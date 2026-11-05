@@ -1,0 +1,19 @@
+include "structs.fbs";
+
+namespace flatzz.test;
+
+struct Matrix {
+    flags:[bool:3];
+    states:[State:2];
+    values:[double:3];
+    envelopes:[Envelope:2];
+}
+
+table ArrayPacket {
+    entries:[Envelope] (required);
+    matrix:Matrix (required);
+    empty:[Sample];
+    blocks:[Matrix];
+}
+
+root_type ArrayPacket;

@@ -1,0 +1,7 @@
+.{
+    .name = .flatzz,
+    .version = "0.0.0",
+    .fingerprint = 0x86cf8e1cd7352677, // Changing this has security and trust implications.
+    .minimum_zig_version = "0.17.0",
+    .paths = .{ "build.zig", "build.zig.zon", "src", "flatbuf", "tests", "README.md" },
+}

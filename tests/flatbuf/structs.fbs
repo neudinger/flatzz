@@ -1,0 +1,25 @@
+namespace flatzz.test;
+
+enum State:ubyte { Ready = 1 }
+
+struct Sample {
+    flag:bool;
+    state:State;
+    count:ushort;
+    number:ulong;
+}
+
+struct Envelope {
+    leading:ubyte;
+    sample:Sample;
+    measure:double;
+    trailing:ushort;
+}
+
+table Packet {
+    marker:uint;
+    envelope:Envelope (required);
+    extra:Sample;
+}
+
+root_type Packet;

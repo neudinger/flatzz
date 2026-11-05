@@ -1,0 +1,17 @@
+//! Runtime and schema test entry point.
+const std = @import("std");
+
+test {
+    std.testing.refAllDecls(@import("runtime"));
+    std.testing.refAllDecls(@import("reading"));
+    std.testing.refAllDecls(@import("test_sequence.zig"));
+    std.testing.refAllDecls(@import("test_runtime.zig"));
+    std.testing.refAllDecls(@import("test_reference.zig"));
+    std.testing.refAllDecls(@import("test_schema_scale.zig"));
+    std.testing.refAllDecls(@import("test_schema_helpers.zig"));
+    std.testing.refAllDecls(@import("test_required_fields.zig"));
+    std.testing.refAllDecls(@import("test_framing.zig"));
+    std.testing.refAllDecls(@import("test_struct.zig"));
+    std.testing.refAllDecls(@import("test_array.zig"));
+    std.testing.refAllDecls(@import("test_union.zig"));
+}
