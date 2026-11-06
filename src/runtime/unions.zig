@@ -99,7 +99,7 @@ pub fn Union(
         /// Compile-time payload interpretation keyed by tag name.
         pub const variants = alternatives;
         /// Construction union: non-none cases carry completed Builder offsets.
-        pub const Value = blk_value: {
+        pub const Value = construction_value_blk: {
             var types: [names.len]type = undefined;
             for (names, 0..) |name, field_index| {
                 types[field_index] = switch (@field(alternatives, name)) {
@@ -107,7 +107,7 @@ pub fn Union(
                     else => Builder.Offset,
                 };
             }
-            break :blk_value @Union(.auto, Tag, names, &types, &@splat(.{}));
+            break :construction_value_blk @Union(.auto, Tag, names, &types, &@splat(.{}));
         };
 
         /// Decoded union of borrowed alternatives; table and struct payloads retain access capability.
@@ -177,7 +177,7 @@ pub fn Union(
             const selected = try check(bytes, location);
             return switch (selected) {
                 .none => .none,
-                inline else => |choice| blk_alternative: {
+                inline else => |choice| borrowed_alternative_blk: {
                     const reference_start = location.reference_start.?;
                     const value = switch (@field(
                         alternatives,
@@ -197,7 +197,7 @@ pub fn Union(
                             location.context,
                             reference_start,
                         ),
-                        .structure => |Layout| blk_struct: {
+                        .structure => |Layout| borrowed_struct_blk: {
                             const target = try validation.referenceTarget(
                                 bytes,
                                 reference_start,
@@ -206,13 +206,13 @@ pub fn Union(
                                 .start = target,
                                 .size = Layout.wire_size,
                             });
-                            break :blk_struct try StructView(Layout, access).from(
+                            break :borrowed_struct_blk try StructView(Layout, access).from(
                                 bytes,
                                 target,
                             );
                         },
                     };
-                    break :blk_alternative @unionInit(
+                    break :borrowed_alternative_blk @unionInit(
                         View(access),
                         @tagName(choice),
                         value,

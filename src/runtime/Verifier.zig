@@ -18,7 +18,7 @@ const Self = @This();
 pub const Options = struct {
     /// Root framing only; .first bounds traversal and retains one complete frame.
     frame: framing.Options = .{},
-    /// Limit recursive table traversal before entering the next table.
+    /// Limit recursive table traversal before entering the next table; zero rejects the root.
     max_depth: usize = 64,
     /// Tables, vectors and strings each consume one visit, including sharing.
     max_objects: usize = 1_000_000,
@@ -86,6 +86,7 @@ fn visitObject(self: *Self) VerifyError!void {
 
 /// Visit a table belonging to this exact byte slice, preserving the recursion depth.
 /// Reject a different frame and check depth/object/work limits before its fields.
+/// Use a checked table view; this does not revalidate a manually forged cached layout.
 pub fn verifyTable(
     self: *Self,
     comptime SchemaType: type,
@@ -161,6 +162,7 @@ fn verifyUnion(
 /// Validate one schema descriptor's value and recursively visit referenced objects.
 /// Schema callbacks charge the field visit separately. Missing required references,
 /// malformed payloads, and traversal-budget failures propagate without rollback.
+/// The table must retain this verifier's complete frame and a checked local layout.
 pub fn verifyField(
     self: *Self,
     comptime FieldType: type,

@@ -43,14 +43,16 @@ pub fn Storage(
 /// Upper bound for Storage.buffer, rounded to Builder's usable alignment.
 /// Includes sparse physical vtable IDs, both slots/vectors of unions, all
 /// default-valued scalars, and worst-case padding for every construction step.
-/// Counts must fit u32; the complete bound must fit Builder.max_buffer_size.
+/// Capacities must be nonnegative integers; counts must fit u32, and the complete
+/// bound must fit Builder.max_buffer_size. Unknown names and invalid budget records
+/// are rejected at compile time.
 /// This is a capacity bound, not a prediction of the serialized frame length.
 pub fn capacity(
     comptime SchemaType: type,
     comptime capacities: anytype,
     comptime options: Options,
 ) usize {
-    return comptime capacity_block: {
+    return comptime capacity_blk: {
         const fields = SchemaType.fields;
         const capacity_info = @typeInfo(@TypeOf(capacities));
         if (capacity_info != .@"struct")
@@ -109,7 +111,7 @@ pub fn capacity(
         total += @mod(-total, @as(comptime_int, wire.storage_alignment));
         if (total > Builder.max_buffer_size)
             @compileError("storage capacity exceeds Builder.max_buffer_size");
-        break :capacity_block @intCast(total);
+        break :capacity_blk @intCast(total);
     };
 }
 
@@ -140,7 +142,7 @@ fn countPart(comptime budget: anytype) comptime_int {
 }
 
 fn bytesPart(comptime budget: anytype) comptime_int {
-    return unsigned(part(budget, "bytes"));
+    return part(budget, "bytes");
 }
 
 fn part(comptime budget: anytype, comptime name: []const u8) comptime_int {

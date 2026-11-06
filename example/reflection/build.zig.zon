@@ -1,0 +1,8 @@
+.{
+    .name = .flatzz_reflection_example,
+    .version = "0.0.0",
+    .fingerprint = 0xf781e7b0715402d2,
+    .minimum_zig_version = "0.17.0",
+    .dependencies = .{ .flatzz = .{ .path = "../.." } },
+    .paths = .{ "build.zig", "build.zig.zon", "main.zig" },
+}

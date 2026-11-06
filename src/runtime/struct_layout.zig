@@ -5,19 +5,19 @@
 //! Example inside a test with `std = @import("std")` and
 //! `runtime = @import("flatzz")` imported:
 //! ```zig
-//! const Point = struct { x: i16, y: i16 };
+//! const Point = struct { horizontal: i16, vertical: i16 };
 //! const Layout = runtime.StructLayout(Point, .{ .size = 4, .alignment = 2 }, .{
-//!     .x = runtime.ScalarMember(i16, 0),
-//!     .y = runtime.ScalarMember(i16, 2),
+//!     .horizontal = runtime.ScalarMember(i16, 0),
+//!     .vertical = runtime.ScalarMember(i16, 2),
 //! });
 //! var bytes: [Layout.wire_size]u8 = undefined;
-//! Layout.encode(&bytes, .{ .x = 1, .y = -2 });
+//! Layout.encode(&bytes, .{ .horizontal = 1, .vertical = -2 });
 //! const point = try Layout.decode(&bytes);
 //! try std.testing.expectEqualSlices(u8, &.{ 1, 0, 254, 255 }, &bytes);
-//! try std.testing.expectEqual(@as(i16, 1), point.x);
-//! try std.testing.expectEqual(@as(i16, -2), point.y);
+//! try std.testing.expectEqual(@as(i16, 1), point.horizontal);
+//! try std.testing.expectEqual(@as(i16, -2), point.vertical);
 //! ```
-//! Expected result: `bytes == .{ 1, 0, 254, 255 }`, `point.x == 1`, `point.y == -2`.
+//! Expected result: `bytes == .{ 1, 0, 254, 255 }`, `point.horizontal == 1`, `point.vertical == -2`.
 //! No output is printed; all storage belongs to the caller.
 const standard_library = @import("std");
 const wire = @import("wire.zig");
@@ -141,7 +141,8 @@ pub fn ArrayLayout(comptime element: Kind, comptime count: usize) type {
             .array => unreachable,
         };
 
-        /// No count prefix or native ABI copy; structs include wire padding.
+        /// Encode every element without a count prefix; structs include wire padding.
+        /// Input must not alias the destination: aggregate values may be passed by reference.
         pub fn encode(destination: *[wire_size]u8, value: Value) void {
             for (value, 0..) |item, element_index| {
                 const element_start = element_index * Element.wire_size;
@@ -159,6 +160,7 @@ pub fn ArrayLayout(comptime element: Kind, comptime count: usize) type {
         }
 
         /// Copy all elements from checked-size wire storage; invalid scalar encodings fail.
+        /// The returned native array owns its values and does not borrow `source`.
         pub fn decode(source: *const [wire_size]u8) DecodeError!Value {
             var result: Value = undefined;
             for (&result, 0..) |*item, element_index| {
@@ -252,7 +254,7 @@ pub fn StructLayout(
         /// Natural wire alignment, in bytes.
         pub const wire_alignment = options.alignment;
         /// Scalar leaves visited by decode, including all nested members.
-        pub const work_size = blk_work: {
+        pub const work_size = decode_work_blk: {
             var total: usize = 0;
             for (member_names) |member_name| {
                 total += switch (@field(descriptors, member_name).kind) {
@@ -260,7 +262,7 @@ pub fn StructLayout(
                     .structure, .array => |Layout| Layout.work_size,
                 };
             }
-            break :blk_work total;
+            break :decode_work_blk total;
         };
 
         /// Resolve a native field name to its compile-time member descriptor.
@@ -328,7 +330,8 @@ pub fn StructLayout(
             }
         }
 
-        /// Caller preflights size/alignment and rejects borrowed input first.
+        /// Encode complete padded structs into at least `values.len * wire_size` bytes.
+        /// The caller checks that bound and excludes input aliasing before any write.
         pub fn encodeSlice(destination: []u8, values: []const Value) void {
             for (values, 0..) |value, element_index| {
                 const element_start = element_index * wire_size;

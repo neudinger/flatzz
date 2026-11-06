@@ -1,0 +1,30 @@
+namespace Cases;
+
+enum Signed:byte { Low=-128, Zero=0, High=127 }
+enum Wide:ulong { Zero=0, Max=18446744073709551615 }
+struct Point { x:short; status:Signed; }
+struct Block { points:[Point:2]; values:[Wide:2]; }
+
+table Node { name:string (required); next:Node; }
+table Packet {
+    legacy:int (deprecated);
+    low:long = -9223372036854775808;
+    high:ulong = 18446744073709551615;
+    signed:Signed = Low;
+    wide:Wide = Max;
+    optional:Signed = null;
+    negative_zero:float = -0.0;
+    fraction:double = 0.1;
+    positive_inf:double = inf;
+    negative_inf:float = -inf;
+    not_a_number:double = nan;
+    const:bool = true;
+    required_text:string (required);
+    nodes:[Node];
+    child:Node;
+    statuses:[Signed];
+    block:Block;
+}
+root_type Packet;
+file_identifier "GENR";
+file_extension "gen";

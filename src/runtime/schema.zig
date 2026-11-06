@@ -169,12 +169,8 @@ pub fn ScalarField(
     comptime field_default: ValueType,
 ) type {
     _ = wire.Scalar(ValueType);
-    switch (@typeInfo(ValueType)) {
-        .optional => if (field_default != null) @compileError(
-            "optional scalars must default to null",
-        ),
-        else => {},
-    }
+    if (@typeInfo(ValueType) == .optional and field_default != null)
+        @compileError("optional scalars must default to null");
     return struct {
         /// Native scalar type, including optional presence when requested.
         pub const Value = ValueType;
@@ -243,7 +239,7 @@ pub fn Schema(comptime Native: type, comptime descriptors: anytype) type {
     const native_info = @typeInfo(Native).@"struct";
     const field_names = native_info.field_names;
     const descriptor_names = @typeInfo(@TypeOf(descriptors)).@"struct".field_names;
-    const slot_count = comptime blk_slots: {
+    const slot_count = comptime field_slots_blk: {
         if (field_names.len != descriptor_names.len) @compileError(
             "schema descriptor fields must match native fields",
         );
@@ -274,7 +270,7 @@ pub fn Schema(comptime Native: type, comptime descriptors: anytype) type {
                 occupied_ids[field_id] = true;
             }
         }
-        break :blk_slots maximum_count;
+        break :field_slots_blk maximum_count;
     };
     return struct {
         const Self = @This();
@@ -290,12 +286,12 @@ pub fn Schema(comptime Native: type, comptime descriptors: anytype) type {
         /// Raw per-table operations; use endTable below for schema finalization.
         pub const Context = TableBuilder(slot_count);
         /// Read result combining copied scalars with borrowed reference and inline views.
-        pub const View = blk_view: {
+        pub const View = view_type_blk: {
             var field_types: [field_names.len]type = undefined;
             for (field_names, 0..) |field_name, field_index| {
                 field_types[field_index] = @field(descriptors, field_name).View;
             }
-            break :blk_view @Struct(
+            break :view_type_blk @Struct(
                 .auto,
                 null,
                 field_names,
@@ -312,20 +308,21 @@ pub fn Schema(comptime Native: type, comptime descriptors: anytype) type {
         /// Builds an ordinary root buffer, borrowing the aligned output storage.
         /// Uses create's child-before-parent restrictions; callers with explicit
         /// child handles or other framing use Builder and addFields directly.
+        /// The result borrows `output_storage`; errors can leave partially written bytes there.
         ///
         /// Generated definitions can expose this without repeating its body:
         /// `pub const write = Schema.writeRoot;`
         pub fn writeRoot(
-            out: []align(wire.storage_alignment) u8,
+            output_storage: []align(wire.storage_alignment) u8,
             values: Native,
             options: WriteOptions,
         ) errors.BuildError![]u8 {
-            var builder = Builder.init(out);
+            var builder = Builder.init(output_storage);
             builder.force_defaults = options.force_defaults;
             return builder.finish(try create(&builder, values), .ordinary);
         }
 
-        /// Reads an ordinary root without requiring a file identifier.
+        /// Read an ordinary root without requiring a file identifier; references borrow `bytes`.
         /// Vector elements remain lazy; use verifyRoot for complete traversal.
         pub fn readRoot(bytes: []const u8) errors.AccessError!View {
             return read(try Table.from(bytes, .root));
@@ -472,6 +469,8 @@ pub fn Schema(comptime Native: type, comptime descriptors: anytype) type {
         /// scalar/struct/sequence schemas and paired union vectors. Union values
         /// carry explicit child handles. Other tables pass handles to addFields;
         /// this function does not recursively walk native object graphs.
+        /// Errors after child construction begins can retain children or an active
+        /// parent context. Reset the builder to discard partial construction.
         pub fn create(
             builder: *Builder,
             values: Native,
@@ -490,12 +489,10 @@ pub fn Schema(comptime Native: type, comptime descriptors: anytype) type {
                     if (!present)
                         return errors.BuildError.MissingRequiredField;
                 }
-                switch (FieldType.kind) {
-                    .union_value => |UnionType| {
-                        if (UnionType.offset(@field(values, field_name))) |handle|
-                            try builder.checkOffset(handle, builder.used());
-                    },
-                    else => {},
+                if (FieldType.kind == .union_value) {
+                    const UnionType = FieldType.kind.union_value;
+                    if (UnionType.offset(@field(values, field_name))) |handle|
+                        try builder.checkOffset(handle, builder.used());
                 }
             }
             var offsets: Offsets = @splat(null);
@@ -549,6 +546,8 @@ pub fn Schema(comptime Native: type, comptime descriptors: anytype) type {
         /// offsets is indexed by physical wire ID, including gaps in older schemas.
         /// Reference handles are authoritative; native reference values need not
         /// be populated when callers build child objects explicitly.
+        /// Required presence and union pairing are checked before additions; other
+        /// failures can leave earlier fields written and the context active.
         pub fn addFields(
             table: *Context,
             values: Native,
@@ -654,11 +653,11 @@ pub fn Schema(comptime Native: type, comptime descriptors: anytype) type {
             verifier: *Verifier,
             table: Table,
         ) errors.VerifyError!void {
-            const physical_count = comptime blk_count: {
+            const physical_count = comptime physical_field_count_blk: {
                 var count: usize = 0;
                 for (field_names) |field_name|
                     count += wireIds(@field(descriptors, field_name)).len;
-                break :blk_count count;
+                break :physical_field_count_blk count;
             };
             try verifier.charge(physical_count);
             inline for (field_names) |field_name| {

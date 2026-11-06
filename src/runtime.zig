@@ -1,9 +1,11 @@
-//! Native FlatBuffers runtime for borrowed access, construction, and verification.
+//! Native FlatBuffers runtime for generated and handwritten schemas.
 //! Schema facts for buffer access belong in generated-style modules.
 //! Local checked access, mutation, construction and full known-schema
 //! verification have separate contracts; none loads BFBS at application runtime.
 //!
 //! Import this package with `const flatzz = @import("flatzz");`.
+//! Schema processing now lives in `@import("flatzz_compiler")`, which exports
+//! `parser`, `reflection`, and `bfbs` separately from the runtime.
 //! Native structs describe values; `Schema` descriptors supply wire IDs and
 //! defaults. Borrowed views retain the complete buffer, which must outlive them.
 //! Builders write into caller-owned aligned storage and allocate no heap memory.
@@ -19,11 +21,10 @@
 //!         .label = flatzz.ReferenceField(1, .string, .{}),
 //!     });
 //! };
-//! const label = "sensor";
-//! var storage: flatzz.Storage(Reading.Schema, .{ .label = label.len }, .{}) = .{};
-//! const bytes = try Reading.Schema.writeRoot(&storage.buffer, .{
+//! var storage: [256]u8 align(flatzz.storage_alignment) = undefined;
+//! const bytes = try Reading.Schema.writeRoot(&storage, .{
 //!     .value = 41,
-//!     .label = label,
+//!     .label = "sensor",
 //! }, .{});
 //! try Reading.Schema.verifyRoot(bytes, .{});
 //! try std.testing.expect(try Reading.Schema.updateRoot(bytes, .value, 42));
@@ -68,7 +69,8 @@ pub const Verifier = @import("runtime/Verifier.zig");
 pub const Schema = schema.Schema;
 /// Root-writing policy; `force_defaults` retains default-valued scalar slots.
 pub const WriteOptions = schema.WriteOptions;
-/// Derive aligned storage from schema facts and explicit sequence capacities.
+/// Derive aligned caller-owned storage from schema facts and explicit capacities.
+/// String capacities count payload bytes; vectors use element counts or count/byte records.
 pub const Storage = storage.Storage;
 /// Describe a scalar field's native type, physical ID, and default value.
 pub const ScalarField = schema.ScalarField;
@@ -117,9 +119,11 @@ pub const BuildError = errors.BuildError;
 /// Checked access errors plus recursive verifier resource-limit failures.
 pub const VerifyError = errors.VerifyError;
 
-/// Read a little-endian scalar at an absolute buffer position with bounds checks.
+/// Copy a bounds-checked little-endian scalar at an absolute byte position.
+/// Unaligned input is supported; unknown exhaustive-enum tags return InvalidBuffer.
 pub const read = validation.readScalar;
-/// Write a scalar at an absolute buffer position after checking its bounds.
+/// Write a little-endian scalar after checking its byte range; no alignment is required.
+/// OutOfBounds leaves bytes unchanged. This does not create an absent schema field.
 pub const write = validation.writeScalar;
 /// Bytes occupied by the root relative offset.
 pub const root_offset_size = wire.root_offset_size;

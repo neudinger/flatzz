@@ -1,0 +1,5 @@
+namespace One;
+table Schema { const:int = 9; }
+namespace Two;
+table Schema { other:One.Schema; }
+root_type Schema;

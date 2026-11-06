@@ -47,7 +47,7 @@ pub fn TableView(comptime access: Access) type {
         layout: validation.TableLayout,
 
         /// Borrows one complete FlatBuffer frame, retaining any size prefix.
-        /// With .first, input[self.bytes.len..] is the remaining input.
+        /// With .first, bytes[result.bytes.len..] is the remaining input.
         /// Metadata validation is local, not schema verification. Aliases must
         /// not change structure; storage reset/reallocation invalidates the view.
         /// Source is not comptime: positions may come from decoded offsets.
@@ -110,12 +110,8 @@ pub fn TableView(comptime access: Access) type {
             comptime default: ValueType,
         ) errors.AccessError!ValueType {
             const ScalarType = wire.Scalar(ValueType);
-            switch (@typeInfo(ValueType)) {
-                .optional => if (default != null) @compileError(
-                    "optional scalars must default to null",
-                ),
-                else => {},
-            }
+            if (@typeInfo(ValueType) == .optional and default != null)
+                @compileError("optional scalars must default to null");
             const field_start = try self.fieldPosition(
                 ScalarType,
                 field_id,
@@ -231,7 +227,8 @@ pub fn TableView(comptime access: Access) type {
             return true;
         }
 
-        /// Mutable parents retain the capability when accessing a child table.
+        /// Borrow a present child table with this view's access capability; return null for absence.
+        /// Only its local metadata is checked. The child retains this complete frame.
         pub fn readTable(
             self: Self,
             comptime field_id: usize,
@@ -325,10 +322,7 @@ pub fn TableView(comptime access: Access) type {
         }
 
         fn requireMutable() void {
-            switch (access) {
-                .read_only => @compileError("mutation requires a MutableTable"),
-                .mutable => {},
-            }
+            if (access != .mutable) @compileError("mutation requires a MutableTable");
         }
     };
 }

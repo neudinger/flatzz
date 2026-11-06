@@ -91,6 +91,7 @@ pub fn init(storage: []align(wire.storage_alignment) u8) Self {
 }
 
 /// Go Reset / C++ Clear: reuse storage and invalidate every handle and view.
+/// Preserve `force_defaults` and return to `ready` without clearing storage.
 pub fn reset(self: *Self) void {
     const force_defaults = self.force_defaults;
     const next_generation = self.context_generation +% 1;
@@ -127,6 +128,8 @@ pub const UnionVector = struct {
 
 /// Two vectors, one atomic preflight. NONE emits a literal zero offset; normal
 /// offset vectors continue to reject null handles. No scratch allocation.
+/// Input must not alias builder storage, and payload handles must be completed
+/// children of this builder. Input/state/capacity failures leave construction intact.
 pub fn createUnionVector(
     self: *Self,
     comptime UnionType: type,
@@ -203,6 +206,8 @@ pub fn createVector(
 
 /// Contiguous inline structs, each including its wire padding. This returns a
 /// vector handle; individual elements are never built as referenced objects.
+/// The builder must be ready, and input must not alias its storage. Count,
+/// capacity, and alias failures leave construction unchanged.
 pub fn createStructVector(
     self: *Self,
     comptime Layout: type,
@@ -356,6 +361,8 @@ pub fn createStringVector(
 
 /// Builds a vector of already completed object handles. Sources cannot borrow
 /// storage: writing relative offsets must not destroy handles yet to be read.
+/// Empty input is present. State, alias, handle, and capacity checks precede writes;
+/// numeric handles cannot prove their originating builder or object type.
 pub fn createOffsetVector(self: *Self, values: []const Offset) Error!Offset {
     if (self.state != .ready) return Error.InvalidState;
     if (values.len > (max_buffer_size - sequence_length_size) / field_offset_size)
@@ -524,6 +531,8 @@ pub fn checkOffset(
 }
 
 /// Go Prepend* / C++ PushElement: checked placement followed by fixed encoding.
+/// This low-level operation checks capacity, not construction state; TableBuilder
+/// supplies the active-context check. Return the stored scalar's distance from the end.
 pub fn prependScalar(
     self: *Self,
     comptime ScalarType: type,

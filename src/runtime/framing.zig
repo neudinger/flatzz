@@ -58,11 +58,8 @@ pub fn parse(bytes: []const u8, options: Options) AccessError!Layout {
             layout.frame_size = wire.size_prefix_size + declared_size;
             layout.root_offset_start = wire.size_prefix_size;
             layout.header_size += wire.size_prefix_size;
-            switch (options.boundary) {
-                .exact => if (layout.frame_size != bytes.len)
-                    return AccessError.InvalidBuffer,
-                .first => {},
-            }
+            if (options.boundary == .exact and layout.frame_size != bytes.len)
+                return AccessError.InvalidBuffer;
         },
     }
     try validation.checkRange(

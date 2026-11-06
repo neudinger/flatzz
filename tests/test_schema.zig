@@ -1,4 +1,4 @@
-//! Handwritten generated-style adapters for tests/flatbuf/graph.fbs.
+//! Handwritten generated-style adapters for a recursive graph schema.
 //! Native order deliberately differs from wire IDs; recursive references stay
 //! named types. This is a second schema, independent of Reading.
 const runtime = @import("runtime");

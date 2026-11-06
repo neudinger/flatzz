@@ -86,7 +86,8 @@ pub fn ScalarCodec(comptime ScalarType: type) type {
         /// Natural alignment of an element slot, in bytes.
         pub const slot_alignment = slot_size;
 
-        /// Copy one bounds/alignment-checked scalar; invalid encodings return an access error.
+        /// Copy one bounds-checked scalar; the caller enforces slot alignment.
+        /// Unknown exhaustive-enum tags return InvalidBuffer.
         pub fn read(
             bytes: []const u8,
             context: validation.Context,

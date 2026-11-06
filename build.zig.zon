@@ -3,5 +3,12 @@
     .version = "0.0.0",
     .fingerprint = 0x86cf8e1cd7352677, // Changing this has security and trust implications.
     .minimum_zig_version = "0.17.0",
-    .paths = .{ "build.zig", "build.zig.zon", "src", "flatbuf", "tests", "README.md" },
+    .dependencies = .{
+        .zast = .{
+            .url = "git+https://github.com/neudinger/zast#63ab94c4f9226a31f68a031477d9fc4336c3d6b5",
+            .hash = "zast-0.0.0-SB4Hrz2mHgA67GOUPcBsErlUxzgPPiBmz741UC7tsz_K",
+            .lazy = true,
+        },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src", "tests", "tools", "example", "README.md" },
 }

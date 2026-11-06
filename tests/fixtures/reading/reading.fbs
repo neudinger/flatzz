@@ -1,0 +1,50 @@
+namespace flatzz.test;
+
+enum Status:ubyte {
+    Unknown = 0,
+    Ok = 1,
+    Warning = 2
+}
+
+struct Coordinates {
+    latitude:float;
+    longitude:float;
+}
+
+struct Location {
+    coordinates:Coordinates;
+    altitude:float;
+}
+
+struct Calibration {
+    gains:[float:3];
+    locations:[Location:2];
+}
+
+table Reading {
+    sequence:uint;
+    value:float;
+    label:string;
+    active:bool;
+    status:Status = Unknown;
+    samples:[float];
+    temperature:float = null;
+    tags:[string];
+    location:Location;
+    history:[Location];
+    calibration:Calibration;
+}
+
+table Temperature {
+    value:float;
+}
+
+// Aliases distinguish two uses of the same struct. NONE is implicit tag zero.
+union ReadingPayload { Temperature, Location, Text:string, Previous:Location }
+
+table ReadingMessage {
+    current:ReadingPayload;
+    history:[ReadingPayload];
+}
+
+root_type Reading;

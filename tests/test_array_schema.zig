@@ -1,4 +1,4 @@
-//! Handwritten adapter for arrays.fbs, independent of native struct ordering.
+//! Handwritten array adapter, independent of native struct ordering.
 const runtime = @import("runtime");
 const structs = @import("test_struct_schema.zig");
 

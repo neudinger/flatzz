@@ -64,6 +64,7 @@ pub fn TableBuilder(comptime field_count: usize) type {
 
         /// Scalar defaults may be omitted. Optional null is always omitted and
         /// optional zero/false always stored, independently of force_defaults.
+        /// Omitting a value still records the slot for duplicate-field checks.
         pub fn addScalar(
             self: *Self,
             comptime ValueType: type,
@@ -72,24 +73,20 @@ pub fn TableBuilder(comptime field_count: usize) type {
             comptime default: ValueType,
         ) BuildError!void {
             const ScalarType = wire.Scalar(ValueType);
-            switch (@typeInfo(ValueType)) {
-                .optional => if (default != null) @compileError(
-                    "optional scalars must default to null",
-                ),
-                else => {},
-            }
+            if (@typeInfo(ValueType) == .optional and default != null)
+                @compileError("optional scalars must default to null");
             try self.checkField(field_id);
             const scalar_value = switch (@typeInfo(ValueType)) {
                 .optional => value orelse {
                     self.field_offsets[field_id] = wire.absent_field_offset;
                     return;
                 },
-                else => blk_resolve_value: {
+                else => scalar_value_blk: {
                     if (!self.builder.force_defaults and value == default) {
                         self.field_offsets[field_id] = wire.absent_field_offset;
                         return;
                     }
-                    break :blk_resolve_value value;
+                    break :scalar_value_blk value;
                 },
             };
             self.field_offsets[field_id] = try self.builder.prependScalar(
@@ -101,6 +98,8 @@ pub fn TableBuilder(comptime field_count: usize) type {
         /// Structs are inline values: encode inside the active table, without a
         /// separate child handle or a forward-reference slot. Null omits the
         /// field; present zero-valued structs are retained regardless of defaults.
+        /// Present input must not alias builder storage. Capacity and alias failures
+        /// leave the field unrecorded, so the caller may retry the addition.
         pub fn addStruct(
             self: *Self,
             comptime Layout: type,
@@ -119,7 +118,9 @@ pub fn TableBuilder(comptime field_count: usize) type {
         }
 
         /// Converts a child handle to the forward offset at its eventual slot.
-        /// The child must have been completed before this context was opened.
+        /// The child must have been completed by this builder before the context opened.
+        /// Null records absence. Invalid handles and capacity failures leave the
+        /// field unrecorded; the numeric handle cannot prove builder ownership.
         pub fn addOffset(
             self: *Self,
             comptime field_id: usize,
@@ -147,7 +148,9 @@ pub fn TableBuilder(comptime field_count: usize) type {
             );
         }
 
-        /// Preflight both slots so a failure cannot write just the tag or value.
+        /// Add a union after preflighting both slots, so failures write neither.
+        /// Payload handles must precede this table. `none` omits its payload;
+        /// `force_defaults` can retain its zero tag.
         pub fn addUnion(
             self: *Self,
             comptime UnionType: type,
@@ -213,7 +216,8 @@ pub fn TableBuilder(comptime field_count: usize) type {
         }
 
         /// Schema finalization checks pairs even when raw incremental operations
-        /// supplied the slots. Full payload verification remains a separate step.
+        /// supplied the slots. Invalid pairs return InvalidUnion; absent required
+        /// values return MissingRequiredField. Full payload verification is separate.
         pub fn requireUnion(
             self: *const Self,
             comptime UnionType: type,
@@ -266,9 +270,7 @@ pub fn TableBuilder(comptime field_count: usize) type {
                 "field ID is outside this table",
             );
             try self.checkActive();
-            const field_offset = self.field_offsets[field_id] orelse
-                return BuildError.MissingRequiredField;
-            if (field_offset == wire.absent_field_offset)
+            if ((self.field_offsets[field_id] orelse wire.absent_field_offset) == wire.absent_field_offset)
                 return BuildError.MissingRequiredField;
         }
 

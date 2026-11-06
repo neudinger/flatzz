@@ -165,14 +165,14 @@ pub fn tableAt(bytes: []const u8, table_start: usize) AccessError!TableLayout {
     if (distance == 0) return AccessError.InvalidBuffer;
     // Avoid signed conversion of usize: a shared vtable may be before or after
     // its table, and even the most negative i32 displacement must be safe.
-    const vtable_start = if (distance > 0) blk_before: {
+    const vtable_start = if (distance > 0) preceding_vtable_blk: {
         const magnitude: usize = @intCast(distance);
         if (magnitude > table_start) return AccessError.InvalidBuffer;
-        break :blk_before table_start - magnitude;
-    } else blk_after: {
+        break :preceding_vtable_blk table_start - magnitude;
+    } else following_vtable_blk: {
         const magnitude: usize = @intCast(-@as(i64, distance));
         try checkRange(bytes.len, table_start, magnitude);
-        break :blk_after table_start + magnitude;
+        break :following_vtable_blk table_start + magnitude;
     };
     if (vtable_start < wire.root_offset_size or vtable_start % wire.vtable_entry_size != 0)
         return AccessError.InvalidBuffer;

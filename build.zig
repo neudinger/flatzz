@@ -1,9 +1,21 @@
-//! Build the runtime package, Reading example, and test contracts.
+//! Build the runtime package, generated examples, host schema tool, and test contracts.
 //! `zig build docs` installs the public API reference under `zig-out/docs`.
 
 const std = @import("std");
+const Step = std.Build.Step;
 
-/// Configure target-aware runtime artifacts and tests.
+/// Register host-side Reading generation; the output path belongs to the build.
+fn compileReading(builder: *std.Build, schema_tool: *Step.Compile) std.Build.LazyPath {
+    return zig_schema_blk: {
+        const generate = builder.addRunArtifact(schema_tool);
+        generate.addArgs(&.{ "--zig", "--depfile" });
+        _ = generate.addDepFileOutputArg2("reading.d", .{});
+        generate.addFileArg(builder.path("example/flatbuf/reading.fbs"));
+        break :zig_schema_blk generate.captureStdOut(.{ .basename = "reading.zig" });
+    };
+}
+
+/// Configure target-aware runtime artifacts and host-only schema tooling.
 pub fn build(builder: *std.Build) void {
     const target = builder.standardTargetOptions(.{});
     const optimize = builder.standardOptimizeOption(.{});
@@ -13,16 +25,27 @@ pub fn build(builder: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    // Zig's doc renderer recognizes the module root by its matching filename.
-    const documentation = builder.addObject(.{ .name = "runtime", .root_module = runtime_module });
-    const install_docs = builder.addInstallDirectory(.{
-        .source_dir = documentation.getEmittedDocs(),
-        .install_dir = .prefix,
-        .install_subdir = "docs",
+
+    const compiler_module = builder.addModule("flatzz_compiler", .{
+        .root_source_file = builder.path("src/compiler.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "flatzz", .module = runtime_module }},
     });
-    builder.step("docs", "Build the public API reference").dependOn(&install_docs.step);
+
+    const docs = docs_blk: {
+        // Zig's doc renderer recognizes the module root by its matching filename.
+        const documentation = builder.addObject(.{ .name = "runtime", .root_module = runtime_module });
+        const install_docs = builder.addInstallDirectory(.{
+            .source_dir = documentation.getEmittedDocs(),
+            .install_dir = .prefix,
+            .install_subdir = "docs",
+        });
+        break :docs_blk &install_docs.step;
+    };
+
     const reading_module = builder.createModule(.{
-        .root_source_file = builder.path("src/reading.zig"),
+        .root_source_file = builder.path("tests/fixtures/reading/reading.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{.{ .name = "flatzz", .module = runtime_module }},
@@ -32,126 +55,169 @@ pub fn build(builder: *std.Build) void {
         .{ .name = "reading", .module = reading_module },
     };
 
-    const mod = builder.createModule(.{
-        .root_source_file = builder.path("src/main.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = test_imports,
-    });
-
-    const exe = builder.addExecutable(.{ .name = "flatzz", .root_module = mod });
-    builder.installArtifact(exe);
-    const run = builder.addRunArtifact(exe);
-    run.addPassthruArgs();
-    builder.step("run", "Run the Builder example").dependOn(&run.step);
-
-    const benchmark = builder.addExecutable(.{
-        .name = "flatzz-benchmark",
-        .root_module = builder.createModule(.{
-            .root_source_file = builder.path("tests/test_benchmark.zig"),
+    const builder_example = builder_example_blk: {
+        const module = builder.createModule(.{
+            .root_source_file = builder.path("example/builder/main.zig"),
             .target = target,
             .optimize = optimize,
             .imports = test_imports,
-        }),
-    });
-    const run_benchmark = builder.addRunArtifact(benchmark);
-    builder.step(
-        "benchmark",
-        "Measure bounded runtime workloads",
-    ).dependOn(&run_benchmark.step);
+        });
 
-    const tests = builder.addTest(.{ .root_module = builder.createModule(.{
-        .root_source_file = builder.path("tests/test_all.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = test_imports,
-    }) });
-    // Compile-only coverage also supports targets that cannot run on this host.
-    const check_step = builder.step("check", "Compile all tools and test contracts");
-    check_step.dependOn(&exe.step);
-    check_step.dependOn(&benchmark.step);
-    const test_step = builder.step(
-        "test",
-        "Test runtime behavior and compile-time contracts",
-    );
-    check_step.dependOn(&tests.step);
-    test_step.dependOn(&builder.addRunArtifact(tests).step);
-
-    const producer = builder.addExecutable(.{
-        .name = "flatzz-test-producer",
-        .root_module = builder.createModule(.{
-            .root_source_file = builder.path("tests/test_interop_producer.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = test_imports,
-        }),
-    });
-    const run_producer = builder.addRunArtifact(producer);
-    check_step.dependOn(&producer.step);
-    const fixture_output = builder.option(
-        []const u8,
-        "fixture-output",
-        "Output directory for interoperability fixtures",
-    ) orelse "tests";
-    run_producer.setCwd(.{ .cwd_relative = fixture_output });
-    builder.step(
-        "test-produce-fixtures",
-        "Generate Zig buffers for the interoperability harness",
-    ).dependOn(&run_producer.step);
-    const failures = .{
-        .{ "read_only", "mutation requires a MutableTable" },
-        .{ "immutable_input", "expected type '[]u8', found '[]const u8'" },
-        .{ "unsupported_scalar", "unsupported FlatBuffers scalar type" },
-        .{ "duplicate_ids", "duplicate schema wire field ID" },
-        .{ "inconsistent_type", "schema descriptor value type mismatch" },
-        .{ "optional_default", "optional scalars must default to null" },
-        .{ "invalid_codec", "invalid sequence element layout" },
-        .{ "struct_offset", "invalid FlatBuffers struct member offset" },
-        .{ "struct_layout", "invalid FlatBuffers struct size or alignment" },
-        .{ "struct_type", "struct descriptor value type mismatch" },
-        .{ "struct_optional", "unsupported FlatBuffers scalar type" },
-        .{ "struct_read_only", "mutation requires a mutable struct" },
-        .{ "array_length", "array length must be positive and fit in u16" },
-        .{ "array_overflow", "array length must be positive and fit in u16" },
-        .{ "array_type", "struct descriptor value type mismatch" },
-        .{ "array_read_only", "mutation requires a mutable array" },
-        .{ "struct_vector_read_only", "mutation requires a mutable struct" },
-        .{ "array_vector", "struct vectors require a struct layout" },
-        .{ "array_nested", "direct nested arrays are unsupported" },
-        .{ "array_table", "table struct fields require a struct layout" },
-        .{ "union_duplicate_ids", "duplicate schema wire field ID" },
-        .{ "union_adjacent_ids", "union value ID must immediately follow tag ID" },
-        .{ "union_tag_width", "union tags require an exhaustive u8 enum" },
-        .{ "union_none_tag", "union tags require none = 0" },
-        .{ "union_none_payload", "only the none tag may omit a payload" },
-        .{ "union_read_only", "mutation requires a MutableTable" },
-        .{ "union_vector_read_only", "mutation requires a mutable struct" },
-        .{ "union_replacement", "union replacement requires rebuilding; mutate borrowed payload fields" },
-        .{ "storage_unknown", "unknown storage capacity field: missing" },
-        .{ "storage_fixed", "fixed-size fields do not accept storage capacities: value" },
-        .{ "storage_overflow", "storage capacity exceeds Builder.max_buffer_size" },
-        .{ "storage_count", "storage element count must fit in u32" },
-        .{ "borrow_scalar", "borrowMutable requires a structured field; use update for scalars and strings" },
-        .{ "borrow_string", "borrowMutable requires a structured field; use update for scalars and strings" },
-        .{ "borrow_read_only", "expected type 'runtime.table_view.TableView(.mutable)', found 'runtime.table_view.TableView(.read_only)'" },
+        const executable = builder.addExecutable(.{ .name = "flatzz-builder-example", .root_module = module });
+        builder.installArtifact(executable);
+        const run = builder.addRunArtifact(executable);
+        run.addPassthruArgs();
+        break :builder_example_blk .{ .compile = &executable.step, .run = &run.step };
     };
-    inline for (failures) |failure| {
-        const rejected = builder.addTest(.{ .root_module = builder.createModule(.{
-            .root_source_file = builder.path(
-                "tests/compile_fail/test_" ++ failure[0] ++ ".zig",
-            ),
+
+    const schema_tools = if (builder.option(bool, "schema-tools", "Build host schema tooling (defaults on for root builds)") orelse builder.isRoot())
+        @import("tools/build.zig").add(builder)
+    else
+        null;
+
+    const generated_reading = if (schema_tools) |tools| reading_module_blk: {
+        const source = compileReading(builder, tools.executable);
+        builder.getInstallStep().dependOn(&builder.addInstallFile(source, "schema/reading.zig").step);
+        break :reading_module_blk builder.createModule(.{
+            .root_source_file = source,
             .target = target,
             .optimize = optimize,
-            .imports = &.{.{ .name = "runtime", .module = runtime_module }},
-        }) });
-        rejected.expect_errors = .{ .contains = failure[1] };
-        test_step.dependOn(&rejected.step);
-        check_step.dependOn(&rejected.step);
-    }
+            .imports = &.{.{ .name = "flatzz", .module = runtime_module }},
+        });
+    } else null;
 
-    const format = builder.addFmt(.{
-        .paths = builder.pathList(&.{ "build.zig", "build.zig.zon", "src", "tests" }),
-        .check = true,
-    });
-    builder.step("fmt", "Check Zig source formatting").dependOn(&format.step);
+    const generated = if (generated_reading) |reading| app_blk: {
+        // The generator runs on the host; the app imports only its output and runtime.
+        const executable = builder.addExecutable(.{
+            .name = "flatzz",
+            .root_module = builder.createModule(.{
+                .root_source_file = builder.path("example/generated/main.zig"),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{
+                    .{ .name = "reading", .module = reading },
+                    .{ .name = "flatzz", .module = runtime_module },
+                },
+            }),
+        });
+        builder.installArtifact(executable);
+        const run = builder.addRunArtifact(executable);
+        run.addPassthruArgs();
+        break :app_blk .{ .compile = &executable.step, .run = &run.step };
+    } else null;
+
+    const suites = suites_blk: {
+        const tests = builder.addTest(.{ .root_module = builder.createModule(.{
+            .root_source_file = builder.path("tests/test_all.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = test_imports,
+        }) });
+        const compiler_tests = builder.addTest(.{ .root_module = builder.createModule(.{
+            .root_source_file = builder.path("tests/test_compiler.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "flatzz_compiler", .module = compiler_module }},
+        }) });
+        const parser_tests = builder.addTest(.{ .root_module = builder.createModule(.{
+            .root_source_file = builder.path("src/compiler/parser.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "flatzz", .module = runtime_module }},
+        }) });
+        break :suites_blk .{
+            .check = [_]*Step{ &tests.step, &compiler_tests.step, &parser_tests.step },
+            .tests = [_]*Step{
+                &builder.addRunArtifact(tests).step,
+                &builder.addRunArtifact(compiler_tests).step,
+                &builder.addRunArtifact(parser_tests).step,
+            },
+        };
+    };
+
+    const contracts = contracts_blk: {
+        const failures = @import("tests/compile_fail.zig").cases;
+        const sources = builder.addWriteFiles();
+        var steps: [failures.len]*Step = undefined;
+        inline for (failures, 0..) |failure, failure_index| {
+            const rejected = builder.addTest(.{ .root_module = builder.createModule(.{
+                .root_source_file = sources.add(
+                    builder.fmt("test_{s}.zig", .{failure.name}),
+                    failure.source,
+                ),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{.{ .name = "runtime", .module = runtime_module }},
+            }) });
+            rejected.expect_errors = .{ .contains = failure.expected_error };
+            steps[failure_index] = &rejected.step;
+        }
+        break :contracts_blk steps;
+    };
+
+    const format = format_blk: {
+        const check_format = builder.addFmt(.{
+            .paths = builder.pathList(&.{ "build.zig", "build.zig.zon", "src", "tests", "tools", "example" }),
+            .check = true,
+        });
+        break :format_blk &check_format.step;
+    };
+
+    const checks = std.mem.concat(builder.allocator, *Step, &.{
+        &.{builder_example.compile},
+        if (generated) |app| &.{app.compile} else &.{},
+        &suites.check,
+        &contracts,
+        if (schema_tools) |*tools| &tools.check else &.{},
+    }) catch @panic("OOM");
+    const test_steps = std.mem.concat(builder.allocator, *Step, &.{
+        &suites.tests,
+        &contracts,
+        if (schema_tools) |*tools| &tools.tests else &.{},
+    }) catch @panic("OOM");
+
+    inline for (.{
+        .{
+            .tag = .docs,
+            .description = "Build the public API reference",
+            .prerequisites = @as([]const *Step, &.{docs}),
+        },
+        .{
+            .tag = .run,
+            .description = "Generate Reading, then build, verify, read, and mutate it",
+            .prerequisites = if (generated) |app| @as([]const *Step, &.{app.run}) else &.{},
+        },
+        .{
+            .tag = .@"run-builder",
+            .description = "Run the Builder example",
+            .prerequisites = @as([]const *Step, &.{builder_example.run}),
+        },
+        // Compile-only coverage also supports targets that cannot run on this host.
+        .{
+            .tag = .check,
+            .description = "Compile all tools and test contracts",
+            .prerequisites = checks,
+        },
+        .{
+            .tag = .@"test",
+            .description = "Test runtime, native schema conversion, and compile-time contracts",
+            .prerequisites = test_steps,
+        },
+        .{
+            .tag = .@"generate-reading",
+            .description = "Regenerate tests/fixtures/reading/reading.zig from tests/fixtures/reading/reading.fbs",
+            .prerequisites = if (schema_tools) |tools| @as([]const *Step, &.{tools.generate_reading}) else &.{},
+        },
+        .{
+            .tag = .fmt,
+            .description = "Check Zig source formatting",
+            .prerequisites = @as([]const *Step, &.{format}),
+        },
+    }) |command| {
+        // Optional schema targets are absent when their tools are disabled.
+        if (command.prerequisites.len != 0) {
+            const command_step = builder.step(@tagName(command.tag), command.description);
+            for (command.prerequisites) |prerequisite| command_step.dependOn(prerequisite);
+        }
+    }
 }

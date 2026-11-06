@@ -1,4 +1,4 @@
-//! Handwritten adapter for tests/flatbuf/structs.fbs, with reordered native fields.
+//! Handwritten struct adapter with reordered native fields.
 const runtime = @import("runtime");
 
 pub const State = enum(u8) { ready = 1, _ };

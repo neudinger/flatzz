@@ -132,12 +132,7 @@ pub fn StructView(comptime Layout: type, comptime access: Access) type {
         }
 
         fn requireMutable() void {
-            switch (access) {
-                .read_only => @compileError(
-                    "mutation requires a mutable struct",
-                ),
-                .mutable => {},
-            }
+            if (access != .mutable) @compileError("mutation requires a mutable struct");
         }
     };
 }
@@ -205,14 +200,7 @@ pub fn ArrayView(comptime Layout: type, comptime access: Access) type {
             element_index: usize,
             value: Element.Value,
         ) errors.MutationError!void {
-            comptime {
-                switch (access) {
-                    .read_only => @compileError(
-                        "mutation requires a mutable array",
-                    ),
-                    .mutable => {},
-                }
-            }
+            if (access != .mutable) @compileError("mutation requires a mutable array");
             const element_start = try self.elementStart(element_index);
             switch (Element.kind) {
                 .scalar => |ScalarType| try mutation.scalar(

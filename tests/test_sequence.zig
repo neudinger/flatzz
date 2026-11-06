@@ -5,10 +5,10 @@ const Reading = @import("reading").Reading;
 test "string vectors fit schema storage across lengths and alignments" {
     const tags = [_][]const u8{ "", "a", "bc", "def", "é", "a\x00b" };
     const samples = [_]f32{ -1.5, 0, 2.5 };
-    const tag_bytes = comptime blk: {
+    const tag_bytes = comptime tag_bytes_blk: {
         var total: usize = 0;
         for (tags) |tag| total += tag.len;
-        break :blk total;
+        break :tag_bytes_blk total;
     };
     inline for (.{ "", "a", "ab", "abc", "abcd", "abcde" }) |label| {
         inline for (0..tags.len + 1) |count| {
@@ -127,10 +127,10 @@ test "string vector updates validate every replacement before writing" {
 }
 
 // Corrupt wire metadata independently of the runtime being tested.
-fn putOffset(bytes: []u8, pos: usize, value: u32) void {
+fn putOffset(bytes: []u8, position: usize, value: u32) void {
     std.mem.writeInt(
         u32,
-        bytes[pos..][0..runtime.field_offset_size],
+        bytes[position..][0..runtime.field_offset_size],
         value,
         .little,
     );
@@ -146,7 +146,7 @@ test "string vector elements reject malformed offsets, lengths and UTF-8" {
     );
     const view = (try Reading.read(bytes)).tags.?;
     const first = try view.get(0);
-    const first_pos = @intFromPtr(first.ptr) - @intFromPtr(bytes.ptr);
+    const first_position = @intFromPtr(first.ptr) - @intFromPtr(bytes.ptr);
     const valid = storage.buffer;
     for ([_]u32{ 0, 1 }) |offset| {
         putOffset(bytes, view.payload_start, offset);
@@ -163,15 +163,15 @@ test "string vector elements reject malformed offsets, lengths and UTF-8" {
     storage.buffer = valid;
     putOffset(
         bytes,
-        first_pos - runtime.sequence_length_size,
+        first_position - runtime.sequence_length_size,
         std.math.maxInt(u32),
     );
     try std.testing.expectError(error.OutOfBounds, view.get(0));
     storage.buffer = valid;
-    bytes[first_pos + first.len] = 1;
+    bytes[first_position + first.len] = 1;
     try std.testing.expectError(error.InvalidBuffer, view.get(0));
     storage.buffer = valid;
-    bytes[first_pos] = 0xff;
+    bytes[first_position] = 0xff;
     try std.testing.expectError(error.InvalidBuffer, view.get(0));
     storage.buffer = valid;
     // Invalid later elements must not permit a partial update of earlier ones.
@@ -278,11 +278,11 @@ test "partially overlapping string objects cannot be mutated" {
     );
     const view = (try Reading.read(bytes)).tags.?;
     const target = try view.get(0);
-    const pos = @intFromPtr(target.ptr) - @intFromPtr(bytes.ptr);
+    const position = @intFromPtr(target.ptr) - @intFromPtr(bytes.ptr);
     // Embed a valid string header/payload inside the first string's UTF-8 bytes.
-    putOffset(bytes, pos, runtime.sequence_length_size);
+    putOffset(bytes, position, runtime.sequence_length_size);
     const second_slot = view.payload_start + runtime.field_offset_size;
-    putOffset(bytes, second_slot, @intCast(pos - second_slot));
+    putOffset(bytes, second_slot, @intCast(position - second_slot));
     try std.testing.expectEqual(
         @as(usize, runtime.sequence_length_size),
         (try view.get(1)).len,

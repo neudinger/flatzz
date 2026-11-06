@@ -1,4 +1,4 @@
-//! Adapter for unions.fbs. Construction uses explicit completed payload handles.
+//! Union adapter. Construction uses explicit completed payload handles.
 const runtime = @import("runtime");
 pub const structs = @import("test_struct_schema.zig");
 
