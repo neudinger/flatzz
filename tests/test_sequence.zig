@@ -1,6 +1,8 @@
 const std = @import("std");
 const runtime = @import("runtime");
-const Reading = @import("reading").Reading;
+const reading = @import("reading");
+
+const Reading = reading.Reading;
 
 test "string vectors fit schema storage across lengths and alignments" {
     const tags = [_][]const u8{ "", "a", "bc", "def", "é", "a\x00b" };
@@ -13,20 +15,19 @@ test "string vectors fit schema storage across lengths and alignments" {
     inline for (.{ "", "a", "ab", "abc", "abcd", "abcde" }) |label| {
         inline for (0..tags.len + 1) |count| {
             for ([_]bool{ false, true }) |force_defaults| {
-                var storage: Reading.Storage(
-                    label.len,
-                    samples.len,
-                    .{ .count = count, .bytes = tag_bytes },
-                    0,
-                ) = .{};
-                const bytes = try Reading.write(&storage.buffer, .{
+                var storage: runtime.Storage(Reading.Schema, .{
+                    .label = label.len,
+                    .samples = samples.len,
+                    .tags = .{ .count = count, .bytes = tag_bytes },
+                }, .{}) = .{};
+                const bytes = try Reading.serialize(.{
                     .sequence = 42,
                     .value = 1.5,
                     .label = label,
                     .samples = &samples,
                     .temperature = 0,
                     .tags = tags[0..count],
-                }, .{ .force_defaults = force_defaults });
+                }, &storage.buffer, .{ .force_defaults = force_defaults });
                 const view = try Reading.read(bytes);
                 try std.testing.expectEqual(@as(u32, 42), view.sequence);
                 try std.testing.expectEqual(@as(f32, 1.5), view.value);
@@ -55,18 +56,18 @@ test "string vectors fit schema storage across lengths and alignments" {
 }
 
 test "absent, empty and older string vector fields remain distinct" {
-    var storage: Reading.Storage(0, 0, .{}, 0) = .{};
+    var storage: runtime.Storage(Reading.Schema, .{}, .{}) = .{};
     for ([_]bool{ false, true }) |force_defaults| {
-        const absent = try Reading.write(
-            &storage.buffer,
+        const absent = try Reading.serialize(
             .{},
+            &storage.buffer,
             .{ .force_defaults = force_defaults },
         );
         try std.testing.expect((try Reading.read(absent)).tags == null);
         try std.testing.expect(!try Reading.update(absent, .tags, &.{}));
-        const empty = try Reading.write(
-            &storage.buffer,
+        const empty = try Reading.serialize(
             .{ .tags = &.{} },
+            &storage.buffer,
             .{ .force_defaults = force_defaults },
         );
         try std.testing.expectEqual(
@@ -87,11 +88,13 @@ test "absent, empty and older string vector fields remain distinct" {
 }
 
 test "string vector updates validate every replacement before writing" {
-    var storage: Reading.Storage(0, 0, .{ .count = 4, .bytes = 9 }, 0) = .{};
+    var storage: runtime.Storage(Reading.Schema, .{
+        .tags = .{ .count = 4, .bytes = 9 },
+    }, .{}) = .{};
     @memset(&storage.buffer, 0);
-    const bytes = try Reading.write(
-        &storage.buffer,
+    const bytes = try Reading.serialize(
         .{ .tags = &.{ "red", "blue", "", "é" } },
+        &storage.buffer,
         .{},
     );
     const view = (try Reading.read(bytes)).tags.?;
@@ -137,11 +140,13 @@ fn putOffset(bytes: []u8, position: usize, value: u32) void {
 }
 
 test "string vector elements reject malformed offsets, lengths and UTF-8" {
-    var storage: Reading.Storage(0, 0, .{ .count = 3, .bytes = 9 }, 0) = .{};
+    var storage: runtime.Storage(Reading.Schema, .{
+        .tags = .{ .count = 3, .bytes = 9 },
+    }, .{}) = .{};
     @memset(&storage.buffer, 0);
-    const bytes = try Reading.write(
-        &storage.buffer,
+    const bytes = try Reading.serialize(
         .{ .tags = &.{ "abc", "def", "ghi" } },
+        &storage.buffer,
         .{},
     );
     const view = (try Reading.read(bytes)).tags.?;
@@ -181,6 +186,15 @@ test "string vector elements reject malformed offsets, lengths and UTF-8" {
         error.InvalidBuffer,
         Reading.update(bytes, .tags, &.{ "xyz", "uvw", "rst" }),
     );
+    // Earlier replacement failures take precedence over the malformed later target.
+    try std.testing.expectError(
+        error.InvalidUtf8,
+        Reading.update(bytes, .tags, &.{ "\xffyz", "uvw", "rst" }),
+    );
+    try std.testing.expectError(
+        error.LengthMismatch,
+        Reading.update(bytes, .tags, &.{ "xy", "uvw", "rst" }),
+    );
     try std.testing.expectEqualSlices(u8, &corrupt, &storage.buffer);
     storage.buffer = valid;
     var truncated = view;
@@ -189,13 +203,11 @@ test "string vector elements reject malformed offsets, lengths and UTF-8" {
 }
 
 test "shared strings permit consistent updates and reject conflicting replacements" {
-    var storage: Reading.Storage(0, 0, .{ .count = 2, .bytes = 6 }, 0) = .{};
+    var storage: runtime.Storage(Reading.Schema, .{
+        .tags = .{ .count = 2, .bytes = 6 },
+    }, .{}) = .{};
     @memset(&storage.buffer, 0);
-    const bytes = try Reading.write(
-        &storage.buffer,
-        .{ .tags = &.{ "one", "two" } },
-        .{},
-    );
+    const bytes = try Reading.serialize(.{ .tags = &.{ "one", "two" } }, &storage.buffer, .{});
     const view = (try Reading.read(bytes)).tags.?;
     const first = try view.get(0);
     const target = @intFromPtr(
@@ -218,7 +230,9 @@ test "shared strings permit consistent updates and reject conflicting replacemen
 }
 
 test "string vector construction failures leave the builder and storage unchanged" {
-    var storage: Reading.Storage(0, 0, .{ .count = 2, .bytes = 6 }, 0) = .{};
+    var storage: runtime.Storage(Reading.Schema, .{
+        .tags = .{ .count = 2, .bytes = 6 },
+    }, .{}) = .{};
     @memset(&storage.buffer, 0);
     var builder = runtime.Builder.init(&storage.buffer);
     const before = storage.buffer;
@@ -264,18 +278,11 @@ test "string vector construction failures leave the builder and storage unchange
 test "partially overlapping string objects cannot be mutated" {
     const outer_length = 4 * runtime.sequence_length_size;
     const outer: [outer_length]u8 = @splat(0);
-    var storage: Reading.Storage(
-        0,
-        0,
-        .{ .count = 2, .bytes = outer_length },
-        0,
-    ) = .{};
+    var storage: runtime.Storage(Reading.Schema, .{
+        .tags = .{ .count = 2, .bytes = outer_length },
+    }, .{}) = .{};
     @memset(&storage.buffer, 0);
-    const bytes = try Reading.write(
-        &storage.buffer,
-        .{ .tags = &.{ &outer, "" } },
-        .{},
-    );
+    const bytes = try Reading.serialize(.{ .tags = &.{ &outer, "" } }, &storage.buffer, .{});
     const view = (try Reading.read(bytes)).tags.?;
     const target = try view.get(0);
     const position = @intFromPtr(target.ptr) - @intFromPtr(bytes.ptr);
@@ -287,23 +294,30 @@ test "partially overlapping string objects cannot be mutated" {
         @as(usize, runtime.sequence_length_size),
         (try view.get(1)).len,
     );
-    const before = storage.buffer;
     const replacement: [outer_length]u8 = @splat('a');
-    try std.testing.expectError(
-        error.InvalidBuffer,
-        Reading.update(bytes, .tags, &.{ &replacement, "abcd" }),
-    );
-    try std.testing.expectEqualSlices(u8, &before, &storage.buffer);
+    for ([_]bool{ false, true }) |nested_first| {
+        const target_starts = if (nested_first)
+            [_]usize{ position, position - runtime.sequence_length_size }
+        else
+            [_]usize{ position - runtime.sequence_length_size, position };
+        putOffset(bytes, view.payload_start, @intCast(target_starts[0] - view.payload_start));
+        putOffset(bytes, second_slot, @intCast(target_starts[1] - second_slot));
+        const values = if (nested_first)
+            [_][]const u8{ "abcd", &replacement }
+        else
+            [_][]const u8{ &replacement, "abcd" };
+        const before = storage.buffer;
+        try std.testing.expectError(error.InvalidBuffer, Reading.update(bytes, .tags, &values));
+        try std.testing.expectEqualSlices(u8, &before, &storage.buffer);
+    }
 }
 
 test "string vectors coexist with wide scalar vectors and optional fields" {
     const wide = [_]u64{ 0x0102030405060708, std.math.maxInt(u64) };
-    var storage: Reading.Storage(
-        0,
-        wide.len * 2,
-        .{ .count = 2, .bytes = 7 },
-        0,
-    ) = .{};
+    var storage: runtime.Storage(Reading.Schema, .{
+        .samples = wide.len * 2,
+        .tags = .{ .count = 2, .bytes = 7 },
+    }, .{}) = .{};
     var builder = runtime.Builder.init(&storage.buffer);
     const numbers = try builder.createVector(u64, &wide);
     const strings = try builder.createStringVector(&.{ "", "1234567" });
@@ -325,4 +339,106 @@ test "string vectors coexist with wide scalar vectors and optional fields" {
         @as(?bool, false),
         try table_view.readField(?bool, 2, null),
     );
+}
+
+test "string content checks follow metadata validation and verifier budgets" {
+    const Message = struct {
+        text: ?[]const u8 = null,
+
+        pub const Schema = runtime.Schema(@This(), .{
+            .text = runtime.ReferenceField(0, .string, .{}),
+        });
+    };
+    var storage: runtime.Storage(Message.Schema, .{ .text = 5 }, .{}) = .{};
+    const bytes = try Message.Schema.serialize(.{ .text = "valid" }, &storage.buffer, .{});
+    const table = try runtime.Table.from(bytes, .root);
+    const payload = (try table.readString(0)).?;
+    const payload_start = @intFromPtr(payload.ptr) - @intFromPtr(bytes.ptr);
+    const table_work = table.layout.table_size + table.layout.vtable_size +
+        Message.Schema.field_count;
+    const string_work = runtime.sequence_length_size + payload.len + runtime.string_terminator_size;
+    const max_work = table_work + string_work;
+
+    try std.testing.expectError(error.OutOfBounds, runtime.validation.stringPayload(&.{}));
+    try std.testing.expectEqualStrings("", try runtime.validation.stringPayload(&.{0}));
+    try std.testing.expectEqualStrings(
+        "a\x00b",
+        try runtime.validation.stringPayload("a\x00b\x00"),
+    );
+    try runtime.Verifier.verify(Message, bytes, .{ .max_work = max_work, .max_objects = 2 });
+    for ([_]usize{ payload_start, payload_start + payload.len }) |corrupt_start| {
+        const previous = bytes[corrupt_start];
+        bytes[corrupt_start] = 0xff;
+        defer bytes[corrupt_start] = previous;
+
+        var verifier = runtime.Verifier.init(bytes, .{ .max_work = max_work - 1 });
+        try std.testing.expectError(error.WorkLimit, verifier.verifyRoot(Message));
+        try std.testing.expectEqual(table_work, verifier.work_count);
+        try std.testing.expectEqual(@as(usize, 2), verifier.object_count);
+        try std.testing.expectError(
+            error.ObjectLimit,
+            runtime.Verifier.verify(Message, bytes, .{ .max_objects = 1 }),
+        );
+        try std.testing.expectError(
+            error.InvalidBuffer,
+            runtime.Verifier.verify(Message, bytes, .{ .max_work = max_work }),
+        );
+        try std.testing.expectError(error.InvalidBuffer, table.readString(0));
+    }
+    // Malformed metadata must fail before charging or scanning the string.
+    try runtime.write(
+        u32,
+        bytes,
+        payload_start - runtime.sequence_length_size,
+        std.math.maxInt(u32),
+    );
+    try std.testing.expectError(
+        error.OutOfBounds,
+        runtime.Verifier.verify(Message, bytes, .{ .max_work = table_work }),
+    );
+}
+
+test "shared empty strings preserve metadata during bulk updates" {
+    var storage: runtime.Storage(Reading.Schema, .{
+        .tags = .{ .count = 3, .bytes = 2 },
+    }, .{}) = .{};
+    @memset(&storage.buffer, 0);
+    const bytes = try Reading.serialize(.{ .tags = &.{ "", "é", "" } }, &storage.buffer, .{});
+    const view = (try Reading.read(bytes)).tags.?;
+    const empty = try view.get(0);
+    const target_start = @intFromPtr(empty.ptr) - @intFromPtr(bytes.ptr) -
+        runtime.sequence_length_size;
+    const last_slot = view.payload_start + 2 * runtime.field_offset_size;
+    putOffset(bytes, last_slot, @intCast(target_start - last_slot));
+    const text = try view.get(1);
+    const text_start = @intFromPtr(text.ptr) - @intFromPtr(&storage.buffer);
+    var expected = storage.buffer;
+    @memcpy(expected[text_start..][0..text.len], "à");
+    try std.testing.expect(try Reading.update(bytes, .tags, &.{ "", "à", "" }));
+    try std.testing.expectEqualSlices(u8, &expected, &storage.buffer);
+    try Reading.verify(bytes, .{});
+}
+
+test "string vector mutation rejects replacement descriptors in the frame" {
+    const padding: [64]u8 = @splat('a');
+    var storage: runtime.Storage(Reading.Schema, .{
+        .tags = .{ .count = 2, .bytes = padding.len },
+    }, .{}) = .{};
+    @memset(&storage.buffer, 0);
+    const bytes = try Reading.serialize(.{ .tags = &.{ &padding, "" } }, &storage.buffer, .{});
+    const view = (try Reading.read(bytes)).tags.?;
+    const payload = try view.get(0);
+    const descriptor_address = std.mem.alignForward(
+        usize,
+        @intFromPtr(payload.ptr),
+        @alignOf([]const u8),
+    );
+    const descriptor_start = descriptor_address - @intFromPtr(bytes.ptr);
+    const descriptors: *[2][]const u8 = @ptrCast(@alignCast(
+        bytes[descriptor_start..][0 .. 2 * @sizeOf([]const u8)],
+    ));
+    descriptors.* = .{ "", "" };
+    const before = storage.buffer;
+    try std.testing.expectError(error.AliasedInput, Reading.update(bytes, .tags, descriptors));
+    try std.testing.expectEqualSlices(u8, &before, &storage.buffer);
 }

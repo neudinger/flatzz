@@ -5,8 +5,8 @@ Run these commands from the Flatzz root:
 
 | Command | Action |
 | --- | --- |
-| `(cd example/generated && zig build run)` | Generate Reading and run the runtime-only app |
-| `(cd example/builder && zig build run)` | Generate Reading and run construction, mutation, and union examples |
+| `(cd example/generated && zig build run)` | Generate Reading; serialize native values and unions using only the runtime |
+| `(cd example/builder && zig build run)` | Generate Reading; run construction, mutation, and unions with Builder |
 | `(cd example/reflection && zig build run)` | Parse FBS into reflection metadata without Zast |
 | `(cd example/schema_json && zig build run)` | Generate BFBS/JSON and print output paths |
 

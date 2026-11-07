@@ -1,13 +1,112 @@
 //! Negative runtime API contracts. Each source is compiled separately by build.zig.
 //! Keep diagnostics beside their sources so test names and expectations stay aligned.
 
+/// Source and expected diagnostic for one independently compiled rejection case.
 pub const Case = struct {
+    /// Contextual suffix used for the generated source filename.
     name: []const u8,
+    /// Complete Zig source; intentionally invalid runtime API usage is preserved.
     source: []const u8,
+    /// Required diagnostic substring, independent of the runtime implementation.
     expected_error: []const u8,
 };
 
+/// Negative API contracts consumed by the root build.
 pub const cases = [_]Case{
+    .{
+        .name = "reference_callback_type",
+        .source =
+        \\const runtime = @import("runtime");
+        \\test "empty native inputs still reject invalid callbacks" {
+        \\    var storage: [64]u8 align(runtime.storage_alignment) = undefined;
+        \\    var builder = runtime.Builder.init(&storage);
+        \\    const values: []const []const u8 = &.{};
+        \\    _ = try builder.createReferenceVector(values, .{ .create = 123 });
+        \\}
+        \\
+        ,
+        .expected_error = "reference vector create must be a function or null",
+    },
+    .{
+        .name = "reference_unknown_callback_option",
+        .source =
+        \\const runtime = @import("runtime");
+        \\test "reference options reject misspelled callback names" {
+        \\    var storage: [64]u8 align(runtime.storage_alignment) = undefined;
+        \\    var builder = runtime.Builder.init(&storage);
+        \\    _ = try builder.createReferenceVector(&.{}, .{ .createe = null });
+        \\}
+        \\
+        ,
+        .expected_error = "unknown reference vector option: createe",
+    },
+    .{
+        .name = "reference_unknown_union_option",
+        .source =
+        \\const runtime = @import("runtime");
+        \\const Payload = runtime.Union(enum(u8) { none, text }, .{
+        \\    .none = .none,
+        \\    .text = .string,
+        \\});
+        \\test "union reference options reject unknown fields" {
+        \\    var storage: [64]u8 align(runtime.storage_alignment) = undefined;
+        \\    var builder = runtime.Builder.init(&storage);
+        \\    _ = try builder.createReferenceVector(&.{}, .{
+        \\        .union_type = Payload,
+        \\        .union_typ = Payload,
+        \\    });
+        \\}
+        \\
+        ,
+        .expected_error = "unknown reference vector option: union_typ",
+    },
+    .{
+        .name = "reference_options_record",
+        .source =
+        \\const runtime = @import("runtime");
+        \\test "reference options require a record" {
+        \\    var storage: [64]u8 align(runtime.storage_alignment) = undefined;
+        \\    var builder = runtime.Builder.init(&storage);
+        \\    _ = try builder.createReferenceVector(&.{}, false);
+        \\}
+        \\
+        ,
+        .expected_error = "reference vector options must be a record",
+    },
+    .{
+        .name = "reference_elements",
+        .source =
+        \\const runtime = @import("runtime");
+        \\test "completed references require typed handles" {
+        \\    var storage: [64]u8 align(runtime.storage_alignment) = undefined;
+        \\    var builder = runtime.Builder.init(&storage);
+        \\    _ = try builder.createReferenceVector(&[_]u32{4}, .{});
+        \\}
+        \\
+        ,
+        .expected_error = "expected type '[]const runtime.Builder.Offset', found '*const [1]u32'",
+    },
+    .{
+        .name = "prepared_union_pair",
+        .source =
+        \\const runtime = @import("runtime");
+        \\const Payload = runtime.Union(enum(u8) { none, text }, .{
+        \\    .none = .none,
+        \\    .text = .string,
+        \\});
+        \\const Values = struct { history: ?[]const Payload.Value = null };
+        \\const Definition = runtime.Schema(Values, .{
+        \\    .history = runtime.UnionVectorField(Payload, .{ .tag = 0, .value = 1 }, .{}),
+        \\});
+        \\test "prepared union vectors require both handles" {
+        \\    const handle: runtime.Builder.Offset = @fromBackingInt(@as(u32, 4));
+        \\    const fields: Definition.Fields = .{ .history = .{ .tag = handle } };
+        \\    _ = fields;
+        \\}
+        \\
+        ,
+        .expected_error = "missing struct field: value",
+    },
     .{
         .name = "read_only",
         .source =
@@ -37,7 +136,7 @@ pub const cases = [_]Case{
         .source =
         \\const runtime = @import("runtime");
         \\comptime {
-        \\    _ = runtime.Vector(runtime.ScalarCodec(u128));
+        \\    _ = runtime.VectorView(runtime.ScalarCodec(u128), .read_only);
         \\}
         \\
         ,
@@ -117,7 +216,7 @@ pub const cases = [_]Case{
         \\    pub const slot_alignment = 3;
         \\};
         \\comptime {
-        \\    _ = runtime.Vector(Codec);
+        \\    _ = runtime.VectorView(Codec, .read_only);
         \\}
         \\
         ,
@@ -289,7 +388,7 @@ pub const cases = [_]Case{
         \\        .size = 4,
         \\        .alignment = 4,
         \\    }, .{ .number = runtime.ScalarMember(u32, 0) });
-        \\    const vector: runtime.Vector(runtime.StructCodec(Layout)) = undefined;
+        \\    const vector: runtime.VectorView(runtime.StructCodec(Layout), .read_only) = undefined;
         \\    const value = try vector.get(0);
         \\    try value.update(.number, 42);
         \\}

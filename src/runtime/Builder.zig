@@ -23,18 +23,20 @@
 //! https://github.com/google/flatbuffers/blob/b8431fbcd7a5c71817f314e18b332c0648554efa/include/flatbuffers/flatbuffer_builder.h
 //! https://github.com/google/flatbuffers/blob/b8431fbcd7a5c71817f314e18b332c0648554efa/go/builder.go
 //! https://github.com/dvidelabs/flatcc/blob/e1272290b486fdd7fdc60f061036b7a18c468dc7/include/flatcc/flatcc_builder.h
-const standard_library = @import("std");
+const std = @import("std");
 const wire = @import("wire.zig");
 const validation = @import("validation.zig");
+const errors = @import("errors.zig");
+
 const Self = @This();
 /// Construction failures; capacity and input checks precede writes.
-pub const Error = @import("errors.zig").BuildError;
+pub const Error = errors.BuildError;
 const sequence_length_size = wire.sequence_length_size;
 const string_terminator_size = wire.string_terminator_size;
 const field_offset_size = wire.field_offset_size;
 
 /// Conservative implementation limit, not a limit of every FlatBuffers variant.
-pub const max_buffer_size = standard_library.math.maxInt(i32);
+pub const max_buffer_size = std.math.maxInt(i32);
 /// Handles must originate from this builder since its last reset. Like Go
 /// UOffsetT/C++ Offset, the representation does not encode ownership or type.
 pub const Offset = enum(u32) { _ };
@@ -65,6 +67,9 @@ pub const FinishOptions = union(enum) {
 buffer: []align(wire.storage_alignment) u8,
 /// Free prefix ends here; the suffix contains completed and active objects.
 write_cursor: usize,
+/// Protected prefix of pending native vector offsets, within final output capacity.
+/// Child writes stay above this boundary; reset releases every reservation.
+scratch_cursor: usize = 0,
 /// Strongest wire alignment used so far; finish preserves it in the root frame.
 min_alignment: usize = wire.root_offset_size,
 /// Current construction phase; transitions are managed by the builder APIs.
@@ -79,7 +84,7 @@ force_defaults: bool = false,
 /// Borrow storage, rounding usable capacity down to `storage_alignment` bytes.
 /// Storage must outlive this builder and every returned frame; no deinit is needed.
 pub fn init(storage: []align(wire.storage_alignment) u8) Self {
-    const usable_capacity = standard_library.mem.alignBackward(
+    const usable_capacity = std.mem.alignBackward(
         usize,
         storage.len,
         wire.storage_alignment,
@@ -118,80 +123,13 @@ pub fn createStruct(
     return @fromBackingInt(try self.prependStruct(Layout, value));
 }
 
-/// Parallel tag and payload-offset vectors produced by `createUnionVector`.
+/// Parallel tag and payload-offset vectors produced by `createReferenceVector`.
 pub const UnionVector = struct {
     /// Handle of the byte-tag vector.
     tag: Offset,
     /// Handle of the payload-offset vector, including zero slots for `none`.
     value: Offset,
 };
-
-/// Two vectors, one atomic preflight. NONE emits a literal zero offset; normal
-/// offset vectors continue to reject null handles. No scratch allocation.
-/// Input must not alias builder storage, and payload handles must be completed
-/// children of this builder. Input/state/capacity failures leave construction intact.
-pub fn createUnionVector(
-    self: *Self,
-    comptime UnionType: type,
-    values: []const UnionType.Value,
-) Error!UnionVector {
-    if (self.state != .ready) return Error.InvalidState;
-    const pair_size = field_offset_size + @sizeOf(wire.UnionTag);
-    const prefixes = sequence_length_size + sequence_length_size;
-    const maximum_padding = (field_offset_size - 1) + (sequence_length_size - 1);
-    if (values.len > (max_buffer_size - prefixes - maximum_padding) / pair_size)
-        return Error.BufferTooLarge;
-    const payload_size = values.len * field_offset_size;
-    const value_padding = wire.paddingFor(
-        self.used() + payload_size,
-        field_offset_size,
-    );
-    const value_size = sequence_length_size + payload_size + value_padding;
-    const tag_padding = wire.paddingFor(
-        self.used() + value_size + values.len,
-        sequence_length_size,
-    );
-    const tag_size = sequence_length_size + values.len + tag_padding;
-    const required_bytes = value_size + tag_size;
-    if (self.used() > max_buffer_size - required_bytes)
-        return Error.BufferTooLarge;
-    try self.ensureSpace(required_bytes);
-    if (validation.overlaps(
-        self.buffer,
-        standard_library.mem.sliceAsBytes(values),
-    ))
-        return Error.AliasedInput;
-    for (values) |value| {
-        if (UnionType.offset(value)) |handle|
-            try self.checkOffset(handle, self.used());
-    }
-    const values_start = self.write_cursor - value_size;
-    const values_payload = values_start + sequence_length_size;
-    const tags_start = values_start - tag_size;
-    const tags_payload = tags_start + sequence_length_size;
-    for (values, 0..) |value, element_index| {
-        const reference_start = values_payload + element_index * field_offset_size;
-        self.encodeOffset(reference_start, UnionType.offset(value));
-    }
-    const value_handle = self.finishSequence(
-        values_start,
-        values_payload + payload_size,
-        values.len,
-        field_offset_size,
-    );
-    for (values, 0..) |value, element_index| {
-        self.buffer[tags_payload + element_index] = @backingInt(UnionType.tag(
-            value,
-        ));
-    }
-    const tag_handle = self.finishSequence(
-        tags_start,
-        tags_payload + values.len,
-        values.len,
-        sequence_length_size,
-    );
-    return .{ .tag = tag_handle, .value = value_handle };
-}
 
 /// Copy scalar values into a present vector; an empty slice remains present.
 /// Supported element types follow `wire.Bits`. Input may borrow builder storage.
@@ -259,20 +197,17 @@ fn createSequence(
     // Include previously built objects without overflowing the addition.
     if (self.used() > max_buffer_size - size) return Error.BufferTooLarge;
     const alignment = @max(sequence_length_size, element_alignment);
-    const padding = wire.paddingFor(
-        self.used() + payload_size + trailer_size,
-        alignment,
-    );
+    const padding = wire.paddingFor(self.used() + payload_size + trailer_size, alignment);
     const required_bytes = size + padding;
     try self.ensureSpace(required_bytes);
     switch (kind) {
-        .string => if (!standard_library.unicode.utf8ValidateSlice(
+        .string => if (!std.unicode.utf8ValidateSlice(
             values,
         )) return Error.InvalidUtf8,
         .vector => {},
         .structure => if (validation.overlaps(
             self.buffer,
-            standard_library.mem.sliceAsBytes(values),
+            std.mem.sliceAsBytes(values),
         )) return Error.AliasedInput,
     }
 
@@ -285,12 +220,7 @@ fn createSequence(
         .string, .vector => wire.encodeSlice(Element, destination, values),
         .structure => Element.encodeSlice(destination, values),
     }
-    return self.finishSequence(
-        next_cursor,
-        payload_start + payload_size,
-        values.len,
-        alignment,
-    );
+    return self.finishSequence(next_cursor, payload_start + payload_size, values.len, alignment);
 }
 
 /// Like C++ CreateVectorOfStrings, create children before their offsets.
@@ -308,7 +238,7 @@ pub fn createStringVector(
     // Child writes must not overwrite the descriptors used to build later children.
     if (validation.overlaps(
         self.buffer,
-        standard_library.mem.sliceAsBytes(values),
+        std.mem.sliceAsBytes(values),
     )) return Error.AliasedInput;
     var strings_size: usize = 0;
     for (values) |value| {
@@ -325,9 +255,7 @@ pub fn createStringVector(
             sequence_length_size,
         );
         try self.ensureSpace(strings_size + size + padding);
-        if (!standard_library.unicode.utf8ValidateSlice(
-            value,
-        )) return Error.InvalidUtf8;
+        if (!std.unicode.utf8ValidateSlice(value)) return Error.InvalidUtf8;
         // Building one child must not overwrite another child's source bytes.
         if (validation.overlaps(self.buffer, value)) return Error.AliasedInput;
         strings_size += size + padding;
@@ -337,10 +265,7 @@ pub fn createStringVector(
     // The offset array must also fit after accounting for every padded string.
     if (vector_size > max_buffer_size - self.used() - strings_size)
         return Error.BufferTooLarge;
-    const padding = wire.paddingFor(
-        self.used() + strings_size + payload_size,
-        field_offset_size,
-    );
+    const padding = wire.paddingFor(self.used() + strings_size + payload_size, field_offset_size);
     const required_bytes = strings_size + vector_size + padding;
     try self.ensureSpace(required_bytes);
     const next_cursor = self.write_cursor - required_bytes;
@@ -359,38 +284,197 @@ pub fn createStringVector(
     );
 }
 
-/// Builds a vector of already completed object handles. Sources cannot borrow
-/// storage: writing relative offsets must not destroy handles yet to be read.
-/// Empty input is present. State, alias, handle, and capacity checks precede writes;
-/// numeric handles cannot prove their originating builder or object type.
-pub fn createOffsetVector(self: *Self, values: []const Offset) Error!Offset {
-    if (self.state != .ready) return Error.InvalidState;
-    if (values.len > (max_buffer_size - sequence_length_size) / field_offset_size)
+const ReferenceOption = enum { union_type, create };
+
+const ReferenceVectorLayout = struct {
+    value_size: usize,
+    tag_size: usize,
+};
+
+fn referenceVectorLayout(
+    self: *const Self,
+    comptime union_values: bool,
+    count: usize,
+) Error!ReferenceVectorLayout {
+    const payload_size = count * field_offset_size;
+    const value_size = sequence_length_size + payload_size +
+        wire.paddingFor(self.used() + payload_size, field_offset_size);
+    const tag_size = if (union_values) sequence_length_size + count + wire.paddingFor(
+        self.used() + value_size + count,
+        sequence_length_size,
+    ) else 0;
+    if (union_values and self.used() > max_buffer_size - value_size - tag_size)
         return Error.BufferTooLarge;
-    if (validation.overlaps(
-        self.buffer,
-        standard_library.mem.sliceAsBytes(values),
-    )) return Error.AliasedInput;
-    for (values) |value| try self.checkOffset(value, self.used());
-    const payload_size = values.len * field_offset_size;
-    const padding = wire.paddingFor(
-        self.used() + payload_size,
-        field_offset_size,
-    );
-    const required_bytes = sequence_length_size + payload_size + padding;
-    try self.ensureSpace(required_bytes);
-    const next_cursor = self.write_cursor - required_bytes;
-    const payload_start = next_cursor + sequence_length_size;
-    for (values, 0..) |value, element_index| {
-        const reference_start = payload_start + element_index * field_offset_size;
-        self.encodeOffset(reference_start, value);
+    return .{
+        .value_size = value_size,
+        .tag_size = tag_size,
+    };
+}
+
+// Normalize compile-time options once for both the public result and construction mode.
+fn ReferenceVectorOptions(comptime options: anytype) type {
+    const options_info = @typeInfo(@TypeOf(options));
+    if (options_info != .@"struct")
+        @compileError("reference vector options must be a record");
+    for (options_info.@"struct".field_names) |field_name| {
+        if (std.meta.stringToEnum(ReferenceOption, field_name) == null)
+            @compileError("unknown reference vector option: " ++ field_name);
     }
-    return self.finishSequence(
-        next_cursor,
-        payload_start + payload_size,
-        values.len,
-        field_offset_size,
-    );
+    const SelectedUnion: ?type = if (@hasField(@TypeOf(options), "union_type"))
+        options.union_type
+    else
+        null;
+    const callback = if (@hasField(@TypeOf(options), "create"))
+        if (@typeInfo(@TypeOf(options.create)) == .optional)
+            if (options.create) |present| present else null
+        else
+            options.create
+    else
+        null;
+    const valid_callback = switch (@typeInfo(@TypeOf(callback))) {
+        .null, .@"fn" => true,
+        .pointer => |info| info.size == .one and @typeInfo(info.child) == .@"fn",
+        else => false,
+    };
+    if (!valid_callback)
+        @compileError("reference vector create must be a function or null");
+    return struct {
+        const UnionType = SelectedUnion;
+        const create = callback;
+        const Result = if (SelectedUnion != null) UnionVector else Offset;
+    };
+}
+
+/// Build a reference vector from completed handles or native values, without allocation.
+/// Compile-time options accept only union_type and create; unknown names are rejected.
+/// .{} accepts completed Offset handles. Omitted or null union_type returns Offset;
+/// a union type returns paired UnionVector handles and accepts its Handle elements.
+/// Omitted or null create selects completed handles, including nullable callback fields.
+/// Non-null callbacks must be functions or function pointers. Supply typed arrays/slices
+/// for union literals. Empty input is present; none union payloads emit zero
+/// offsets, while ordinary vectors reject zero handles.
+/// A create callback packs native elements in order, returning Offset for tables
+/// or UnionType.Handle for unions. Union callbacks also receive UnionType first.
+/// Callbacks must preserve the active prefix reservation, leave the builder ready,
+/// and retain the input union tag. All input and callback borrows must avoid storage.
+/// Completed-handle errors leave construction intact; native errors may retain children.
+/// Native temporary u32 handles reuse eventual output capacity, including nested vectors.
+/// Returned handles belong to this builder until reset; numerical checks cannot
+/// establish a handle's originating builder or object type.
+///
+/// Fragment with flatzz = @import("flatzz"), a ready builder, and a completed
+/// child_handle from that builder:
+/// ```zig
+/// const handles = [_]flatzz.Builder.Offset{child_handle};
+/// const vector = try builder.createReferenceVector(&handles, .{});
+/// ```
+/// Expected result: vector is a present one-element offset vector; nothing is printed.
+/// For union handles use .{ .union_type = Payload }; for native tables use
+/// .{ .create = packChild }. Native unions combine both options with packUnion.
+pub fn createReferenceVector(
+    self: *Self,
+    input_values: anytype,
+    comptime options: anytype,
+) Error!ReferenceVectorOptions(options).Result {
+    const Config = ReferenceVectorOptions(options);
+    const UnionType = Config.UnionType;
+    const create = Config.create;
+    const native_values = @TypeOf(create) != @TypeOf(null);
+    const values = if (native_values)
+        input_values
+    else
+        @as([]const (if (UnionType) |Selected| Selected.Handle else Offset), input_values);
+    const union_values = UnionType != null;
+
+    // Preflight sizes and aliases; completed unions check capacity before handles.
+    if (self.state != .ready) return Error.InvalidState;
+    const element_size = field_offset_size + if (union_values) @sizeOf(wire.UnionTag) else 0;
+    const overhead = sequence_length_size + if (union_values)
+        sequence_length_size + 2 * (field_offset_size - 1)
+    else
+        0;
+    if (values.len > (max_buffer_size - overhead) / element_size) return Error.BufferTooLarge;
+    const input_width = @max(1, @sizeOf(std.meta.Elem(@TypeOf(values))));
+    if (values.len > std.math.maxInt(usize) / input_width) return Error.BufferTooLarge;
+    var layout: ReferenceVectorLayout = undefined;
+    if (!native_values) {
+        layout = try self.referenceVectorLayout(union_values, values.len);
+        if (union_values) try self.ensureSpace(layout.value_size + layout.tag_size);
+    }
+    if (validation.overlaps(self.buffer, std.mem.sliceAsBytes(values))) return Error.AliasedInput;
+
+    // Reserve native handles while building children, or check completed handles.
+    const marker = self.scratch_cursor;
+    defer self.scratch_cursor = marker;
+    var handles: []u32 = undefined;
+    if (native_values) {
+        const payload_size = values.len * field_offset_size;
+        if (marker > max_buffer_size - payload_size - (field_offset_size - 1))
+            return Error.BufferTooLarge;
+        const start = std.mem.alignForward(usize, marker, field_offset_size);
+        const end = start + payload_size;
+        if (end > self.write_cursor) return Error.NoSpaceLeft;
+        self.scratch_cursor = end;
+        const bytes: []align(field_offset_size) u8 = @alignCast(self.buffer[start..end]);
+        handles = std.mem.bytesAsSlice(u32, bytes);
+        for (values, handles) |value, *stored| {
+            const built = if (UnionType) |Selected|
+                try create(Selected, self, value)
+            else
+                try create(self, value);
+            if (self.state != .ready or self.scratch_cursor != end) return Error.InvalidState;
+            if (union_values and std.meta.activeTag(built) != std.meta.activeTag(value))
+                return Error.InvalidUnion;
+            const handle: ?Offset = if (UnionType) |Selected| Selected.offset(built) else built;
+            if (handle) |present| try self.checkOffset(present, self.used());
+            stored.* = if (handle) |present| @backingInt(present) else 0;
+        }
+        self.scratch_cursor = marker;
+        layout = try self.referenceVectorLayout(union_values, values.len);
+    } else {
+        for (values) |value| {
+            const handle: ?Offset = if (UnionType) |Selected| Selected.offset(value) else value;
+            if (handle) |present| try self.checkOffset(present, self.used());
+        }
+    }
+    if (native_values or !union_values) try self.ensureSpace(layout.value_size + layout.tag_size);
+
+    // Encode payload offsets before sequence metadata, then emit any union tags.
+    const value = value_vector_blk: {
+        const value_start = self.write_cursor - layout.value_size;
+        const value_payload = value_start + sequence_length_size;
+        // Final slots lie above the prefix. Read high slots first so overlapping
+        // writes cannot destroy handles that remain to be read.
+        for (0..values.len) |reverse_index| {
+            const index = values.len - reverse_index - 1;
+            const handle: ?Offset = if (native_values)
+                if (handles[index] == 0) null else @as(Offset, @fromBackingInt(handles[index]))
+            else if (UnionType) |Selected| Selected.offset(values[index]) else values[index];
+            self.encodeOffset(value_payload + index * field_offset_size, handle);
+        }
+        const value_end = value_payload + values.len * field_offset_size;
+        break :value_vector_blk self.finishSequence(
+            value_start,
+            value_end,
+            values.len,
+            field_offset_size,
+        );
+    };
+    if (!union_values) return value;
+    const tag = tag_vector_blk: {
+        const tag_start = self.write_cursor - layout.tag_size;
+        const tag_payload = tag_start + sequence_length_size;
+        for (values, 0..) |element, element_index|
+            self.buffer[tag_payload + element_index] = @backingInt(std.meta.activeTag(element));
+        const tag_end = tag_payload + values.len;
+        break :tag_vector_blk self.finishSequence(
+            tag_start,
+            tag_end,
+            values.len,
+            sequence_length_size,
+        );
+    };
+    return .{ .value = value, .tag = tag };
 }
 
 // All callers preflight handles, capacity, and aliases before encoding slots.
@@ -400,11 +484,7 @@ fn encodeOffset(self: *Self, reference_start: usize, handle: ?Offset) void {
         @intCast(self.buffer.len - @backingInt(present) - reference_start)
     else
         0;
-    wire.encode(
-        u32,
-        self.buffer[reference_start..][0..field_offset_size],
-        relative_offset,
-    );
+    wire.encode(u32, self.buffer[reference_start..][0..field_offset_size], relative_offset);
 }
 
 /// Commits preflighted metadata after copying the payload. Scalar, string, and
@@ -444,10 +524,7 @@ pub fn finish(
     const root_offset = @backingInt(root_handle);
     const table_start = self.buffer.len - root_offset;
     // A numerical handle alone does not prove it points to a completed table.
-    const layout = validation.tableAt(
-        self.buffer,
-        table_start,
-    ) catch return Error.InvalidOffset;
+    const layout = validation.tableAt(self.buffer, table_start) catch return Error.InvalidOffset;
     if (layout.vtable_start < self.write_cursor) return Error.InvalidOffset;
     const prefix_size = comptime switch (options) {
         .ordinary, .identifier => 0,
@@ -457,37 +534,22 @@ pub fn finish(
         .ordinary, .size_prefixed => wire.root_offset_size,
         .identifier, .size_prefixed_identifier => wire.identified_header_size,
     };
-    const padding = wire.paddingFor(
-        self.used() + header_size,
-        self.min_alignment,
-    );
+    const padding = wire.paddingFor(self.used() + header_size, self.min_alignment);
     const required_bytes = padding + header_size;
     try self.ensureSpace(required_bytes);
     const next_cursor = self.write_cursor - required_bytes;
     const root_offset_start = next_cursor + prefix_size;
     // The root displacement starts at its slot, after any size prefix.
-    const relative_offset: u32 = @intCast(
-        self.used() + required_bytes - root_offset - prefix_size,
-    );
-    @memset(
-        self.buffer[next_cursor..self.write_cursor],
-        0,
-    );
+    const relative_offset: u32 = @intCast(self.used() + required_bytes - root_offset - prefix_size);
+    @memset(self.buffer[next_cursor..self.write_cursor], 0);
     switch (options) {
         .ordinary, .size_prefixed => {},
         .identifier, .size_prefixed_identifier => |identifier| {
             const identifier_start = root_offset_start + wire.file_identifier_start;
-            @memcpy(
-                self.buffer[identifier_start..][0..wire.file_identifier_size],
-                &identifier,
-            );
+            @memcpy(self.buffer[identifier_start..][0..wire.file_identifier_size], &identifier);
         },
     }
-    wire.encode(
-        u32,
-        self.buffer[root_offset_start..][0..wire.root_offset_size],
-        relative_offset,
-    );
+    wire.encode(u32, self.buffer[root_offset_start..][0..wire.root_offset_size], relative_offset);
     switch (options) {
         .ordinary, .identifier => {},
         .size_prefixed, .size_prefixed_identifier => wire.encode(
@@ -509,8 +571,8 @@ pub fn used(self: *const Self) usize {
 /// Shared by TableBuilder. These low-level operations require an active context
 /// or a caller that has checked its own construction state.
 pub fn ensureSpace(self: *const Self, required_bytes: usize) Error!void {
-    // Backward writes can consume only the free prefix below write_cursor.
-    if (required_bytes > self.write_cursor) return Error.NoSpaceLeft;
+    // Scratch occupies the low prefix; output grows backward toward it.
+    if (required_bytes > self.write_cursor - self.scratch_cursor) return Error.NoSpaceLeft;
     // Subtract before adding to enforce the signed-distance limit without overflow.
     if (required_bytes > max_buffer_size or self.used() > max_buffer_size - required_bytes)
         return Error.BufferTooLarge;
@@ -553,6 +615,7 @@ pub fn prependScalar(
 /// C++ AddStruct placement, with member encoding instead of native ABI copies.
 /// TableBuilder records the returned distance immediately; it is not a handle
 /// to a reusable referenced object. Capacity/alias failures leave state intact.
+/// This low-level operation does not check construction state.
 pub fn prependStruct(
     self: *Self,
     comptime Layout: type,
@@ -570,7 +633,7 @@ pub fn prependStruct(
     // Native aggregates may be passed by reference, even with value syntax.
     if (validation.overlaps(
         self.buffer,
-        standard_library.mem.asBytes(&value),
+        std.mem.asBytes(&value),
     )) return Error.AliasedInput;
     const next_cursor = self.write_cursor - required_bytes;
     Layout.encode(self.buffer[next_cursor..][0..Layout.wire_size], value);

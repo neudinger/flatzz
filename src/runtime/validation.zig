@@ -1,9 +1,11 @@
 //! Local checks only: opening one object does not verify its reachable graph.
 //! Positions are relative to the complete frame, including any size prefix.
 //! Helpers allocate nothing; returned payload slices borrow the supplied bytes.
-const standard_library = @import("std");
+const std = @import("std");
 const wire = @import("wire.zig");
-const AccessError = @import("errors.zig").AccessError;
+const errors = @import("errors.zig");
+
+const AccessError = errors.AccessError;
 
 /// Byte interval described without computing a potentially overflowing end.
 pub const Range = struct {
@@ -127,27 +129,14 @@ pub fn writeScalar(
     wire.encode(ScalarType, bytes[scalar_start..][0..scalar_size], value);
 }
 
-/// Read an ordinary frame's root displacement without validating the target table.
-/// Reject a displacement into its own slot; this helper does not accept a size prefix.
-pub fn rootPosition(bytes: []const u8) AccessError!usize {
-    const table_start = try readScalar(u32, bytes, 0);
-    // Ordinary 32-bit framing; an optional identifier is ignored here.
-    if (table_start < wire.root_offset_size) return AccessError.InvalidBuffer;
-    return table_start;
-}
-
 /// Checks only the marker, not schema validity. No size prefix is accepted.
 /// A missing identifier has no separate wire flag: compare the expected bytes.
 pub fn checkIdentifier(
     bytes: []const u8,
     expected_identifier: [wire.file_identifier_size]u8,
 ) AccessError!void {
-    try checkRange(
-        bytes.len,
-        wire.file_identifier_start,
-        wire.file_identifier_size,
-    );
-    if (!standard_library.mem.eql(
+    try checkRange(bytes.len, wire.file_identifier_start, wire.file_identifier_size);
+    if (!std.mem.eql(
         u8,
         bytes[wire.file_identifier_start..wire.identified_header_size],
         &expected_identifier,
@@ -177,13 +166,11 @@ pub fn tableAt(bytes: []const u8, table_start: usize) AccessError!TableLayout {
     if (vtable_start < wire.root_offset_size or vtable_start % wire.vtable_entry_size != 0)
         return AccessError.InvalidBuffer;
     const vtable_size = try readScalar(u16, bytes, vtable_start);
-    const table_size = try readScalar(
-        u16,
-        bytes,
-        vtable_start + wire.vtable_table_size_offset,
-    );
+    const table_size = try readScalar(u16, bytes, vtable_start + wire.vtable_table_size_offset);
     // Complete headers and complete u16 entries are required before field lookup.
-    if (vtable_size < wire.vtable_header_size or vtable_size % wire.vtable_entry_size != 0 or table_size < wire.table_header_size)
+    if (vtable_size < wire.vtable_header_size or
+        vtable_size % wire.vtable_entry_size != 0 or
+        table_size < wire.table_header_size)
         return AccessError.InvalidBuffer;
     try checkRange(bytes.len, vtable_start, vtable_size);
     try checkRange(bytes.len, table_start, table_size);
@@ -216,19 +203,13 @@ pub fn fieldPosition(
     comptime layout: FieldLayout,
 ) AccessError!?usize {
     const field_alignment = comptime layout.alignment orelse layout.size;
-    if (field_id >= wire.max_field_count) @compileError(
-        "field ID exceeds the maximum vtable size",
-    );
+    if (field_id >= wire.max_field_count) @compileError("field ID exceeds the maximum vtable size");
     const vtable_entry_offset = wire.vtable_header_size + wire.vtable_entry_size * field_id;
     // Older schemas and trimmed vtables legitimately lack later slots.
     if (vtable_entry_offset + wire.vtable_entry_size > table.vtable_size)
         return null;
     try checkRange(bytes.len, table.vtable_start, table.vtable_size);
-    const field_offset = try readScalar(
-        u16,
-        bytes,
-        table.vtable_start + vtable_entry_offset,
-    );
+    const field_offset = try readScalar(u16, bytes, table.vtable_start + vtable_entry_offset);
     if (field_offset == wire.absent_field_offset) return null;
     // A present field cannot overwrite the table's signed vtable displacement.
     if (field_offset < wire.table_header_size) return AccessError.InvalidBuffer;
@@ -248,7 +229,7 @@ pub fn inlineRange(
     comptime value_alignment: usize,
 ) AccessError!void {
     comptime {
-        if (value_size == 0 or !standard_library.math.isPowerOfTwo(
+        if (value_size == 0 or !std.math.isPowerOfTwo(
             value_alignment,
         )) @compileError("invalid inline size or alignment");
     }
@@ -275,6 +256,7 @@ pub fn referenceTarget(
 /// Follow a reference and validate a sequence's count, payload, trailer, and context.
 /// Element size/alignment must describe a supported nonzero wire layout. Empty
 /// payloads need no element alignment. The trailer's contents are checked by callers.
+/// This low-level helper does not validate its compile-time layout parameters.
 pub fn sequenceAt(
     comptime element_size: usize,
     comptime element_alignment: usize,
@@ -311,7 +293,7 @@ pub fn stringAt(
     context: Context,
     reference_start: usize,
 ) AccessError![]const u8 {
-    const sequence = try sequenceAt(
+    const layout = try sequenceAt(
         @sizeOf(u8),
         @sizeOf(u8),
         wire.string_terminator_size,
@@ -319,14 +301,20 @@ pub fn stringAt(
         context,
         reference_start,
     );
-    const payload_end = sequence.payload_start + sequence.element_count;
-    if (bytes[payload_end] != wire.string_terminator)
+    const string_size = layout.element_count + wire.string_terminator_size;
+    return stringPayload(bytes[layout.payload_start..][0..string_size]);
+}
+
+/// Validate a bounded string including its zero terminator; return borrowed UTF-8 without it.
+/// Empty input returns OutOfBounds; a nonzero terminator or invalid text returns InvalidBuffer.
+/// Wire callers validate metadata separately; budgeted traversals charge before this scan.
+pub fn stringPayload(terminated: []const u8) AccessError![]const u8 {
+    if (terminated.len < wire.string_terminator_size) return AccessError.OutOfBounds;
+    const payload = terminated[0 .. terminated.len - wire.string_terminator_size];
+    if (terminated[payload.len] != wire.string_terminator)
         return AccessError.InvalidBuffer;
-    const payload = bytes[sequence.payload_start..payload_end];
     // This runtime's preserved UTF-8 policy is stricter than C++ VerifyString.
-    if (!standard_library.unicode.utf8ValidateSlice(
-        payload,
-    )) return AccessError.InvalidBuffer;
+    if (!std.unicode.utf8ValidateSlice(payload)) return AccessError.InvalidBuffer;
     return payload;
 }
 
@@ -357,7 +345,8 @@ pub fn referencedTable(
         ))
             return AccessError.InvalidBuffer;
         // Identical shared vtables are legal; partial metadata overlap is not.
-        const shared_vtable = table.vtable_start == parent.vtable_start and table.vtable_size == parent.vtable_size;
+        const shared_vtable = table.vtable_start == parent.vtable_start and
+            table.vtable_size == parent.vtable_size;
         if (!shared_vtable and rangesOverlap(
             vtable_range,
             .{ .start = parent.vtable_start, .size = parent.vtable_size },

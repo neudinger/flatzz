@@ -6,7 +6,7 @@
 //! Example inside a test with `std = @import("std")` and
 //! `runtime = @import("flatzz")` imported:
 //! ```zig
-//! const values: runtime.Vector(runtime.ScalarCodec(u16)) = .{
+//! const values: runtime.VectorView(runtime.ScalarCodec(u16), .read_only) = .{
 //!     .bytes = &.{ 42, 0, 7, 0 },
 //!     .payload_start = 0,
 //!     .element_count = 2,
@@ -18,9 +18,14 @@
 //! scalar payload has no vector count prefix; use `fromReference` for wire vectors.
 const wire = @import("wire.zig");
 const validation = @import("validation.zig");
-const AccessError = @import("errors.zig").AccessError;
-const TableView = @import("table_view.zig");
-const StructView = @import("struct_view.zig").StructView;
+const errors = @import("errors.zig");
+const table_view = @import("table_view.zig");
+const struct_view = @import("struct_view.zig");
+
+const AccessError = errors.AccessError;
+const TableView = table_view.TableView;
+const Access = table_view.Access;
+const StructView = struct_view.StructView;
 
 /// Encoding of one vector slot; strings and tables contain forward offsets.
 pub const ElementKind = enum {
@@ -125,7 +130,7 @@ pub const StringCodec = struct {
 pub fn TableCodec(comptime ChildSchema: type) type {
     return struct {
         /// Child table view borrowing the complete input frame.
-        pub const Value = TableView.TableView(.read_only);
+        pub const Value = TableView(.read_only);
         /// Named child adapter resolved lazily during full schema verification.
         pub const Schema = ChildSchema;
         /// Selects forward table-offset handling.
@@ -143,28 +148,18 @@ pub fn TableCodec(comptime ChildSchema: type) type {
         ) AccessError!Value {
             return .{
                 .bytes = bytes,
-                .layout = try validation.referencedTable(
-                    bytes,
-                    context,
-                    element_start,
-                ),
+                .layout = try validation.referencedTable(bytes, context, element_start),
             };
         }
     };
 }
 
-/// Read-only borrowed vector specialized for a codec; no storage is allocated.
-pub fn Sequence(comptime ElementCodec: type) type {
-    return SequenceView(ElementCodec, .read_only);
-}
-
 /// Create a borrowed vector type; invalid codec size/alignment fails at compile time.
-/// Preserve existing read-only Sequence(Codec) calls. Mutable vector storage
-/// additionally permits borrowed mutable struct elements; other codecs retain
-/// their existing result types and reference-mutation contracts.
+/// Mutable vector storage permits borrowed mutable struct elements; other codecs
+/// retain their existing result types and reference-mutation contracts.
 pub fn SequenceView(
     comptime ElementCodec: type,
-    comptime access: TableView.Access,
+    comptime access: Access,
 ) type {
     comptime {
         if (ElementCodec.slot_size == 0 or ElementCodec.slot_alignment == 0 or
@@ -220,7 +215,7 @@ pub fn SequenceView(
         }
 
         /// Drop mutation capability while continuing to borrow the same frame and context.
-        pub fn asReadOnly(self: Self) Sequence(ElementCodec) {
+        pub fn asReadOnly(self: Self) SequenceView(ElementCodec, .read_only) {
             return .{
                 .bytes = self.bytes,
                 .payload_start = self.payload_start,
@@ -234,7 +229,10 @@ pub fn SequenceView(
             self: Self,
             element_index: usize,
         ) AccessError!usize {
-            if (self.payload_start > self.bytes.len or self.element_count > (self.bytes.len - self.payload_start) / ElementCodec.slot_size or element_index >= self.element_count)
+            if (self.payload_start > self.bytes.len or
+                self.element_count >
+                    (self.bytes.len - self.payload_start) / ElementCodec.slot_size or
+                element_index >= self.element_count)
                 return AccessError.OutOfBounds;
             if (self.payload_start % ElementCodec.slot_alignment != 0)
                 return AccessError.InvalidBuffer;
@@ -245,10 +243,7 @@ pub fn SequenceView(
         /// count prefix so a child vtable cannot reinterpret vector metadata.
         pub fn elementContext(self: Self) validation.Context {
             var context = self.context;
-            const prefix_size = @min(
-                self.payload_start,
-                wire.sequence_length_size,
-            );
+            const prefix_size = @min(self.payload_start, wire.sequence_length_size);
             context.vector = .{
                 .start = self.payload_start - prefix_size,
                 .size = prefix_size + self.element_count * ElementCodec.slot_size,
@@ -265,11 +260,7 @@ pub fn SequenceView(
             const element_start = try self.elementStart(element_index);
             return switch (ElementCodec.kind) {
                 .structure => ElementView.from(self.bytes, element_start),
-                else => ElementCodec.read(
-                    self.bytes,
-                    self.elementContext(),
-                    element_start,
-                ),
+                else => ElementCodec.read(self.bytes, self.elementContext(), element_start),
             };
         }
     };

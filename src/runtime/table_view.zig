@@ -7,8 +7,13 @@ const sequence = @import("sequence.zig");
 const mutation = @import("mutation.zig");
 const errors = @import("errors.zig");
 const framing = @import("framing.zig");
-const StructView = @import("struct_view.zig").StructView;
+const struct_view = @import("struct_view.zig");
 const unions = @import("unions.zig");
+
+const AccessError = errors.AccessError;
+const MutationError = errors.MutationError;
+
+const StructView = struct_view.StructView;
 
 /// Compile-time capability of a borrowed view; mutable views still perform checked access.
 pub const Access = enum {
@@ -20,12 +25,10 @@ pub const Access = enum {
 
 /// Positions are runtime offsets relative to the complete frame, not child slices.
 pub const Source = union(enum) {
-    /// Follows the root offset without checking a file identifier.
+    /// Open an ordinary root without checking an identifier.
     root,
-    /// Follow an ordinary root and require these four identifier bytes.
-    identified_root: [wire.file_identifier_size]u8,
-    /// Parse the selected framing, identifier, and exact/first-frame policy.
-    framed_root: framing.Options,
+    /// Parse custom framing, identifier, and exact/first-frame policy.
+    options: framing.Options,
     /// Opens an ordinary frame at a known position; children inherit framing.
     position: usize,
 };
@@ -51,30 +54,27 @@ pub fn TableView(comptime access: Access) type {
         /// Metadata validation is local, not schema verification. Aliases must
         /// not change structure; storage reset/reallocation invalidates the view.
         /// Source is not comptime: positions may come from decoded offsets.
-        pub fn from(bytes: Bytes, source: Source) errors.AccessError!Self {
+        /// Use `.root` for ordinary framing or `.options` for custom framing.
+        pub fn from(bytes: Bytes, source: Source) AccessError!Self {
             const frame = switch (source) {
                 .root => try framing.parse(bytes, .{}),
-                .identified_root => |identifier| try framing.parse(
-                    bytes,
-                    .{ .identifier = identifier },
-                ),
-                .framed_root => |options| try framing.parse(bytes, options),
+                .options => |options| try framing.parse(bytes, options),
                 .position => framing.Layout{ .frame_size = bytes.len },
             };
             const frame_bytes = bytes[0..frame.frame_size];
             const table_start = switch (source) {
                 .position => |table_position| table_position,
-                else => try validation.referenceTarget(
+                .root, .options => try validation.referenceTarget(
                     frame_bytes,
                     frame.root_offset_start,
                 ),
             };
             // Neither the table nor its vtable may overlap the selected header.
             if (table_start < frame.header_size)
-                return errors.AccessError.InvalidBuffer;
+                return AccessError.InvalidBuffer;
             var layout = try validation.tableAt(frame_bytes, table_start);
             if (layout.vtable_start < frame.header_size)
-                return errors.AccessError.InvalidBuffer;
+                return AccessError.InvalidBuffer;
             layout.header_size = frame.header_size;
             return .{ .bytes = frame_bytes, .layout = layout };
         }
@@ -92,7 +92,7 @@ pub fn TableView(comptime access: Access) type {
             self: Self,
             comptime ScalarType: type,
             comptime field_id: usize,
-        ) errors.AccessError!?usize {
+        ) AccessError!?usize {
             return validation.fieldPosition(
                 self.bytes,
                 self.layout,
@@ -108,19 +108,12 @@ pub fn TableView(comptime access: Access) type {
             comptime ValueType: type,
             comptime field_id: usize,
             comptime default: ValueType,
-        ) errors.AccessError!ValueType {
+        ) AccessError!ValueType {
             const ScalarType = wire.Scalar(ValueType);
             if (@typeInfo(ValueType) == .optional and default != null)
                 @compileError("optional scalars must default to null");
-            const field_start = try self.fieldPosition(
-                ScalarType,
-                field_id,
-            ) orelse return default;
-            return try validation.readScalar(
-                ScalarType,
-                self.bytes,
-                field_start,
-            );
+            const field_start = try self.fieldPosition(ScalarType, field_id) orelse return default;
+            return try validation.readScalar(ScalarType, self.bytes, field_start);
         }
 
         /// Borrow a present UTF-8 string without its prefix/terminator; return null for absence.
@@ -128,16 +121,9 @@ pub fn TableView(comptime access: Access) type {
         pub fn readString(
             self: Self,
             comptime field_id: usize,
-        ) errors.AccessError!?[]const u8 {
-            const field_start = try self.fieldPosition(
-                u32,
-                field_id,
-            ) orelse return null;
-            return try validation.stringAt(
-                self.bytes,
-                self.context(),
-                field_start,
-            );
+        ) AccessError!?[]const u8 {
+            const field_start = try self.fieldPosition(u32, field_id) orelse return null;
+            return try validation.stringAt(self.bytes, self.context(), field_start);
         }
 
         /// Borrow a present vector with this table's access capability; return null for absence.
@@ -146,11 +132,8 @@ pub fn TableView(comptime access: Access) type {
             self: Self,
             comptime ElementCodec: type,
             comptime field_id: usize,
-        ) errors.AccessError!?sequence.SequenceView(ElementCodec, access) {
-            const field_start = try self.fieldPosition(
-                u32,
-                field_id,
-            ) orelse return null;
+        ) AccessError!?sequence.SequenceView(ElementCodec, access) {
+            const field_start = try self.fieldPosition(u32, field_id) orelse return null;
             return try sequence.SequenceView(ElementCodec, access).fromReference(
                 self.bytes,
                 self.context(),
@@ -158,18 +141,14 @@ pub fn TableView(comptime access: Access) type {
             );
         }
 
-        /// Read paired union slots, checking tag/payload agreement before borrowing the alternative.
+        /// Check paired tag/payload slots before borrowing the selected union alternative.
         /// Unknown tags fail; absent optional values produce the `.none` variant.
         pub fn readUnion(
             self: Self,
             comptime UnionType: type,
             comptime field_ids: unions.FieldIds,
-        ) errors.AccessError!UnionType.View(access) {
-            return UnionType.read(
-                access,
-                self.bytes,
-                try unions.field(self, field_ids),
-            );
+        ) AccessError!UnionType.View(access) {
+            return UnionType.read(access, self.bytes, try unions.field(self, field_ids));
         }
 
         /// Borrow paired tag/payload vectors; either both slots are absent or both are present.
@@ -178,11 +157,11 @@ pub fn TableView(comptime access: Access) type {
             self: Self,
             comptime UnionType: type,
             comptime field_ids: unions.FieldIds,
-        ) errors.AccessError!?unions.VectorView(UnionType, access) {
+        ) AccessError!?unions.VectorView(UnionType, access) {
             const tag_start = try self.fieldPosition(u32, field_ids.tag);
             const value_start = try self.fieldPosition(u32, field_ids.value);
             if ((tag_start == null) != (value_start == null))
-                return errors.AccessError.InvalidUnion;
+                return AccessError.InvalidUnion;
             if (tag_start == null) return null;
             return try unions.VectorView(UnionType, access).fromReferences(
                 self.bytes,
@@ -198,7 +177,7 @@ pub fn TableView(comptime access: Access) type {
             self: Self,
             comptime Layout: type,
             comptime field_id: usize,
-        ) errors.AccessError!?StructView(Layout, access) {
+        ) AccessError!?StructView(Layout, access) {
             const struct_start = try validation.fieldPosition(
                 self.bytes,
                 self.layout,
@@ -218,32 +197,24 @@ pub fn TableView(comptime access: Access) type {
             comptime Layout: type,
             comptime field_id: usize,
             value: ?Layout.Value,
-        ) errors.MutationError!bool {
+        ) MutationError!bool {
             comptime requireMutable();
             const current = try self.readStruct(Layout, field_id) orelse
                 return false;
-            try current.replace(value orelse
-                return errors.MutationError.CannotClearField);
+            try current.replace(value orelse return MutationError.CannotClearField);
             return true;
         }
 
-        /// Borrow a present child table with this view's access capability; return null for absence.
+        /// Borrow a child table with this view's access capability; return null for absence.
         /// Only its local metadata is checked. The child retains this complete frame.
         pub fn readTable(
             self: Self,
             comptime field_id: usize,
-        ) errors.AccessError!?Self {
-            const field_start = try self.fieldPosition(
-                u32,
-                field_id,
-            ) orelse return null;
+        ) AccessError!?Self {
+            const field_start = try self.fieldPosition(u32, field_id) orelse return null;
             return .{
                 .bytes = self.bytes,
-                .layout = try validation.referencedTable(
-                    self.bytes,
-                    self.context(),
-                    field_start,
-                ),
+                .layout = try validation.referencedTable(self.bytes, self.context(), field_start),
             };
         }
 
@@ -255,7 +226,7 @@ pub fn TableView(comptime access: Access) type {
             comptime ValueType: type,
             comptime field_id: usize,
             value: ValueType,
-        ) errors.MutationError!bool {
+        ) MutationError!bool {
             comptime requireMutable();
             const field_start = try self.fieldPosition(
                 wire.Scalar(ValueType),
@@ -272,7 +243,7 @@ pub fn TableView(comptime access: Access) type {
             self: Self,
             comptime field_id: usize,
             value: ?[]const u8,
-        ) errors.MutationError!bool {
+        ) MutationError!bool {
             comptime requireMutable();
             const current = try self.readString(field_id) orelse return false;
             try mutation.string(self.bytes, current, value);
@@ -287,36 +258,30 @@ pub fn TableView(comptime access: Access) type {
             comptime ElementCodec: type,
             comptime field_id: usize,
             value: ?[]const sequence.NativeValue(ElementCodec),
-        ) errors.MutationError!bool {
+        ) MutationError!bool {
             comptime requireMutable();
-            const current = try self.readVector(
-                ElementCodec,
-                field_id,
-            ) orelse return false;
+            const current = try self.readVector(ElementCodec, field_id) orelse return false;
             const replacement = value orelse
-                return errors.MutationError.CannotClearField;
+                return MutationError.CannotClearField;
             if (replacement.len != current.element_count)
-                return errors.MutationError.LengthMismatch;
+                return MutationError.LengthMismatch;
             switch (ElementCodec.kind) {
-                .scalar => wire.encodeSlice(
-                    ElementCodec.Value,
-                    self.bytes[current.payload_start..][0 .. current.element_count * ElementCodec.slot_size],
-                    replacement,
-                ),
-                .string => try mutation.stringVector(
-                    self.bytes,
-                    current.asReadOnly(),
-                    replacement,
-                ),
+                .scalar => {
+                    const payload_size = current.element_count * ElementCodec.slot_size;
+                    wire.encodeSlice(
+                        ElementCodec.Value,
+                        self.bytes[current.payload_start..][0..payload_size],
+                        replacement,
+                    );
+                },
+                .string => try mutation.stringVector(self.bytes, current.asReadOnly(), replacement),
                 .structure => try mutation.structVector(
                     ElementCodec.Layout,
                     self.bytes,
                     current.payload_start,
                     replacement,
                 ),
-                .table => @compileError(
-                    "table vector replacement requires rebuilding",
-                ),
+                .table => @compileError("table vector replacement requires rebuilding"),
             }
             return true;
         }

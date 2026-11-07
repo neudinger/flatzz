@@ -1,3 +1,5 @@
+//! Build the standalone FBS reflection example without schema tooling.
+
 const std = @import("std");
 
 /// Build an FBS parser example without schema generation or Zast.
@@ -17,7 +19,10 @@ pub fn build(builder: *std.Build) void {
                 .root_source_file = builder.path("main.zig"),
                 .target = target,
                 .optimize = optimize,
-                .imports = &.{.{ .name = "flatzz_compiler", .module = flatzz.module("flatzz_compiler") }},
+                .imports = &.{.{
+                    .name = "flatzz_compiler",
+                    .module = flatzz.module("flatzz_compiler"),
+                }},
             }),
         });
         builder.installArtifact(executable);

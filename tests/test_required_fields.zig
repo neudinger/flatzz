@@ -1,8 +1,11 @@
-const standard_library = @import("std");
+const std = @import("std");
 const runtime = @import("runtime");
 const fixtures = @import("test_schema.zig");
-const testing = standard_library.testing;
+
+const testing = std.testing;
 const Storage = [fixtures.storage_capacity]u8;
+
+const required_fields = .{ .label, .samples, .tags };
 
 const RequiredPayload = struct {
     marker: u32 = 0,
@@ -29,7 +32,7 @@ const RequiredPayload = struct {
 };
 
 test "required native references fail before any payload construction" {
-    inline for (.{ .label, .samples, .tags }) |field| {
+    inline for (required_fields) |field| {
         var storage: Storage align(runtime.storage_alignment) = @splat(0xa5);
         var builder = runtime.Builder.init(&storage);
         var values: RequiredPayload = .{
@@ -44,7 +47,7 @@ test "required native references fail before any payload construction" {
         const before_builder = builder;
         try testing.expectError(
             error.MissingRequiredField,
-            RequiredPayload.Schema.create(&builder, values),
+            RequiredPayload.Schema.create(&builder, values, .{}),
         );
         try testing.expectEqualSlices(u8, &before_storage, &storage);
         try testing.expectEqualDeep(before_builder, builder);
@@ -57,6 +60,7 @@ test "empty required sequences are present and optional references may be absent
     const bytes = try builder.finish(try RequiredPayload.Schema.create(
         &builder,
         .{ .label = "", .samples = &.{}, .tags = &.{} },
+        .{},
     ), .ordinary);
     try runtime.Verifier.verify(RequiredPayload, bytes, .{});
     const values = try RequiredPayload.Schema.read(
@@ -71,34 +75,29 @@ test "empty required sequences are present and optional references may be absent
 test "required handle preflight leaves table fields and storage unchanged" {
     var storage: Storage align(runtime.storage_alignment) = @splat(0xa5);
     var builder = runtime.Builder.init(&storage);
-    var offsets: RequiredPayload.Schema.Offsets = @splat(null);
-    offsets[RequiredPayload.Schema.fields.label.wire_id] =
-        try builder.createString("");
-    offsets[RequiredPayload.Schema.fields.samples.wire_id] =
-        try builder.createVector(u16, &.{});
-    offsets[RequiredPayload.Schema.fields.tags.wire_id] =
-        try builder.createStringVector(&.{});
+    const fields: RequiredPayload.Schema.Fields = .{
+        .marker = 123,
+        .label = try builder.createString(""),
+        .samples = try builder.createVector(u16, &.{}),
+        .tags = try builder.createStringVector(&.{}),
+    };
     var context = try RequiredPayload.Schema.Context.init(&builder);
-    inline for (.{ .label, .samples, .tags }) |field| {
-        var missing_offsets = offsets;
-        missing_offsets[RequiredPayload.Schema.Descriptor(field).wire_id] = null;
+    inline for (required_fields) |field| {
+        var missing_fields = fields;
+        @field(missing_fields, @tagName(field)) = null;
         const before_storage = storage;
         const before_builder = builder;
         const before_fields = context.field_offsets;
         try testing.expectError(
             error.MissingRequiredField,
-            RequiredPayload.Schema.addFields(
-                &context,
-                .{ .marker = 123 },
-                missing_offsets,
-            ),
+            RequiredPayload.Schema.addFields(&context, missing_fields),
         );
         try testing.expectEqualSlices(u8, &before_storage, &storage);
         try testing.expectEqualDeep(before_builder, builder);
         try testing.expectEqualDeep(before_fields, context.field_offsets);
     }
-    // Explicit handles determine presence, even when native references are null.
-    try RequiredPayload.Schema.addFields(&context, .{ .marker = 123 }, offsets);
+    // Named completed handles determine required presence independently of wire IDs.
+    try RequiredPayload.Schema.addFields(&context, fields);
     const bytes = try builder.finish(
         try RequiredPayload.Schema.endTable(&context),
         .ordinary,
@@ -113,22 +112,20 @@ test "required handle preflight leaves table fields and storage unchanged" {
 }
 
 test "incremental required finalization can fail without writes and retry" {
-    inline for (.{ .label, .samples, .tags }) |missing_field| {
+    inline for (required_fields) |missing_field| {
         var storage: Storage align(runtime.storage_alignment) = @splat(0xa5);
         var builder = runtime.Builder.init(&storage);
-        var offsets: RequiredPayload.Schema.Offsets = @splat(null);
-        offsets[RequiredPayload.Schema.fields.label.wire_id] =
-            try builder.createString("");
-        offsets[RequiredPayload.Schema.fields.samples.wire_id] =
-            try builder.createVector(u16, &.{});
-        offsets[RequiredPayload.Schema.fields.tags.wire_id] =
-            try builder.createStringVector(&.{});
+        const fields: RequiredPayload.Schema.Fields = .{
+            .label = try builder.createString(""),
+            .samples = try builder.createVector(u16, &.{}),
+            .tags = try builder.createStringVector(&.{}),
+        };
         var context = try RequiredPayload.Schema.Context.init(&builder);
         try context.addScalar(u32, 0, 123, 0);
-        inline for (.{ .label, .samples, .tags }) |field| {
+        inline for (required_fields) |field| {
             if (field != missing_field) {
                 const field_id = RequiredPayload.Schema.Descriptor(field).wire_id;
-                try context.addOffset(field_id, offsets[field_id]);
+                try context.addOffset(field_id, @field(fields, @tagName(field)));
             }
         }
         const before_storage = storage;
@@ -144,7 +141,7 @@ test "incremental required finalization can fail without writes and retry" {
         const missing_id = RequiredPayload.Schema.Descriptor(
             missing_field,
         ).wire_id;
-        try context.addOffset(missing_id, offsets[missing_id]);
+        try context.addOffset(missing_id, @field(fields, @tagName(missing_field)));
         const bytes = try builder.finish(
             try RequiredPayload.Schema.endTable(&context),
             .ordinary,
@@ -197,11 +194,7 @@ test "required nested-table handles fail preflight and incremental finalization"
     const before_fields = context.field_offsets;
     try testing.expectError(
         error.MissingRequiredField,
-        fixtures.Graph.Schema.addFields(
-            &context,
-            .{ .revision = 123 },
-            @splat(null),
-        ),
+        fixtures.Graph.Schema.addFields(&context, .{ .revision = 123 }),
     );
     try testing.expectError(
         error.MissingRequiredField,

@@ -17,11 +17,14 @@
 //! try std.testing.expectEqual(@as(i16, 1), point.horizontal);
 //! try std.testing.expectEqual(@as(i16, -2), point.vertical);
 //! ```
-//! Expected result: `bytes == .{ 1, 0, 254, 255 }`, `point.horizontal == 1`, `point.vertical == -2`.
+//! Expected result: `bytes == .{ 1, 0, 254, 255 }`, `point.horizontal == 1`,
+//! and `point.vertical == -2`.
 //! No output is printed; all storage belongs to the caller.
-const standard_library = @import("std");
+const std = @import("std");
 const wire = @import("wire.zig");
-const DecodeError = @import("errors.zig").DecodeError;
+const errors = @import("errors.zig");
+
+const DecodeError = errors.DecodeError;
 
 /// Interpretation of one inline member, independent of the native Zig ABI.
 pub const Kind = union(enum) {
@@ -148,11 +151,7 @@ pub fn ArrayLayout(comptime element: Kind, comptime count: usize) type {
                 const element_start = element_index * Element.wire_size;
                 const element_bytes = destination[element_start..][0..Element.wire_size];
                 switch (Element.kind) {
-                    .scalar => |ScalarType| wire.encode(
-                        ScalarType,
-                        element_bytes,
-                        item,
-                    ),
+                    .scalar => |ScalarType| wire.encode(ScalarType, element_bytes, item),
                     .structure => |Layout| Layout.encode(element_bytes, item),
                     .array => unreachable,
                 }
@@ -167,10 +166,7 @@ pub fn ArrayLayout(comptime element: Kind, comptime count: usize) type {
                 const element_start = element_index * Element.wire_size;
                 const element_bytes = source[element_start..][0..Element.wire_size];
                 item.* = switch (Element.kind) {
-                    .scalar => |ScalarType| try wire.decode(
-                        ScalarType,
-                        element_bytes,
-                    ),
+                    .scalar => |ScalarType| try wire.decode(ScalarType, element_bytes),
                     .structure => |Layout| try Layout.decode(element_bytes),
                     .array => unreachable,
                 };
@@ -184,10 +180,7 @@ pub fn ArrayLayout(comptime element: Kind, comptime count: usize) type {
                 const element_start = element_index * Element.wire_size;
                 const element_bytes = source[element_start..][0..Element.wire_size];
                 switch (Element.kind) {
-                    .scalar => |ScalarType| _ = try wire.decode(
-                        ScalarType,
-                        element_bytes,
-                    ),
+                    .scalar => |ScalarType| _ = try wire.decode(ScalarType, element_bytes),
                     .structure => |Layout| try Layout.verify(element_bytes),
                     .array => unreachable,
                 }
@@ -209,9 +202,7 @@ pub fn StructLayout(
     comptime {
         if (member_names.len == 0 or
             member_names.len != native_info.field_names.len)
-            @compileError(
-                "struct descriptors must match nonempty native fields",
-            );
+            @compileError("struct descriptors must match nonempty native fields");
         var member_end: usize = 0;
         var maximum_alignment: usize = @sizeOf(u8);
         for (member_names) |member_name| {
@@ -220,7 +211,7 @@ pub fn StructLayout(
             const MemberType = @field(descriptors, member_name);
             if (MemberType.Value != @FieldType(Native, member_name))
                 @compileError("struct descriptor value type mismatch");
-            const expected_offset = standard_library.mem.alignForward(
+            const expected_offset = std.mem.alignForward(
                 usize,
                 member_end,
                 MemberType.wire_alignment,
@@ -228,13 +219,10 @@ pub fn StructLayout(
             if (MemberType.offset != expected_offset)
                 @compileError("invalid FlatBuffers struct member offset");
             member_end = expected_offset + MemberType.wire_size;
-            maximum_alignment = @max(
-                maximum_alignment,
-                MemberType.wire_alignment,
-            );
+            maximum_alignment = @max(maximum_alignment, MemberType.wire_alignment);
         }
         if (options.alignment != maximum_alignment or
-            options.size != standard_library.mem.alignForward(
+            options.size != std.mem.alignForward(
                 usize,
                 member_end,
                 maximum_alignment,
@@ -246,7 +234,7 @@ pub fn StructLayout(
         /// Native copied value; its declaration order and padding are independent of the wire.
         pub const Value = Native;
         /// Native member names accepted by `Member` and borrowed views.
-        pub const Field = standard_library.meta.FieldEnum(Native);
+        pub const Field = std.meta.FieldEnum(Native);
         /// Member descriptors in schema wire order.
         pub const members = descriptors;
         /// Complete padded wire extent, in bytes.
@@ -279,15 +267,8 @@ pub fn StructLayout(
                 const member_bytes = destination[MemberType.offset..][0..MemberType.wire_size];
                 const member_value = @field(value, member_name);
                 switch (MemberType.kind) {
-                    .scalar => |ScalarType| wire.encode(
-                        ScalarType,
-                        member_bytes,
-                        member_value,
-                    ),
-                    .structure, .array => |Layout| Layout.encode(
-                        member_bytes,
-                        member_value,
-                    ),
+                    .scalar => |ScalarType| wire.encode(ScalarType, member_bytes, member_value),
+                    .structure, .array => |Layout| Layout.encode(member_bytes, member_value),
                 }
             }
         }
@@ -301,13 +282,8 @@ pub fn StructLayout(
                 const MemberType = @field(descriptors, member_name);
                 const member_bytes = source[MemberType.offset..][0..MemberType.wire_size];
                 @field(result, member_name) = switch (MemberType.kind) {
-                    .scalar => |ScalarType| try wire.decode(
-                        ScalarType,
-                        member_bytes,
-                    ),
-                    .structure, .array => |Layout| try Layout.decode(
-                        member_bytes,
-                    ),
+                    .scalar => |ScalarType| try wire.decode(ScalarType, member_bytes),
+                    .structure, .array => |Layout| try Layout.decode(member_bytes),
                 };
             }
             return result;
@@ -319,13 +295,8 @@ pub fn StructLayout(
                 const MemberType = @field(descriptors, member_name);
                 const member_bytes = source[MemberType.offset..][0..MemberType.wire_size];
                 switch (MemberType.kind) {
-                    .scalar => |ScalarType| _ = try wire.decode(
-                        ScalarType,
-                        member_bytes,
-                    ),
-                    .structure, .array => |Layout| try Layout.verify(
-                        member_bytes,
-                    ),
+                    .scalar => |ScalarType| _ = try wire.decode(ScalarType, member_bytes),
+                    .structure, .array => |Layout| try Layout.verify(member_bytes),
                 }
             }
         }

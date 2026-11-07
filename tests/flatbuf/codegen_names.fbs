@@ -1,5 +1,11 @@
 namespace One;
-table Schema { const:int = 9; }
+table Schema {
+    const:int = 9;
+    write:int = 7;
+    Storage:int = 11;
+    x:[int];
+    mutableX:int = 13;
+}
 namespace Two;
 table Schema { other:One.Schema; }
 root_type Schema;

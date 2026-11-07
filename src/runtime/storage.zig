@@ -1,8 +1,10 @@
 //! Conservative fixed storage derived from schema wire descriptors.
 //! Counts and budgets are compile-time inputs; no allocation or graph traversal.
-const standard_library = @import("std");
+const std = @import("std");
 const wire = @import("wire.zig");
 const Builder = @import("Builder.zig");
+
+const BudgetPart = enum { count, bytes };
 
 /// Match the framing passed to Builder.finish.
 pub const Options = struct {
@@ -11,7 +13,7 @@ pub const Options = struct {
 };
 
 /// Aligned storage for one root and its budgeted children. The buffer is
-/// undefined until initialized by a Builder or a schema's writeRoot operation.
+/// undefined until written by a Builder or a schema's serialize operation.
 ///
 /// Capacities use schema field names:
 /// - Strings: maximum payload bytes, excluding prefix and terminator.
@@ -24,7 +26,8 @@ pub const Options = struct {
 /// reserve an empty present value; null/omitted values consume no child space.
 /// Fixed scalar/inline-struct fields are always budgeted and reject capacities.
 /// External child budgets must include all descendant objects, vtables, and
-/// padding. They do not enable automatic native table-graph serialization.
+/// padding. Native table/union vectors reuse their final wire storage for
+/// temporary handles; no separate scratch capacity or allocator is required.
 ///
 /// Example, given a schema with label:string and samples:[float]:
 /// `var storage: runtime.Storage(Schema, .{ .label = 64, .samples = 16 }, .{}) = .{};`
@@ -36,13 +39,14 @@ pub fn Storage(
 ) type {
     return struct {
         /// Caller-owned aligned output; constructing this wrapper does not initialize its bytes.
-        buffer: [capacity(SchemaType, capacities, options)]u8 align(wire.storage_alignment) = undefined,
+        buffer: [capacity(SchemaType, capacities, options)]u8 align(wire.storage_alignment) =
+            undefined,
     };
 }
 
 /// Upper bound for Storage.buffer, rounded to Builder's usable alignment.
 /// Includes sparse physical vtable IDs, both slots/vectors of unions, all
-/// default-valued scalars, and worst-case padding for every construction step.
+/// default-valued scalars and worst-case padding.
 /// Capacities must be nonnegative integers; counts must fit u32, and the complete
 /// bound must fit Builder.max_buffer_size. Unknown names and invalid budget records
 /// are rejected at compile time.
@@ -75,7 +79,9 @@ pub fn capacity(
         for (@typeInfo(@TypeOf(fields)).@"struct".field_names) |field_name| {
             const FieldType = @field(fields, field_name);
             const has_budget = @hasField(@TypeOf(capacities), field_name);
-            const budget = if (has_budget) @field(capacities, field_name) else switch (FieldType.kind) {
+            const budget = if (has_budget)
+                @field(capacities, field_name)
+            else switch (FieldType.kind) {
                 .union_vector => .{},
                 .vector => |Codec| switch (Codec.kind) {
                     .string, .table => .{},
@@ -92,19 +98,40 @@ pub fn capacity(
             };
             total += switch (FieldType.kind) {
                 .scalar, .structure => if (has_budget)
-                    @compileError("fixed-size fields do not accept storage capacities: " ++ field_name)
+                    @compileError(
+                        "fixed-size fields do not accept storage capacities: " ++ field_name,
+                    )
                 else
                     0,
                 .string => sequenceSize(count(budget), 1, 1) + wire.string_terminator_size,
                 .table, .union_value => unsigned(budget),
-                .union_vector => sequenceSize(countPart(budget), wire.field_offset_size, wire.field_offset_size) +
-                    sequenceSize(countPart(budget), @sizeOf(wire.UnionTag), @alignOf(wire.UnionTag)) + bytesPart(budget),
+                .union_vector => sequenceSize(
+                    part(budget, .count),
+                    wire.field_offset_size,
+                    wire.field_offset_size,
+                ) + sequenceSize(
+                    part(budget, .count),
+                    @sizeOf(wire.UnionTag),
+                    @alignOf(wire.UnionTag),
+                ) + part(budget, .bytes),
                 .vector => |Codec| switch (Codec.kind) {
-                    .scalar, .structure => sequenceSize(count(budget), Codec.slot_size, Codec.slot_alignment),
-                    .string => sequenceSize(countPart(budget), Codec.slot_size, Codec.slot_alignment) +
-                        countPart(budget) * (wire.sequence_length_size + wire.string_terminator_size + wire.sequence_length_size - 1) +
-                        bytesPart(budget),
-                    .table => sequenceSize(countPart(budget), Codec.slot_size, Codec.slot_alignment) + bytesPart(budget),
+                    .scalar, .structure => sequenceSize(
+                        count(budget),
+                        Codec.slot_size,
+                        Codec.slot_alignment,
+                    ),
+                    .string => sequenceSize(
+                        part(budget, .count),
+                        Codec.slot_size,
+                        Codec.slot_alignment,
+                    ) + part(budget, .count) *
+                        (wire.sequence_length_size + wire.string_terminator_size +
+                            wire.sequence_length_size - 1) + part(budget, .bytes),
+                    .table => sequenceSize(
+                        part(budget, .count),
+                        Codec.slot_size,
+                        Codec.slot_alignment,
+                    ) + part(budget, .bytes),
                 },
             };
         }
@@ -115,7 +142,11 @@ pub fn capacity(
     };
 }
 
-fn sequenceSize(comptime elements: comptime_int, comptime size: usize, comptime alignment: usize) comptime_int {
+fn sequenceSize(
+    comptime elements: comptime_int,
+    comptime size: usize,
+    comptime alignment: usize,
+) comptime_int {
     const element_size: comptime_int = size;
     const padding: comptime_int = @max(wire.sequence_length_size, alignment) - 1;
     return wire.sequence_length_size + elements * element_size + padding;
@@ -132,27 +163,23 @@ fn unsigned(comptime value: anytype) comptime_int {
 
 fn count(comptime value: anytype) comptime_int {
     const result = unsigned(value);
-    if (result > standard_library.math.maxInt(u32))
+    if (result > std.math.maxInt(u32))
         @compileError("storage element count must fit in u32");
     return result;
 }
 
-fn countPart(comptime budget: anytype) comptime_int {
-    return count(part(budget, "count"));
-}
-
-fn bytesPart(comptime budget: anytype) comptime_int {
-    return part(budget, "bytes");
-}
-
-fn part(comptime budget: anytype, comptime name: []const u8) comptime_int {
+fn part(comptime budget: anytype, comptime field: BudgetPart) comptime_int {
     const budget_info = @typeInfo(@TypeOf(budget));
     if (budget_info != .@"struct")
         @compileError("storage vector capacity must be a count/bytes record");
     for (budget_info.@"struct".field_names) |field_name| {
-        if (!standard_library.mem.eql(u8, field_name, "count") and
-            !standard_library.mem.eql(u8, field_name, "bytes"))
+        if (std.meta.stringToEnum(BudgetPart, field_name) == null)
             @compileError("unknown storage vector capacity field: " ++ field_name);
     }
-    return if (@hasField(@TypeOf(budget), name)) unsigned(@field(budget, name)) else 0;
+    const name = @tagName(field);
+    const value = if (@hasField(@TypeOf(budget), name)) unsigned(@field(budget, name)) else 0;
+    return switch (field) {
+        .count => count(value),
+        .bytes => value,
+    };
 }

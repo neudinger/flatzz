@@ -2,24 +2,26 @@
 //! Open one context after constructing referenced children, add each physical
 //! field at most once, then finalize through its generated schema or `endTable`.
 //! The context borrows a stable builder address and requires no allocation/deinit.
-const standard_library = @import("std");
+const std = @import("std");
 const wire = @import("wire.zig");
 const Builder = @import("Builder.zig");
-const BuildError = @import("errors.zig").BuildError;
+const errors = @import("errors.zig");
 const unions = @import("unions.zig");
 const validation = @import("validation.zig");
+
+const BuildError = errors.BuildError;
 
 /// field_count is max physical wire ID + 1, including deprecated/synthetic slots.
 /// It must fit the u16 vtable-size limit; invalid counts fail at compile time.
 /// Go StartObject/EndObject and C++ StartTable/EndTable are the references.
 /// https://github.com/google/flatbuffers/blob/b8431fbcd7a5c71817f314e18b332c0648554efa/go/builder.go
 pub fn TableBuilder(comptime field_count: usize) type {
-    if (field_count > wire.max_field_count) @compileError(
-        "vtable size must fit in u16",
-    );
+    if (field_count > wire.max_field_count) @compileError("vtable size must fit in u16");
     return struct {
         const Self = @This();
         const vtable_size = wire.vtable_header_size + wire.vtable_entry_size * field_count;
+        // Builder distances never exceed maxInt(i32), leaving this marker unused.
+        const omitted_field_offset = std.math.maxInt(u32);
 
         /// Borrowed stable builder address. Do not copy an active context.
         builder: *Builder,
@@ -27,9 +29,10 @@ pub fn TableBuilder(comptime field_count: usize) type {
         table_end: usize,
         /// Builder generation captured at init; stale contexts return InvalidState.
         context_generation: u64,
-        /// null: untouched; zero: explicitly omitted. Both emit absent slots,
+        /// Zero: untouched; maxInt(u32): explicitly omitted. Both emit absent slots,
         /// but recording omissions lets duplicate additions fail consistently.
-        field_offsets: [field_count]?u32 = @splat(null),
+        /// Other values are stored distances from the buffer end, at most maxInt(i32).
+        field_offsets: [field_count]u32 = @splat(0),
 
         /// Enter table construction from a ready builder without writing storage.
         /// InvalidState rejects nested tables and finished builders. This context
@@ -45,8 +48,14 @@ pub fn TableBuilder(comptime field_count: usize) type {
             };
         }
 
+        fn storedOffset(field_offset: u32) u32 {
+            if (field_offset == omitted_field_offset) return wire.absent_field_offset;
+            return field_offset;
+        }
+
         fn checkActive(self: *const Self) BuildError!void {
-            if (self.builder.state != .table or self.context_generation != self.builder.context_generation)
+            if (self.builder.state != .table or
+                self.context_generation != self.builder.context_generation)
                 return BuildError.InvalidState;
         }
 
@@ -54,11 +63,9 @@ pub fn TableBuilder(comptime field_count: usize) type {
             self: *const Self,
             comptime field_id: usize,
         ) BuildError!void {
-            if (field_id >= field_count) @compileError(
-                "field ID is outside this table",
-            );
+            if (field_id >= field_count) @compileError("field ID is outside this table");
             try self.checkActive();
-            if (self.field_offsets[field_id] != null)
+            if (self.field_offsets[field_id] != 0)
                 return BuildError.DuplicateField;
         }
 
@@ -78,21 +85,18 @@ pub fn TableBuilder(comptime field_count: usize) type {
             try self.checkField(field_id);
             const scalar_value = switch (@typeInfo(ValueType)) {
                 .optional => value orelse {
-                    self.field_offsets[field_id] = wire.absent_field_offset;
+                    self.field_offsets[field_id] = omitted_field_offset;
                     return;
                 },
                 else => scalar_value_blk: {
                     if (!self.builder.force_defaults and value == default) {
-                        self.field_offsets[field_id] = wire.absent_field_offset;
+                        self.field_offsets[field_id] = omitted_field_offset;
                         return;
                     }
                     break :scalar_value_blk value;
                 },
             };
-            self.field_offsets[field_id] = try self.builder.prependScalar(
-                ScalarType,
-                scalar_value,
-            );
+            self.field_offsets[field_id] = try self.builder.prependScalar(ScalarType, scalar_value);
         }
 
         /// Structs are inline values: encode inside the active table, without a
@@ -108,13 +112,10 @@ pub fn TableBuilder(comptime field_count: usize) type {
         ) BuildError!void {
             try self.checkField(field_id);
             const present = value orelse {
-                self.field_offsets[field_id] = wire.absent_field_offset;
+                self.field_offsets[field_id] = omitted_field_offset;
                 return;
             };
-            self.field_offsets[field_id] = try self.builder.prependStruct(
-                Layout,
-                present,
-            );
+            self.field_offsets[field_id] = try self.builder.prependStruct(Layout, present);
         }
 
         /// Converts a child handle to the forward offset at its eventual slot.
@@ -128,7 +129,7 @@ pub fn TableBuilder(comptime field_count: usize) type {
         ) BuildError!void {
             try self.checkField(field_id);
             const child_offset = offset orelse {
-                self.field_offsets[field_id] = wire.absent_field_offset;
+                self.field_offsets[field_id] = omitted_field_offset;
                 return;
             };
             try self.builder.checkOffset(child_offset, self.table_end);
@@ -138,14 +139,9 @@ pub fn TableBuilder(comptime field_count: usize) type {
             ) + wire.field_offset_size;
             try self.builder.ensureSpace(required_bytes);
             const relative_offset: u32 = @intCast(
-                self.builder.used() + required_bytes - @backingInt(
-                    child_offset,
-                ),
+                self.builder.used() + required_bytes - @backingInt(child_offset),
             );
-            self.field_offsets[field_id] = try self.builder.prependScalar(
-                u32,
-                relative_offset,
-            );
+            self.field_offsets[field_id] = try self.builder.prependScalar(u32, relative_offset);
         }
 
         /// Add a union after preflighting both slots, so failures write neither.
@@ -155,14 +151,12 @@ pub fn TableBuilder(comptime field_count: usize) type {
             self: *Self,
             comptime UnionType: type,
             comptime field_ids: unions.FieldIds,
-            value: UnionType.Value,
+            value: UnionType.Handle,
         ) BuildError!void {
-            if (field_ids.tag == field_ids.value) @compileError(
-                "union wire IDs must differ",
-            );
+            if (field_ids.tag == field_ids.value) @compileError("union wire IDs must differ");
             try self.checkField(field_ids.tag);
             try self.checkField(field_ids.value);
-            const selected = UnionType.tag(value);
+            const selected = std.meta.activeTag(value);
             const handle = UnionType.offset(value);
             var required_bytes: usize = 0;
             if (handle) |present| {
@@ -176,12 +170,7 @@ pub fn TableBuilder(comptime field_count: usize) type {
                 required_bytes += @sizeOf(wire.UnionTag);
             try self.builder.ensureSpace(required_bytes);
             self.addOffset(field_ids.value, handle) catch unreachable;
-            self.addScalar(
-                UnionType.Tag,
-                field_ids.tag,
-                selected,
-                .none,
-            ) catch unreachable;
+            self.addScalar(UnionType.Tag, field_ids.tag, selected, .none) catch unreachable;
         }
 
         /// Atomically add parallel tag/value vector handles, or omit both with null.
@@ -192,9 +181,7 @@ pub fn TableBuilder(comptime field_count: usize) type {
             comptime field_ids: unions.FieldIds,
             handles: ?Builder.UnionVector,
         ) BuildError!void {
-            if (field_ids.tag == field_ids.value) @compileError(
-                "union wire IDs must differ",
-            );
+            if (field_ids.tag == field_ids.value) @compileError("union wire IDs must differ");
             try self.checkField(field_ids.tag);
             try self.checkField(field_ids.value);
             if (handles) |present| {
@@ -226,8 +213,8 @@ pub fn TableBuilder(comptime field_count: usize) type {
             comptime vector: bool,
         ) BuildError!void {
             try self.checkActive();
-            const tag_offset = self.field_offsets[field_ids.tag] orelse 0;
-            const value_offset = self.field_offsets[field_ids.value] orelse 0;
+            const tag_offset = storedOffset(self.field_offsets[field_ids.tag]);
+            const value_offset = storedOffset(self.field_offsets[field_ids.value]);
             if (vector) {
                 if ((tag_offset == 0) != (value_offset == 0))
                     return BuildError.InvalidUnion;
@@ -260,17 +247,15 @@ pub fn TableBuilder(comptime field_count: usize) type {
         }
 
         /// Checks presence without writing. Schema finalizers supply required
-        /// IDs; the raw context has no schema metadata. Null and explicit zero
-        /// both describe an absent slot, rather than an empty referenced object.
+        /// IDs; the raw context has no schema metadata. Untouched and omitted
+        /// fields both describe absence, rather than an empty referenced object.
         pub fn requireField(
             self: *const Self,
             comptime field_id: usize,
         ) BuildError!void {
-            if (field_id >= field_count) @compileError(
-                "field ID is outside this table",
-            );
+            if (field_id >= field_count) @compileError("field ID is outside this table");
             try self.checkActive();
-            if ((self.field_offsets[field_id] orelse wire.absent_field_offset) == wire.absent_field_offset)
+            if (storedOffset(self.field_offsets[field_id]) == wire.absent_field_offset)
                 return BuildError.MissingRequiredField;
         }
 
@@ -281,18 +266,13 @@ pub fn TableBuilder(comptime field_count: usize) type {
         pub fn endTable(self: *Self) BuildError!Builder.Offset {
             try self.checkActive();
             const builder = self.builder;
-            const padding = wire.paddingFor(
-                builder.used(),
-                wire.table_header_size,
-            );
+            const padding = wire.paddingFor(builder.used(), wire.table_header_size);
             const required_bytes = padding + wire.table_header_size + vtable_size;
             try builder.ensureSpace(required_bytes);
             const table_offset = builder.used() + padding + wire.table_header_size;
             const table_size = table_offset - self.table_end;
             // Table sizes and field positions are serialized in u16 vtable entries.
-            if (table_size > standard_library.math.maxInt(
-                u16,
-            )) return BuildError.TableTooLarge;
+            if (table_size > std.math.maxInt(u16)) return BuildError.TableTooLarge;
             const table_start = builder.buffer.len - table_offset;
             const vtable_start = table_start - vtable_size;
             @memset(
@@ -309,18 +289,20 @@ pub fn TableBuilder(comptime field_count: usize) type {
                 builder.buffer[vtable_start..][0..wire.vtable_entry_size],
                 @intCast(vtable_size),
             );
+            const table_size_start = vtable_start + wire.vtable_table_size_offset;
             wire.encode(
                 u16,
-                builder.buffer[vtable_start + wire.vtable_table_size_offset ..][0..wire.vtable_entry_size],
+                builder.buffer[table_size_start..][0..wire.vtable_entry_size],
                 @intCast(table_size),
             );
             for (self.field_offsets, 0..) |field_offset, field_id| {
-                const field_end_offset = field_offset orelse wire.absent_field_offset;
+                const field_end_offset = storedOffset(field_offset);
                 const relative_offset: u16 = if (field_end_offset == wire.absent_field_offset)
                     wire.absent_field_offset
                 else
                     @intCast(table_offset - field_end_offset);
-                const entry_start = vtable_start + wire.vtable_header_size + field_id * wire.vtable_entry_size;
+                const entry_start = vtable_start + wire.vtable_header_size +
+                    field_id * wire.vtable_entry_size;
                 wire.encode(
                     u16,
                     builder.buffer[entry_start..][0..wire.vtable_entry_size],

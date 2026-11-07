@@ -58,6 +58,10 @@ pub const BuildError = error{
     AliasedInput,
     /// Supplied union slots or paired vectors are inconsistent.
     InvalidUnion,
+    /// Native packing would exceed the active table-depth limit, including cycles.
+    DepthLimit,
+    /// Native graph traversal would exceed the configured work budget.
+    WorkLimit,
 };
 /// Local-access failures plus missing required fields and traversal-budget limits.
 pub const VerifyError = AccessError || error{

@@ -1,11 +1,33 @@
-const standard_library = @import("std");
+const std = @import("std");
 const runtime = @import("runtime");
-const example = @import("reading");
+const reading = @import("reading");
 const fixtures = @import("test_array_schema.zig");
 const structs = @import("test_struct_schema.zig");
-const testing = standard_library.testing;
+
+const Reading = reading.Reading;
+const Location = reading.Location;
+const testing = std.testing;
 const Storage = [fixtures.storage_capacity]u8;
 const EnvelopeCodec = runtime.StructCodec(structs.Envelope.Layout);
+
+const array_frames = .{
+    .{ runtime.Builder.FinishOptions.ordinary, runtime.framing.Options{} },
+    .{
+        runtime.Builder.FinishOptions{ .identifier = "ARRY".* },
+        runtime.framing.Options{ .identifier = "ARRY".* },
+    },
+    .{
+        runtime.Builder.FinishOptions.size_prefixed,
+        runtime.framing.Options{ .format = .size_prefixed },
+    },
+    .{
+        runtime.Builder.FinishOptions{ .size_prefixed_identifier = "ARRY".* },
+        runtime.framing.Options{
+            .format = .size_prefixed,
+            .identifier = "ARRY".*,
+        },
+    },
+};
 
 test "arrays of structs containing arrays preserve schema layout" {
     const Group = struct { matrices: [2]fixtures.Matrix };
@@ -30,35 +52,18 @@ test "arrays of structs containing arrays preserve schema layout" {
     try testing.expectEqual(@as(f64, 10), native.matrices[1].values[2]);
     const Maximum = runtime.ArrayMember(
         .{ .scalar = u8 },
-        standard_library.math.maxInt(u16),
+        std.math.maxInt(u16),
         0,
     );
     try testing.expectEqual(@as(usize, 65535), Maximum.wire_size);
 }
 
 test "struct vector stride and inline arrays work with every frame" {
-    inline for (.{
-        .{ runtime.Builder.FinishOptions.ordinary, runtime.framing.Options{} },
-        .{
-            runtime.Builder.FinishOptions{ .identifier = "ARRY".* },
-            runtime.framing.Options{ .identifier = "ARRY".* },
-        },
-        .{
-            runtime.Builder.FinishOptions.size_prefixed,
-            runtime.framing.Options{ .format = .size_prefixed },
-        },
-        .{
-            runtime.Builder.FinishOptions{ .size_prefixed_identifier = "ARRY".* },
-            runtime.framing.Options{
-                .format = .size_prefixed,
-                .identifier = "ARRY".*,
-            },
-        },
-    }) |frame| {
+    inline for (array_frames) |frame| {
         var storage: Storage align(runtime.storage_alignment) = @splat(0xa5);
         const bytes = try fixtures.build(&storage, frame[0]);
         try runtime.Verifier.verify(fixtures.Packet, bytes, .{ .frame = frame[1] });
-        const table = try runtime.Table.from(bytes, .{ .framed_root = frame[1] });
+        const table = try runtime.Table.from(bytes, .{ .options = frame[1] });
         const packet = try fixtures.Packet.Schema.read(table);
         const entries = packet.entries.?;
         try testing.expectEqual(@as(usize, 2), entries.element_count);
@@ -157,13 +162,14 @@ test "struct vectors distinguish missing and empty with required preflight" {
     const before_builder = builder;
     try testing.expectError(
         error.MissingRequiredField,
-        fixtures.Packet.Schema.create(&builder, .{ .matrix = fixtures.matrix }),
+        fixtures.Packet.Schema.create(&builder, .{ .matrix = fixtures.matrix }, .{}),
     );
     try testing.expectEqualSlices(u8, &before, &storage);
     try testing.expectEqualDeep(before_builder, builder);
     const bytes = try builder.finish(try fixtures.Packet.Schema.create(
         &builder,
         .{ .matrix = fixtures.matrix, .entries = &.{} },
+        .{},
     ), .ordinary);
     const table = try runtime.MutableTable.from(bytes, .root);
     try runtime.Verifier.verify(fixtures.Packet, bytes, .{});
@@ -224,10 +230,10 @@ test "struct vectors and arrays reject truncated misaligned and forged views" {
     try testing.expectError(error.OutOfBounds, entries.get(2));
     try testing.expectError(
         error.OutOfBounds,
-        entries.get(standard_library.math.maxInt(usize)),
+        entries.get(std.math.maxInt(usize)),
     );
     var forged = entries;
-    forged.element_count = standard_library.math.maxInt(usize);
+    forged.element_count = std.math.maxInt(usize);
     try testing.expectError(error.OutOfBounds, forged.get(0));
     forged = entries;
     forged.payload_start += 1;
@@ -235,7 +241,7 @@ test "struct vectors and arrays reject truncated misaligned and forged views" {
     const matrix = (try table.readStruct(fixtures.Matrix.Layout, 1)).?;
     var array = try matrix.get(.values);
     const before = storage;
-    array.array_start = standard_library.math.maxInt(usize);
+    array.array_start = std.math.maxInt(usize);
     try testing.expectError(error.OutOfBounds, array.get(0));
     try testing.expectError(error.OutOfBounds, array.update(0, 0));
     try testing.expectEqualSlices(u8, &before, &storage);
@@ -248,7 +254,7 @@ test "struct vectors and arrays reject truncated misaligned and forged views" {
         u32,
         bytes,
         entries.payload_start - runtime.sequence_length_size,
-        standard_library.math.maxInt(u32),
+        std.math.maxInt(u32),
     );
     try testing.expectError(error.OutOfBounds, table.readVector(EnvelopeCodec, 0));
 }
@@ -281,6 +287,7 @@ test "array verification budgets work and checks the last vector member" {
     const bytes = try builder.finish(try Packet.Schema.create(
         &builder,
         .{ .blocks = &.{ value, value } },
+        .{},
     ), .ordinary);
     const table = try runtime.MutableTable.from(bytes, .root);
     const blocks = (try table.readVector(runtime.StructCodec(Closed.Layout), 0)).?;
@@ -303,17 +310,19 @@ test "array verification budgets work and checks the last vector member" {
 }
 
 test "Reading capacity includes struct vectors and fixed arrays" {
-    const location: example.Location = .{
+    const location: Location = .{
         .coordinates = .{ .latitude = 1, .longitude = 2 },
         .altitude = 3,
     };
     inline for (.{ 0, 1, 3, 17 }) |count| {
-        const history: [count]example.Location = @splat(location);
-        var storage: example.Reading.Storage(5, 3, .{
-            .count = 2,
-            .bytes = 6,
-        }, count) = .{};
-        const bytes = try example.Reading.write(&storage.buffer, .{
+        const history: [count]Location = @splat(location);
+        var storage: runtime.Storage(Reading.Schema, .{
+            .label = 5,
+            .samples = 3,
+            .tags = .{ .count = 2, .bytes = 6 },
+            .history = count,
+        }, .{}) = .{};
+        const bytes = try Reading.serialize(.{
             .label = "start",
             .samples = &.{ 1, 2, 3 },
             .tags = &.{ "lab", "new" },
@@ -324,14 +333,14 @@ test "Reading capacity includes struct vectors and fixed arrays" {
                 .gains = .{ 1, 2, 3 },
                 .locations = @splat(location),
             },
-        }, .{ .force_defaults = true });
-        try example.Reading.verify(bytes, .{});
-        const reading = try example.Reading.read(bytes);
-        try testing.expectEqual(count, reading.history.?.element_count);
+        }, &storage.buffer, .{ .force_defaults = true });
+        try Reading.verify(bytes, .{});
+        const view = try Reading.read(bytes);
+        try testing.expectEqual(count, view.history.?.element_count);
         for (0..count) |element_index| {
             try testing.expectEqualDeep(
                 location,
-                try (try reading.history.?.get(element_index)).read(),
+                try (try view.history.?.get(element_index)).read(),
             );
         }
     }

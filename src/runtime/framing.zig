@@ -1,7 +1,9 @@
 //! Frame positions retain the prefix: alignment is relative to slice index zero.
 const wire = @import("wire.zig");
 const validation = @import("validation.zig");
-const AccessError = @import("errors.zig").AccessError;
+const errors = @import("errors.zig");
+
+const AccessError = errors.AccessError;
 
 /// Whether a u32 byte count precedes the root-offset slot.
 pub const Format = enum {
@@ -50,11 +52,7 @@ pub fn parse(bytes: []const u8, options: Options) AccessError!Layout {
         .size_prefixed => {
             const declared_size: usize = try validation.readScalar(u32, bytes, 0);
             // Subtraction-based range checking proves the addition cannot wrap.
-            try validation.checkRange(
-                bytes.len,
-                wire.size_prefix_size,
-                declared_size,
-            );
+            try validation.checkRange(bytes.len, wire.size_prefix_size, declared_size);
             layout.frame_size = wire.size_prefix_size + declared_size;
             layout.root_offset_start = wire.size_prefix_size;
             layout.header_size += wire.size_prefix_size;
@@ -62,11 +60,7 @@ pub fn parse(bytes: []const u8, options: Options) AccessError!Layout {
                 return AccessError.InvalidBuffer;
         },
     }
-    try validation.checkRange(
-        layout.frame_size,
-        layout.root_offset_start,
-        wire.root_offset_size,
-    );
+    try validation.checkRange(layout.frame_size, layout.root_offset_start, wire.root_offset_size);
     if (options.identifier) |identifier| {
         // Identifier lookup has no alignment checks; object access retains
         // the full frame instead of rebasing its positions onto this subslice.

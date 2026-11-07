@@ -1,12 +1,31 @@
-const standard_library = @import("std");
+const std = @import("std");
 const runtime = @import("runtime");
 const fixtures = @import("test_union_schema.zig");
-const testing = standard_library.testing;
+
+const testing = std.testing;
 const Storage = [fixtures.storage_capacity]u8;
 
+const union_frames = .{
+    .{ runtime.Builder.FinishOptions.ordinary, runtime.framing.Options{} },
+    .{
+        runtime.Builder.FinishOptions{ .identifier = "UNIO".* },
+        runtime.framing.Options{ .identifier = "UNIO".* },
+    },
+    .{
+        runtime.Builder.FinishOptions.size_prefixed,
+        runtime.framing.Options{ .format = .size_prefixed },
+    },
+    .{
+        runtime.Builder.FinishOptions{ .size_prefixed_identifier = "UNIO".* },
+        runtime.framing.Options{ .format = .size_prefixed, .identifier = "UNIO".* },
+    },
+};
+
+/// Check every union alternative, then mutate shared event and struct payloads in `bytes`.
+/// The caller owns the frame; validation, mutation, and test assertion errors propagate.
 pub fn checkFixture(bytes: []u8, frame: runtime.framing.Options) !void {
     try runtime.Verifier.verify(fixtures.Packet, bytes, .{ .frame = frame });
-    const table = try runtime.Table.from(bytes, .{ .framed_root = frame });
+    const table = try runtime.Table.from(bytes, .{ .options = frame });
     const packet = try fixtures.Packet.Schema.read(table);
     try testing.expectEqual(@as(u32, 42), packet.marker);
     const event = try fixtures.Event.Schema.read(packet.current.event);
@@ -22,8 +41,14 @@ pub fn checkFixture(bytes: []u8, frame: runtime.framing.Options) !void {
         packet.current.event.layout.table_start,
         (try history.get(0)).event.layout.table_start,
     );
-    try testing.expectEqual(fixtures.Payload.Tag.none, standard_library.meta.activeTag(try history.get(1)));
-    try testing.expectEqualDeep(fixtures.structs.envelope, try (try history.get(2)).envelope.read());
+    try testing.expectEqual(
+        fixtures.Payload.Tag.none,
+        std.meta.activeTag(try history.get(1)),
+    );
+    try testing.expectEqualDeep(
+        fixtures.structs.envelope,
+        try (try history.get(2)).envelope.read(),
+    );
     try testing.expectEqualStrings(fixtures.message, (try history.get(3)).text);
     try testing.expectEqual(
         packet.current.event.layout.table_start,
@@ -31,10 +56,13 @@ pub fn checkFixture(bytes: []u8, frame: runtime.framing.Options) !void {
     );
     try testing.expectEqual(@as(usize, 0), packet.required_history.?.element_count);
     // Mutation is through the selected borrowed payload; tags are unchanged.
-    const mutable = try runtime.MutableTable.from(bytes, .{ .framed_root = frame });
+    const mutable = try runtime.MutableTable.from(bytes, .{ .options = frame });
     const current = try mutable.readUnion(fixtures.Payload, .{ .tag = 0, .value = 1 });
     try testing.expect(try current.event.mutateField(u64, 0, 99));
-    try testing.expectEqual(@as(u64, 99), (try fixtures.Event.Schema.read((try history.get(4)).again)).number);
+    try testing.expectEqual(
+        @as(u64, 99),
+        (try fixtures.Event.Schema.read((try history.get(4)).again)).number,
+    );
     const vector = (try mutable.readUnionVector(fixtures.Payload, .{ .tag = 2, .value = 3 })).?;
     try (try vector.get(2)).envelope.update(.measure, 25.5);
     try testing.expectEqual(@as(f64, 25.5), try packet.required_value.envelope.get(.measure));
@@ -43,21 +71,7 @@ pub fn checkFixture(bytes: []u8, frame: runtime.framing.Options) !void {
 
 test "all union alternatives and paired vectors in every frame" {
     try testing.expectEqual(@as(usize, 9), fixtures.Packet.Schema.field_count);
-    inline for (.{
-        .{ runtime.Builder.FinishOptions.ordinary, runtime.framing.Options{} },
-        .{
-            runtime.Builder.FinishOptions{ .identifier = "UNIO".* },
-            runtime.framing.Options{ .identifier = "UNIO".* },
-        },
-        .{
-            runtime.Builder.FinishOptions.size_prefixed,
-            runtime.framing.Options{ .format = .size_prefixed },
-        },
-        .{
-            runtime.Builder.FinishOptions{ .size_prefixed_identifier = "UNIO".* },
-            runtime.framing.Options{ .format = .size_prefixed, .identifier = "UNIO".* },
-        },
-    }) |frame| {
+    inline for (union_frames) |frame| {
         var storage: Storage align(runtime.storage_alignment) = @splat(0xa5);
         try checkFixture(try fixtures.build(&storage, frame[0]), frame[1]);
     }
@@ -74,14 +88,14 @@ const OptionalPacket = struct {
 };
 
 test "NONE differs from an absent or empty union vector" {
-    inline for (.{ false, true }) |force_defaults| {
-        inline for ([_]?[]const fixtures.Payload.Value{ null, &.{}, &.{.none} }) |history| {
+    for ([_]bool{ false, true }) |force_defaults| {
+        for ([_]?[]const fixtures.Payload.Value{ null, &.{}, &.{.none} }) |history| {
             var storage: Storage align(runtime.storage_alignment) = undefined;
             var builder = runtime.Builder.init(&storage);
-            builder.force_defaults = force_defaults;
             const bytes = try builder.finish(try OptionalPacket.Schema.create(
                 &builder,
                 .{ .history = history },
+                .{ .force_defaults = force_defaults },
             ), .ordinary);
             try runtime.Verifier.verify(OptionalPacket, bytes, .{});
             const table = try runtime.Table.from(bytes, .root);
@@ -101,14 +115,17 @@ test "required unions and union vectors reject absence before writes" {
     var storage: Storage align(runtime.storage_alignment) = @splat(0xa5);
     var builder = runtime.Builder.init(&storage);
     const text = try builder.createString("");
-    const empty = try builder.createUnionVector(fixtures.Payload, &.{});
-    inline for (.{
-        fixtures.Packet{ .required_history = &.{} },
-        fixtures.Packet{ .required_value = .{ .text = text } },
+    const empty = try builder.createReferenceVector(&.{}, .{ .union_type = fixtures.Payload });
+    for ([_]fixtures.Packet{
+        .{ .required_history = &.{} },
+        .{ .required_value = .{ .text = "" } },
     }) |value| {
         const before_storage = storage;
         const before_builder = builder;
-        try testing.expectError(error.MissingRequiredField, fixtures.Packet.Schema.create(&builder, value));
+        try testing.expectError(
+            error.MissingRequiredField,
+            fixtures.Packet.Schema.create(&builder, value, .{}),
+        );
         try testing.expectEqualSlices(u8, &before_storage, &storage);
         try testing.expectEqualDeep(before_builder, builder);
     }
@@ -123,11 +140,14 @@ test "required unions and union vectors reject absence before writes" {
     try context.addUnionVector(.{ .tag = 6, .value = 7 }, empty);
     const bytes = try builder.finish(try fixtures.Packet.Schema.endTable(&context), .ordinary);
     try runtime.Verifier.verify(fixtures.Packet, bytes, .{});
-    try testing.expectError(error.InvalidState, context.addUnion(fixtures.Payload, .{ .tag = 0, .value = 1 }, .none));
+    try testing.expectError(
+        error.InvalidState,
+        context.addUnion(fixtures.Payload, .{ .tag = 0, .value = 1 }, .none),
+    );
 }
 
 test "incremental finalization checks raw discriminator and payload pairs" {
-    inline for (.{ @as(u8, 0), @as(u8, 1), @as(u8, 250) }) |tag| {
+    for ([_]u8{ 0, 1, 250 }) |tag| {
         var storage: Storage align(runtime.storage_alignment) = @splat(0xa5);
         var builder = runtime.Builder.init(&storage);
         const text = try builder.createString("payload");
@@ -147,7 +167,7 @@ test "incremental finalization checks raw discriminator and payload pairs" {
 }
 
 test "paired fields reject partial and unequal union vectors" {
-    inline for (.{ false, true }) |mismatched| {
+    for ([_]bool{ false, true }) |mismatched| {
         var storage: Storage align(runtime.storage_alignment) = @splat(0xa5);
         var builder = runtime.Builder.init(&storage);
         const tags = try builder.createVector(u8, &.{0});
@@ -160,27 +180,37 @@ test "paired fields reject partial and unequal union vectors" {
         try testing.expectEqualSlices(u8, &before_storage, &storage);
         const bytes = try builder.finish(try context.endTable(), .ordinary);
         const table = try runtime.Table.from(bytes, .root);
-        try testing.expectError(error.InvalidUnion, table.readUnionVector(fixtures.Payload, .{ .tag = 2, .value = 3 }));
-        try testing.expectError(error.InvalidUnion, runtime.Verifier.verify(OptionalPacket, bytes, .{}));
+        try testing.expectError(
+            error.InvalidUnion,
+            table.readUnionVector(fixtures.Payload, .{ .tag = 2, .value = 3 }),
+        );
+        try testing.expectError(
+            error.InvalidUnion,
+            runtime.Verifier.verify(OptionalPacket, bytes, .{}),
+        );
     }
 }
 
-test "schema addFields rejects partial union handles before adding fields" {
+test "schema addFields rejects invalid union handles before adding fields" {
     var storage: Storage align(runtime.storage_alignment) = @splat(0xa5);
     var builder = runtime.Builder.init(&storage);
-    const empty = try builder.createUnionVector(fixtures.Payload, &.{});
+    const empty = try builder.createReferenceVector(&.{}, .{ .union_type = fixtures.Payload });
     var context = try OptionalPacket.Schema.Context.init(&builder);
-    var offsets: OptionalPacket.Schema.Offsets = @splat(null);
-    offsets[2] = empty.tag;
+    const invalid: runtime.Builder.Offset = @fromBackingInt(@as(u32, 0));
     const before_storage = storage;
     const before_builder = builder;
     const before_fields = context.field_offsets;
-    try testing.expectError(error.InvalidUnion, OptionalPacket.Schema.addFields(&context, .{}, offsets));
+    try testing.expectError(
+        error.InvalidOffset,
+        OptionalPacket.Schema.addFields(&context, .{
+            .current = .{ .text = invalid },
+            .history = empty,
+        }),
+    );
     try testing.expectEqualSlices(u8, &before_storage, &storage);
     try testing.expectEqualDeep(before_builder, builder);
     try testing.expectEqualDeep(before_fields, context.field_offsets);
-    offsets[3] = empty.value;
-    try OptionalPacket.Schema.addFields(&context, .{}, offsets);
+    try OptionalPacket.Schema.addFields(&context, .{ .history = empty });
     const bytes = try builder.finish(try OptionalPacket.Schema.endTable(&context), .ordinary);
     try runtime.Verifier.verify(OptionalPacket, bytes, .{});
 }
@@ -198,17 +228,26 @@ test "unknown union alternatives fail explicitly until metadata adds the tag" {
     };
     var storage: Storage align(runtime.storage_alignment) = undefined;
     var builder = runtime.Builder.init(&storage);
-    const text = try builder.createString("future");
-    const bytes = try builder.finish(try FuturePacket.Schema.create(&builder, .{
-        .current = .{ .text = text },
-    }), .ordinary);
+    const bytes = try builder.finish(try FuturePacket.Schema.create(
+        &builder,
+        .{
+            .current = .{ .text = "future" },
+        },
+        .{},
+    ), .ordinary);
     try runtime.Verifier.verify(FuturePacket, bytes, .{});
-    try testing.expectError(error.UnknownUnionTag, runtime.Verifier.verify(OptionalPacket, bytes, .{}));
-    try testing.expectError(error.UnknownUnionTag, OptionalPacket.Schema.read(try runtime.Table.from(bytes, .root)));
+    try testing.expectError(
+        error.UnknownUnionTag,
+        runtime.Verifier.verify(OptionalPacket, bytes, .{}),
+    );
+    try testing.expectError(
+        error.UnknownUnionTag,
+        OptionalPacket.Schema.read(try runtime.Table.from(bytes, .root)),
+    );
 }
 
 test "union vector malformed tags nulls and bounds are checked locally" {
-    inline for ([_]enum { unknown, missing, unexpected }{ .unknown, .missing, .unexpected }) |damage| {
+    for (std.meta.tags(enum { unknown, missing, unexpected })) |damage| {
         var storage: Storage align(runtime.storage_alignment) = undefined;
         const bytes = try fixtures.build(&storage, .ordinary);
         const table = try runtime.Table.from(bytes, .root);
@@ -228,10 +267,10 @@ test "union vector malformed tags nulls and bounds are checked locally" {
     const vector = (try table.readUnionVector(fixtures.Payload, .{ .tag = 2, .value = 3 })).?;
     try testing.expectError(error.OutOfBounds, vector.get(vector.element_count));
     var forged = vector;
-    forged.element_count = standard_library.math.maxInt(usize);
+    forged.element_count = std.math.maxInt(usize);
     try testing.expectError(error.OutOfBounds, forged.get(0));
     forged = vector;
-    forged.values_start = standard_library.math.maxInt(usize) - 3;
+    forged.values_start = std.math.maxInt(usize) - 3;
     try testing.expectError(error.OutOfBounds, forged.get(0));
 }
 
@@ -247,32 +286,64 @@ test "union vector payloads cannot overlap either metadata array" {
     const bytes = try builder.finish(try OptionalPacket.Schema.endTable(&context), .ordinary);
     const table = try runtime.Table.from(bytes, .root);
     const vector = (try table.readUnionVector(fixtures.Payload, .{ .tag = 2, .value = 3 })).?;
-    try runtime.write(u32, bytes, vector.values_start, @intCast(vector.tags_start - runtime.wire.sequence_length_size - vector.values_start));
+    try runtime.write(
+        u32,
+        bytes,
+        vector.values_start,
+        @intCast(vector.tags_start - runtime.wire.sequence_length_size - vector.values_start),
+    );
     try testing.expectError(error.InvalidBuffer, vector.get(0));
-    try testing.expectError(error.InvalidBuffer, runtime.Verifier.verify(OptionalPacket, bytes, .{}));
+    try testing.expectError(
+        error.InvalidBuffer,
+        runtime.Verifier.verify(OptionalPacket, bytes, .{}),
+    );
     // The two vectors themselves must not overlap, except shared empty vectors.
     const value_slot = (try table.fieldPosition(u32, 3)).?;
-    try runtime.write(u32, bytes, value_slot, @intCast(vector.tags_start - runtime.wire.sequence_length_size - value_slot));
-    try testing.expectError(error.InvalidUnion, table.readUnionVector(fixtures.Payload, .{ .tag = 2, .value = 3 }));
+    try runtime.write(
+        u32,
+        bytes,
+        value_slot,
+        @intCast(vector.tags_start - runtime.wire.sequence_length_size - value_slot),
+    );
+    try testing.expectError(
+        error.InvalidUnion,
+        table.readUnionVector(fixtures.Payload, .{ .tag = 2, .value = 3 }),
+    );
 }
 
 test "union vectors budget before element traversal and strings before UTF8" {
     var storage: Storage align(runtime.storage_alignment) = undefined;
     var builder = runtime.Builder.init(&storage);
-    const text = try builder.createString("valid");
-    const bytes = try builder.finish(try OptionalPacket.Schema.create(&builder, .{
-        .history = &.{.{ .text = text }},
-    }), .ordinary);
+    const bytes = try builder.finish(try OptionalPacket.Schema.create(
+        &builder,
+        .{
+            .history = &.{.{ .text = "valid" }},
+        },
+        .{},
+    ), .ordinary);
     const table = try runtime.Table.from(bytes, .root);
     const vector = (try table.readUnionVector(fixtures.Payload, .{ .tag = 2, .value = 3 })).?;
     const string = (try vector.get(0)).text;
     bytes[@intFromPtr(string.ptr) - @intFromPtr(bytes.ptr)] = 0xff;
-    const table_work = table.layout.table_size + table.layout.vtable_size + OptionalPacket.Schema.field_count;
+    const table_work = table.layout.table_size + table.layout.vtable_size +
+        OptionalPacket.Schema.field_count;
     const vector_work = 2 * runtime.wire.sequence_length_size + runtime.wire.field_offset_size + 1;
-    try testing.expectError(error.WorkLimit, runtime.Verifier.verify(OptionalPacket, bytes, .{ .max_work = table_work }));
-    try testing.expectError(error.WorkLimit, runtime.Verifier.verify(OptionalPacket, bytes, .{ .max_work = table_work + vector_work }));
-    try testing.expectError(error.ObjectLimit, runtime.Verifier.verify(OptionalPacket, bytes, .{ .max_objects = 3 }));
-    try testing.expectError(error.InvalidBuffer, runtime.Verifier.verify(OptionalPacket, bytes, .{}));
+    try testing.expectError(
+        error.WorkLimit,
+        runtime.Verifier.verify(OptionalPacket, bytes, .{ .max_work = table_work }),
+    );
+    try testing.expectError(
+        error.WorkLimit,
+        runtime.Verifier.verify(OptionalPacket, bytes, .{ .max_work = table_work + vector_work }),
+    );
+    try testing.expectError(
+        error.ObjectLimit,
+        runtime.Verifier.verify(OptionalPacket, bytes, .{ .max_objects = 3 }),
+    );
+    try testing.expectError(
+        error.InvalidBuffer,
+        runtime.Verifier.verify(OptionalPacket, bytes, .{}),
+    );
 }
 
 test "recursive table unions specialize lazily and retain depth limits" {
@@ -288,27 +359,37 @@ test "recursive table unions specialize lazily and retain depth limits" {
     };
     var storage: Storage align(runtime.storage_alignment) = undefined;
     var builder = runtime.Builder.init(&storage);
-    const leaf = try Node.Schema.create(&builder, .{});
-    const middle = try Node.Schema.create(&builder, .{ .next = .{ .child = leaf } });
-    const bytes = try builder.finish(try Node.Schema.create(&builder, .{
-        .next = .{ .child = middle },
-    }), .ordinary);
+    const leaf: Node = .{};
+    const middle: Node = .{ .next = .{ .child = &leaf } };
+    const bytes = try builder.finish(try Node.Schema.create(
+        &builder,
+        .{
+            .next = .{ .child = &middle },
+        },
+        .{},
+    ), .ordinary);
     try runtime.Verifier.verify(Node, bytes, .{ .max_depth = 3 });
-    try testing.expectError(error.DepthLimit, runtime.Verifier.verify(Node, bytes, .{ .max_depth = 2 }));
-    try testing.expectError(error.ObjectLimit, runtime.Verifier.verify(Node, bytes, .{ .max_objects = 2 }));
+    try testing.expectError(
+        error.DepthLimit,
+        runtime.Verifier.verify(Node, bytes, .{ .max_depth = 2 }),
+    );
+    try testing.expectError(
+        error.ObjectLimit,
+        runtime.Verifier.verify(Node, bytes, .{ .max_objects = 2 }),
+    );
 }
 
 test "union vector construction rejects capacity invalid handles and aliasing atomically" {
-    inline for ([_]enum { capacity, handle, alias }{ .capacity, .handle, .alias }) |failure| {
+    for (std.meta.tags(enum { capacity, handle, alias })) |failure| {
         var storage: Storage align(runtime.storage_alignment) = @splat(0xa5);
         const usable_size = if (failure == .capacity) 8 else storage.len;
         var builder = runtime.Builder.init(storage[0..usable_size]);
-        const aliased: *[1]fixtures.Payload.Value = @ptrCast(@alignCast(&storage));
+        const aliased: *[1]fixtures.Payload.Handle = @ptrCast(@alignCast(&storage));
         aliased[0] = .none;
         const before_storage = storage;
         const before_builder = builder;
-        const invalid: fixtures.Payload.Value = .{ .text = @fromBackingInt(4) };
-        const values: []const fixtures.Payload.Value = switch (failure) {
+        const invalid: fixtures.Payload.Handle = .{ .text = @fromBackingInt(4) };
+        const values: []const fixtures.Payload.Handle = switch (failure) {
             .capacity => &.{.none},
             .handle => &.{invalid},
             .alias => aliased,
@@ -318,20 +399,77 @@ test "union vector construction rejects capacity invalid handles and aliasing at
             .handle => error.InvalidOffset,
             .alias => error.AliasedInput,
         };
-        try testing.expectError(expected, builder.createUnionVector(fixtures.Payload, values));
+        try testing.expectError(
+            expected,
+            builder.createReferenceVector(values, .{ .union_type = fixtures.Payload }),
+        );
         try testing.expectEqualSlices(u8, &before_storage, &storage);
         try testing.expectEqualDeep(before_builder, builder);
     }
 }
 
+test "native reference callbacks preserve union tags and release reservations on failure" {
+    const Callback = struct {
+        fn pack(
+            comptime UnionType: type,
+            builder: *runtime.Builder,
+            value: UnionType.Value,
+        ) runtime.BuildError!UnionType.Handle {
+            const text = switch (value) {
+                .none => return .none,
+                .text => |text| text,
+                else => return error.InvalidUnion,
+            };
+            if (std.mem.eql(u8, text, "callback")) return error.InvalidUtf8;
+            if (std.mem.eql(u8, text, "state")) {
+                builder.state = .table;
+                return .none;
+            }
+            if (std.mem.eql(u8, text, "tag")) return .none;
+            return .{ .text = try builder.createString(text) };
+        }
+    };
+    for (std.meta.tags(enum { valid, callback, state, tag })) |mode| {
+        var storage: Storage align(runtime.storage_alignment) = @splat(0xa5);
+        var builder = runtime.Builder.init(&storage);
+        const values = [_]fixtures.Payload.Value{.{ .text = @tagName(mode) }};
+        const result = builder.createReferenceVector(
+            &values,
+            .{ .union_type = fixtures.Payload, .create = Callback.pack },
+        );
+        if (mode == .valid) {
+            const history: runtime.Builder.UnionVector = try result;
+            var context = try OptionalPacket.Schema.Context.init(&builder);
+            try OptionalPacket.Schema.addFields(&context, .{ .history = history });
+            const bytes = try builder.finish(
+                try OptionalPacket.Schema.endTable(&context),
+                .ordinary,
+            );
+            try runtime.Verifier.verify(OptionalPacket, bytes, .{});
+            const packet = try OptionalPacket.Schema.read(try runtime.Table.from(bytes, .root));
+            try testing.expectEqualStrings("valid", (try packet.history.?.get(0)).text);
+        } else {
+            try testing.expectError(switch (mode) {
+                .callback => error.InvalidUtf8,
+                .state => error.InvalidState,
+                .tag => error.InvalidUnion,
+                .valid => unreachable,
+            }, result);
+        }
+        try testing.expectEqual(@as(usize, 0), builder.scratch_cursor);
+    }
+}
+
 test "paired union field additions preflight both slots and all required bytes" {
-    inline for ([_]enum { capacity, duplicate, handle }{ .capacity, .duplicate, .handle }) |failure| {
+    for (std.meta.tags(enum { capacity, duplicate, handle })) |failure| {
         var storage: Storage align(runtime.storage_alignment) = @splat(0xa5);
         var builder = runtime.Builder.init(if (failure == .capacity) storage[0..16] else &storage);
         const text = try builder.createString("text");
         var context = try OptionalPacket.Schema.Context.init(&builder);
         if (failure == .duplicate) try context.addOffset(1, text);
-        const value: fixtures.Payload.Value = .{ .text = if (failure == .handle) @fromBackingInt(0) else text };
+        const value: fixtures.Payload.Handle = .{
+            .text = if (failure == .handle) @fromBackingInt(0) else text,
+        };
         const before_storage = storage;
         const before_builder = builder;
         const before_fields = context.field_offsets;
@@ -340,12 +478,21 @@ test "paired union field additions preflight both slots and all required bytes" 
             .duplicate => error.DuplicateField,
             .handle => error.InvalidOffset,
         };
-        try testing.expectError(expected, context.addUnion(fixtures.Payload, .{ .tag = 0, .value = 1 }, value));
+        try testing.expectError(
+            expected,
+            context.addUnion(fixtures.Payload, .{ .tag = 0, .value = 1 }, value),
+        );
         try testing.expectEqualSlices(u8, &before_storage, &storage);
         try testing.expectEqualDeep(before_builder, builder);
         try testing.expectEqualDeep(before_fields, context.field_offsets);
-        try testing.expectError(error.InvalidState, builder.createUnionVector(fixtures.Payload, &.{}));
-        try testing.expectError(error.InvalidState, builder.createStruct(fixtures.structs.Envelope.Layout, fixtures.structs.envelope));
+        try testing.expectError(
+            error.InvalidState,
+            builder.createReferenceVector(&.{}, .{ .union_type = fixtures.Payload }),
+        );
+        try testing.expectError(
+            error.InvalidState,
+            builder.createStruct(fixtures.structs.Envelope.Layout, fixtures.structs.envelope),
+        );
     }
 }
 
@@ -369,10 +516,13 @@ test "standalone union structs decode members and charge work before scanning" {
     };
     var storage: Storage align(runtime.storage_alignment) = undefined;
     var builder = runtime.Builder.init(&storage);
-    const child = try builder.createStruct(Closed.Layout, .{ .state = .ready });
-    const bytes = try builder.finish(try Packet.Schema.create(&builder, .{
-        .current = .{ .closed = child },
-    }), .ordinary);
+    const bytes = try builder.finish(try Packet.Schema.create(
+        &builder,
+        .{
+            .current = .{ .closed = .{ .state = .ready } },
+        },
+        .{},
+    ), .ordinary);
     try runtime.Verifier.verify(Packet, bytes, .{});
     const table = try runtime.Table.from(bytes, .root);
     const view = (try Packet.Schema.read(table)).current.closed;
@@ -380,20 +530,24 @@ test "standalone union structs decode members and charge work before scanning" {
     const reference = (try table.fieldPosition(u32, 1)).?;
     const target = reference + try runtime.read(u32, bytes, reference);
     bytes[target] = 250;
-    const table_work = table.layout.table_size + table.layout.vtable_size + Packet.Schema.field_count;
+    const table_work = table.layout.table_size + table.layout.vtable_size +
+        Packet.Schema.field_count;
     try testing.expectError(error.WorkLimit, runtime.Verifier.verify(Packet, bytes, .{
         .max_work = table_work + Closed.Layout.wire_size,
     }));
-    try testing.expectError(error.ObjectLimit, runtime.Verifier.verify(Packet, bytes, .{ .max_objects = 1 }));
+    try testing.expectError(
+        error.ObjectLimit,
+        runtime.Verifier.verify(Packet, bytes, .{ .max_objects = 1 }),
+    );
     try testing.expectError(error.InvalidBuffer, runtime.Verifier.verify(Packet, bytes, .{}));
     try testing.expectError(error.InvalidBuffer, view.read());
 }
 
 test "union vector slot additions preflight both fields before writing" {
-    inline for ([_]enum { capacity, duplicate, handle }{ .capacity, .duplicate, .handle }) |failure| {
+    for (std.meta.tags(enum { capacity, duplicate, handle })) |failure| {
         var storage: Storage align(runtime.storage_alignment) = @splat(0xa5);
         var builder = runtime.Builder.init(if (failure == .capacity) storage[0..8] else &storage);
-        var empty = try builder.createUnionVector(fixtures.Payload, &.{});
+        var empty = try builder.createReferenceVector(&.{}, .{ .union_type = fixtures.Payload });
         var context = try OptionalPacket.Schema.Context.init(&builder);
         if (failure == .duplicate) try context.addOffset(2, empty.tag);
         if (failure == .handle) empty.tag = @fromBackingInt(0);
@@ -420,10 +574,15 @@ test "a shared empty union vector is valid but missing required fields are not" 
     try context.addUnionVector(.{ .tag = 2, .value = 3 }, .{ .tag = empty, .value = empty });
     const bytes = try builder.finish(try context.endTable(), .ordinary);
     try runtime.Verifier.verify(OptionalPacket, bytes, .{});
-    const view = try OptionalPacket.Schema.read(try runtime.Table.from(bytes, .root));
+    const view = try OptionalPacket.Schema.read(
+        try runtime.Table.from(bytes, .root),
+    );
     try testing.expectEqual(@as(usize, 0), view.history.?.element_count);
     try testing.expectError(error.OutOfBounds, view.history.?.get(0));
-    try testing.expectError(error.MissingRequiredField, runtime.Verifier.verify(fixtures.Packet, bytes, .{}));
+    try testing.expectError(
+        error.MissingRequiredField,
+        runtime.Verifier.verify(fixtures.Packet, bytes, .{}),
+    );
 }
 
 test "union verification tolerates bounded corruption without trapping" {

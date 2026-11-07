@@ -10,8 +10,11 @@ const validation = @import("validation.zig");
 const sequence = @import("sequence.zig");
 const framing = @import("framing.zig");
 const unions = @import("unions.zig");
-const Table = @import("table_view.zig").TableView(.read_only);
-const VerifyError = @import("errors.zig").VerifyError;
+const table_view = @import("table_view.zig");
+const errors = @import("errors.zig");
+
+const Table = table_view.TableView(.read_only);
+const VerifyError = errors.VerifyError;
 const Self = @This();
 
 /// Framing and traversal budgets, checked before recursive work or scans.
@@ -63,7 +66,7 @@ pub fn verify(
 pub fn verifyRoot(self: *Self, comptime SchemaType: type) VerifyError!void {
     const table = try Table.from(
         self.bytes,
-        .{ .framed_root = self.options.frame },
+        .{ .options = self.options.frame },
     );
     // Every recursive check must see only this frame, never trailing messages.
     self.bytes = table.bytes;
@@ -117,10 +120,9 @@ fn verifyString(
         context,
         reference_start,
     );
-    try self.charge(
-        wire.sequence_length_size + layout.element_count + wire.string_terminator_size,
-    );
-    _ = try validation.stringAt(self.bytes, context, reference_start);
+    const string_size = layout.element_count + wire.string_terminator_size;
+    try self.charge(wire.sequence_length_size + string_size);
+    _ = try validation.stringPayload(self.bytes[layout.payload_start..][0..string_size]);
 }
 
 fn verifyUnion(
@@ -131,10 +133,7 @@ fn verifyUnion(
     const selected = try UnionType.check(self.bytes, location);
     switch (selected) {
         .none => {},
-        inline else => |choice| switch (@field(
-            UnionType.variants,
-            @tagName(choice),
-        )) {
+        inline else => |choice| switch (@field(UnionType.variants, @tagName(choice))) {
             .none => unreachable,
             .table => |Child| try self.verifyTable(Child, .{
                 .bytes = self.bytes,
@@ -144,10 +143,7 @@ fn verifyUnion(
                     location.reference_start.?,
                 ),
             }),
-            .string => try self.verifyString(
-                location.context,
-                location.reference_start.?,
-            ),
+            .string => try self.verifyString(location.context, location.reference_start.?),
             .structure => |Layout| {
                 try self.visitObject();
                 try self.charge(Layout.wire_size);
@@ -176,10 +172,7 @@ pub fn verifyField(
             try self.verifyUnion(UnionType, location);
         },
         .union_vector => |UnionType| {
-            const vector = try table.readUnionVector(
-                UnionType,
-                FieldType.field_ids,
-            ) orelse {
+            const vector = try table.readUnionVector(UnionType, FieldType.field_ids) orelse {
                 if (FieldType.required) return VerifyError.MissingRequiredField;
                 return;
             };
@@ -191,23 +184,13 @@ pub fn verifyField(
             try self.charge(wire.sequence_length_size +
                 vector.element_count * wire.field_offset_size);
             for (0..vector.element_count) |element_index|
-                try self.verifyUnion(
-                    UnionType,
-                    try vector.element(element_index),
-                );
+                try self.verifyUnion(UnionType, try vector.element(element_index));
         },
         .scalar => |ValueType| {
-            _ = try table.readField(
-                ValueType,
-                FieldType.wire_id,
-                FieldType.default,
-            );
+            _ = try table.readField(ValueType, FieldType.wire_id, FieldType.default);
         },
         .structure => |Layout| {
-            const structure = try table.readStruct(
-                Layout,
-                FieldType.wire_id,
-            ) orelse {
+            const structure = try table.readStruct(Layout, FieldType.wire_id) orelse {
                 if (FieldType.required) return VerifyError.MissingRequiredField;
                 return;
             };
@@ -218,10 +201,7 @@ pub fn verifyField(
             try structure.verify();
         },
         .string, .vector, .table => {
-            const field_start = try table.fieldPosition(
-                u32,
-                FieldType.wire_id,
-            ) orelse {
+            const field_start = try table.fieldPosition(u32, FieldType.wire_id) orelse {
                 if (FieldType.required) return VerifyError.MissingRequiredField;
                 return;
             };
@@ -241,20 +221,15 @@ pub fn verifyField(
                 },
                 .vector => |ElementCodec| {
                     try self.visitObject();
-                    const vector = try sequence.Sequence(
+                    const vector = try sequence.SequenceView(
                         ElementCodec,
-                    ).fromReference(
-                        self.bytes,
-                        table.context(),
-                        field_start,
-                    );
+                        .read_only,
+                    ).fromReference(self.bytes, table.context(), field_start);
                     try self.charge(
                         wire.sequence_length_size + vector.element_count * ElementCodec.slot_size,
                     );
                     for (0..vector.element_count) |element_index| {
-                        const element_start = try vector.elementStart(
-                            element_index,
-                        );
+                        const element_start = try vector.elementStart(element_index);
                         switch (ElementCodec.kind) {
                             .scalar => _ = try vector.get(element_index),
                             .structure => {

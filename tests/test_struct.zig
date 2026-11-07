@@ -1,9 +1,34 @@
-const standard_library = @import("std");
-const testing = standard_library.testing;
+const std = @import("std");
 const runtime = @import("runtime");
-const example = @import("reading");
+const reading = @import("reading");
 const fixtures = @import("test_struct_schema.zig");
+
+const Reading = reading.Reading;
+const Location = reading.Location;
+const testing = std.testing;
+
 const Storage = [fixtures.storage_capacity]u8;
+
+const struct_frames = .{
+    .{ runtime.Builder.FinishOptions.ordinary, runtime.framing.Options{} },
+    .{
+        runtime.Builder.FinishOptions{ .identifier = "STRU".* },
+        runtime.framing.Options{ .identifier = "STRU".* },
+    },
+    .{
+        runtime.Builder.FinishOptions.size_prefixed,
+        runtime.framing.Options{ .format = .size_prefixed },
+    },
+    .{
+        runtime.Builder.FinishOptions{
+            .size_prefixed_identifier = "STRU".*,
+        },
+        runtime.framing.Options{
+            .format = .size_prefixed,
+            .identifier = "STRU".*,
+        },
+    },
+};
 
 // Independent literal layout: both internal and tail padding must be zero.
 const envelope_bytes = [_]u8{
@@ -15,31 +40,12 @@ const envelope_bytes = [_]u8{
 };
 
 test "inline structs use schema layout and padding across all frame modes" {
-    inline for (.{
-        .{ runtime.Builder.FinishOptions.ordinary, runtime.framing.Options{} },
-        .{
-            runtime.Builder.FinishOptions{ .identifier = "STRU".* },
-            runtime.framing.Options{ .identifier = "STRU".* },
-        },
-        .{
-            runtime.Builder.FinishOptions.size_prefixed,
-            runtime.framing.Options{ .format = .size_prefixed },
-        },
-        .{
-            runtime.Builder.FinishOptions{
-                .size_prefixed_identifier = "STRU".*,
-            },
-            runtime.framing.Options{
-                .format = .size_prefixed,
-                .identifier = "STRU".*,
-            },
-        },
-    }) |frame| {
+    inline for (struct_frames) |frame| {
         var storage: Storage align(runtime.storage_alignment) = @splat(0xa5);
         const bytes = try fixtures.build(&storage, frame[0]);
         try runtime.Verifier.verify(fixtures.Packet, bytes, .{ .frame = frame[1] });
         const table = try runtime.MutableTable.from(bytes, .{
-            .framed_root = frame[1],
+            .options = frame[1],
         });
         const view = (try table.readStruct(fixtures.Envelope.Layout, 1)).?;
         try testing.expectEqual(@as(usize, 0), view.struct_start % 8);
@@ -66,79 +72,84 @@ test "inline structs use schema layout and padding across all frame modes" {
 }
 
 test "Reading storage includes nested structs and mutable views remain borrowed" {
-    var storage: example.Reading.Storage(5, 3, .{ .count = 1, .bytes = 3 }, 0) = .{};
-    const initial: example.Location = .{
+    var storage: runtime.Storage(Reading.Schema, .{
+        .label = 5,
+        .samples = 3,
+        .tags = .{ .count = 1, .bytes = 3 },
+    }, .{}) = .{};
+    const initial: Location = .{
         .coordinates = .{ .latitude = 48.5, .longitude = 2.25 },
         .altitude = 35,
     };
-    const bytes = try example.Reading.write(&storage.buffer, .{
+    const bytes = try Reading.serialize(.{
         .label = "start",
         .samples = &.{ 1, 2, 3 },
         .tags = &.{"lab"},
         .temperature = 0,
         .location = initial,
-    }, .{ .force_defaults = true });
-    const borrowed = (try example.Reading.read(bytes)).location.?;
+    }, &storage.buffer, .{ .force_defaults = true });
+    const borrowed = (try Reading.read(bytes)).location.?;
     const snapshot = try borrowed.read();
-    const mutable = (try example.Reading.mutableLocation(bytes)).?;
+    const table = try runtime.MutableTable.from(bytes, .root);
+    const mutable = (try Reading.borrowMutable(table, .location)).?;
     try mutable.update(.coordinates, .{ .latitude = 49, .longitude = 3 });
     const coordinates = try mutable.get(.coordinates);
     try coordinates.update(.longitude, 4);
     try testing.expectEqual(@as(f32, 4), (try borrowed.read()).coordinates.longitude);
     try testing.expectEqualDeep(initial, snapshot);
-    try testing.expect(try example.Reading.update(bytes, .location, initial));
+    try testing.expect(try Reading.update(bytes, .location, initial));
     try testing.expectEqualDeep(initial, try borrowed.read());
     const before = storage.buffer;
     try testing.expectError(
         error.CannotClearField,
-        example.Reading.update(bytes, .location, null),
+        Reading.update(bytes, .location, null),
     );
     try testing.expectEqualSlices(u8, &before, &storage.buffer);
-    try example.Reading.verify(bytes, .{});
+    try Reading.verify(bytes, .{});
 }
 
 test "absent inline fields and present zero structs remain distinct" {
-    var storage: example.Reading.Storage(0, 0, .{}, 0) = .{};
-    const absent = try example.Reading.write(&storage.buffer, .{}, .{});
-    try testing.expect((try example.Reading.read(absent)).location == null);
-    const zero: example.Location = .{
+    var storage: runtime.Storage(Reading.Schema, .{}, .{}) = .{};
+    const absent = try Reading.serialize(.{}, &storage.buffer, .{});
+    try testing.expect((try Reading.read(absent)).location == null);
+    const table = try runtime.MutableTable.from(absent, .root);
+    try testing.expect(try Reading.borrowMutable(table, .location) == null);
+    const zero: Location = .{
         .coordinates = .{ .latitude = 0, .longitude = 0 },
         .altitude = 0,
     };
-    try testing.expect(!try example.Reading.update(absent, .location, zero));
-    const present = try example.Reading.write(&storage.buffer, .{
+    try testing.expect(!try Reading.update(absent, .location, zero));
+    const present = try Reading.serialize(.{
         .location = zero,
-    }, .{});
+    }, &storage.buffer, .{});
     try testing.expectEqualDeep(
         zero,
-        try (try example.Reading.read(present)).location.?.read(),
+        try (try Reading.read(present)).location.?.read(),
     );
     // A pre-extension producer has a shorter vtable, not a zero-valued struct.
     var builder = runtime.Builder.init(&storage.buffer);
     var old_table = try runtime.TableBuilder(0).init(&builder);
     const old_bytes = try builder.finish(try old_table.endTable(), .ordinary);
-    try example.Reading.verify(old_bytes, .{});
-    try testing.expect((try example.Reading.read(old_bytes)).location == null);
+    try Reading.verify(old_bytes, .{});
+    try testing.expect((try Reading.read(old_bytes)).location == null);
 }
 
-test "required structs preflight values and cannot be supplied as offsets" {
+test "required structs preflight inline values" {
     var storage: Storage align(runtime.storage_alignment) = @splat(0xa5);
     var builder = runtime.Builder.init(&storage);
     const before_storage = storage;
     const before_builder = builder;
     try testing.expectError(
         error.MissingRequiredField,
-        fixtures.Packet.Schema.create(&builder, .{ .extra = fixtures.sample }),
+        fixtures.Packet.Schema.create(&builder, .{ .extra = fixtures.sample }, .{}),
     );
     try testing.expectEqualSlices(u8, &before_storage, &storage);
     try testing.expectEqualDeep(before_builder, builder);
     var table = try fixtures.Packet.Schema.Context.init(&builder);
     const before_table = table;
-    var offsets: fixtures.Packet.Schema.Offsets = @splat(null);
-    offsets[1] = @fromBackingInt(@as(u32, 8));
     try testing.expectError(
         error.MissingRequiredField,
-        fixtures.Packet.Schema.addFields(&table, .{}, offsets),
+        fixtures.Packet.Schema.addFields(&table, .{}),
     );
     try testing.expectEqualDeep(before_table, table);
     try testing.expectEqualSlices(u8, &before_storage, &storage);
@@ -225,7 +236,7 @@ test "truncated misaligned and escaping struct fields reject without mutation" {
     const View = runtime.StructView(fixtures.Envelope.Layout, .mutable);
     const forged: View = .{
         .bytes = bytes,
-        .struct_start = standard_library.math.maxInt(usize),
+        .struct_start = std.math.maxInt(usize),
     };
     const before = storage;
     try testing.expectError(error.OutOfBounds, forged.get(.sample));
@@ -252,6 +263,7 @@ test "struct verification charges member work before decoding exhaustive enums" 
     const bytes = try builder.finish(try Packet.Schema.create(
         &builder,
         .{ .value = .{ .state = .known } },
+        .{},
     ), .ordinary);
     const table = try runtime.MutableTable.from(bytes, .root);
     const view = (try table.readStruct(Closed.Layout, 0)).?;
@@ -295,15 +307,22 @@ test "nested tables and offset vectors retain inline struct access" {
     };
     var storage: Storage align(runtime.storage_alignment) = undefined;
     var builder = runtime.Builder.init(&storage);
-    const child_handle = try fixtures.Packet.Schema.create(&builder, .{
-        .envelope = fixtures.envelope,
-    });
-    const vector_handle = try builder.createOffsetVector(&.{
-        child_handle,
-        child_handle,
-    });
+    const child_handle = try fixtures.Packet.Schema.create(
+        &builder,
+        .{
+            .envelope = fixtures.envelope,
+        },
+        .{},
+    );
+    const vector_handle = try builder.createReferenceVector(
+        &[_]runtime.Builder.Offset{
+            child_handle,
+            child_handle,
+        },
+        .{},
+    );
     var context = try Parent.Schema.Context.init(&builder);
-    try Parent.Schema.addFields(&context, .{}, .{ child_handle, vector_handle });
+    try Parent.Schema.addFields(&context, .{ .child = child_handle, .children = vector_handle });
     const bytes = try builder.finish(
         try Parent.Schema.endTable(&context),
         .{ .size_prefixed_identifier = "STRU".* },
@@ -314,7 +333,7 @@ test "nested tables and offset vectors retain inline struct access" {
     };
     try runtime.Verifier.verify(Parent, bytes, .{ .frame = options });
     const parent = try runtime.MutableTable.from(bytes, .{
-        .framed_root = options,
+        .options = options,
     });
     const child = (try parent.readTable(0)).?;
     const structure = (try child.readStruct(fixtures.Envelope.Layout, 1)).?;

@@ -1,6 +1,18 @@
-const standard_library = @import("std");
-const testing = standard_library.testing;
+const std = @import("std");
 const runtime = @import("runtime");
+
+const testing = std.testing;
+
+const prefixed_wire_cases = .{
+    .{ runtime.Builder.FinishOptions.size_prefixed, null, &prefixed_empty },
+    .{
+        runtime.Builder.FinishOptions{
+            .size_prefixed_identifier = "READ".*,
+        },
+        "READ".*,
+        &prefixed_identified_empty,
+    },
+};
 
 test "identified empty roots match wire bytes including BFBS" {
     const storage_capacity = 32;
@@ -20,7 +32,7 @@ test "identified empty roots match wire bytes including BFBS" {
         try testing.expectEqualSlices(u8, &expected, bytes);
         const table = try runtime.Table.from(
             bytes,
-            .{ .identified_root = identifier },
+            .{ .options = .{ .identifier = identifier } },
         );
         try testing.expectEqual(@as(usize, 12), table.layout.table_start);
         _ = try runtime.Table.from(bytes, .root);
@@ -30,7 +42,7 @@ test "identified empty roots match wire bytes including BFBS" {
         const expected_identifier = bytes[identifier_start..][0..identifier.len].*;
         _ = try runtime.Table.from(
             &expected,
-            .{ .identified_root = expected_identifier },
+            .{ .options = .{ .identifier = expected_identifier } },
         );
     }
 }
@@ -41,14 +53,14 @@ test "identifier checks reject mismatches truncations and absent markers" {
     };
     try testing.expectError(
         error.IdentifierMismatch,
-        runtime.Table.from(&identified, .{ .identified_root = "BFBS".* }),
+        runtime.Table.from(&identified, .{ .options = .{ .identifier = "BFBS".* } }),
     );
     for (0..runtime.wire.identified_header_size) |prefix_size| {
         try testing.expectError(
             error.OutOfBounds,
             runtime.Table.from(
                 identified[0..prefix_size],
-                .{ .identified_root = "READ".* },
+                .{ .options = .{ .identifier = "READ".* } },
             ),
         );
     }
@@ -56,7 +68,7 @@ test "identifier checks reject mismatches truncations and absent markers" {
         error.OutOfBounds,
         runtime.Table.from(
             identified[0..runtime.wire.identified_header_size],
-            .{ .identified_root = "READ".* },
+            .{ .options = .{ .identifier = "READ".* } },
         ),
     );
     var storage: [16]u8 align(runtime.storage_alignment) = undefined;
@@ -68,7 +80,7 @@ test "identifier checks reject mismatches truncations and absent markers" {
     _ = try runtime.Table.from(ordinary, .root);
     try testing.expectError(
         error.IdentifierMismatch,
-        runtime.Table.from(ordinary, .{ .identified_root = "READ".* }),
+        runtime.Table.from(ordinary, .{ .options = .{ .identifier = "READ".* } }),
     );
 }
 
@@ -78,7 +90,7 @@ test "identified roots cannot overlap the frame header" {
         error.InvalidBuffer,
         runtime.Table.from(
             &root_in_header,
-            .{ .identified_root = "READ".* },
+            .{ .options = .{ .identifier = "READ".* } },
         ),
     );
     // The marker also looks like a valid empty vtable. Matching bytes alone
@@ -88,7 +100,7 @@ test "identified roots cannot overlap the frame header" {
         error.InvalidBuffer,
         runtime.Table.from(
             &vtable_in_header,
-            .{ .identified_root = .{ 4, 0, 4, 0 } },
+            .{ .options = .{ .identifier = .{ 4, 0, 4, 0 } } },
         ),
     );
 }
@@ -107,7 +119,7 @@ test "identified frames preserve wide scalar alignment access and mutation" {
     var builder = runtime.Builder.init(&storage);
     const number: u64 = 0x1122334455667788;
     const bytes = try builder.finish(
-        try Wide.Schema.create(&builder, .{ .number = number, .value = -1.5 }),
+        try Wide.Schema.create(&builder, .{ .number = number, .value = -1.5 }, .{}),
         .{ .identifier = "READ".* },
     );
     try testing.expectEqual(
@@ -120,7 +132,7 @@ test "identified frames preserve wide scalar alignment access and mutation" {
     );
     const table = try runtime.Table.from(
         bytes,
-        .{ .identified_root = "READ".* },
+        .{ .options = .{ .identifier = "READ".* } },
     );
     inline for (.{ .{ u64, 0 }, .{ f64, 1 } }) |field| {
         const field_start = (try table.fieldPosition(field[0], field[1])).?;
@@ -132,7 +144,7 @@ test "identified frames preserve wide scalar alignment access and mutation" {
     try runtime.Verifier.verify(Wide, bytes, .{});
     const mutable = try runtime.MutableTable.from(
         bytes,
-        .{ .identified_root = "READ".* },
+        .{ .options = .{ .identifier = "READ".* } },
     );
     try testing.expect(try mutable.mutateField(u64, 0, number + 1));
     try testing.expectEqual(number + 1, try table.readField(u64, 0, 0));
@@ -175,16 +187,7 @@ const prefixed_identified_empty = [_]u8{
 };
 
 test "size-prefixed roots match independent wire layouts" {
-    inline for (.{
-        .{ runtime.Builder.FinishOptions.size_prefixed, null, &prefixed_empty },
-        .{
-            runtime.Builder.FinishOptions{
-                .size_prefixed_identifier = "READ".*,
-            },
-            "READ".*,
-            &prefixed_identified_empty,
-        },
-    }) |example| {
+    inline for (prefixed_wire_cases) |example| {
         var storage: [32]u8 align(runtime.storage_alignment) = undefined;
         var builder = runtime.Builder.init(&storage);
         var context = try runtime.TableBuilder(0).init(&builder);
@@ -194,10 +197,10 @@ test "size-prefixed roots match independent wire layouts" {
             .format = .size_prefixed,
             .identifier = example[1],
         };
-        _ = try runtime.Table.from(example[2], .{ .framed_root = options });
+        _ = try runtime.Table.from(example[2], .{ .options = options });
         const table = try runtime.Table.from(
             bytes,
-            .{ .framed_root = options },
+            .{ .options = options },
         );
         try testing.expectEqual(bytes.len, table.bytes.len);
         try testing.expectEqual(
@@ -208,7 +211,7 @@ test "size-prefixed roots match independent wire layouts" {
 }
 
 test "prefixed parsing rejects truncations bad lengths and wrong identifiers" {
-    const source: runtime.TableSource = .{ .framed_root = .{
+    const source: runtime.TableSource = .{ .options = .{
         .format = .size_prefixed,
     } };
     for (0..prefixed_empty.len) |byte_count| {
@@ -218,7 +221,7 @@ test "prefixed parsing rejects truncations bad lengths and wrong identifiers" {
         );
     }
     var malformed = prefixed_empty;
-    try runtime.write(u32, &malformed, 0, standard_library.math.maxInt(u32));
+    try runtime.write(u32, &malformed, 0, std.math.maxInt(u32));
     try testing.expectError(
         error.OutOfBounds,
         runtime.Table.from(&malformed, source),
@@ -226,14 +229,14 @@ test "prefixed parsing rejects truncations bad lengths and wrong identifiers" {
     try runtime.write(u32, &malformed, 0, 0);
     try testing.expectError(
         error.OutOfBounds,
-        runtime.Table.from(&malformed, .{ .framed_root = .{
+        runtime.Table.from(&malformed, .{ .options = .{
             .format = .size_prefixed,
             .boundary = .first,
         } }),
     );
     try testing.expectError(
         error.IdentifierMismatch,
-        runtime.Table.from(&prefixed_identified_empty, .{ .framed_root = .{
+        runtime.Table.from(&prefixed_identified_empty, .{ .options = .{
             .format = .size_prefixed,
             .identifier = "BFBS".*,
         } }),
@@ -248,17 +251,17 @@ test "prefixed streams consume one frame and reject references into the next" {
     var messages = prefixed_empty ++ prefixed_identified_empty;
     try testing.expectError(
         error.InvalidBuffer,
-        runtime.Table.from(&messages, .{ .framed_root = .{
+        runtime.Table.from(&messages, .{ .options = .{
             .format = .size_prefixed,
         } }),
     );
     const first = try runtime.Table.from(
         &messages,
-        .{ .framed_root = options },
+        .{ .options = options },
     );
     try testing.expectEqual(prefixed_empty.len, first.bytes.len);
     const remaining = messages[first.bytes.len..];
-    const second = try runtime.Table.from(remaining, .{ .framed_root = .{
+    const second = try runtime.Table.from(remaining, .{ .options = .{
         .format = .size_prefixed,
         .identifier = "READ".*,
     } });
@@ -274,7 +277,7 @@ test "prefixed streams consume one frame and reject references into the next" {
     );
     try testing.expectError(
         error.OutOfBounds,
-        runtime.Table.from(&messages, .{ .framed_root = options }),
+        runtime.Table.from(&messages, .{ .options = options }),
     );
 }
 
@@ -309,14 +312,18 @@ test "prefixed child access preserves alignment bounds and headers" {
     const identifier = [runtime.file_identifier_size]u8{ 4, 0, 4, 0 };
     var storage: [256]u8 align(runtime.storage_alignment) = undefined;
     var builder = runtime.Builder.init(&storage);
-    const child_handle = try Child.Schema.create(&builder, .{
-        .number = 0x1122334455667788,
-        .value = -1.5,
-        .samples = &.{ 10, 20 },
-    });
-    const vector_handle = try builder.createOffsetVector(&.{child_handle});
+    const child_handle = try Child.Schema.create(
+        &builder,
+        .{
+            .number = 0x1122334455667788,
+            .value = -1.5,
+            .samples = &.{ 10, 20 },
+        },
+        .{},
+    );
+    const vector_handle = try builder.createReferenceVector(&.{child_handle}, .{});
     var context = try Root.Schema.Context.init(&builder);
-    try Root.Schema.addFields(&context, .{}, .{ child_handle, vector_handle });
+    try Root.Schema.addFields(&context, .{ .child = child_handle, .children = vector_handle });
     const bytes = try builder.finish(
         try Root.Schema.endTable(&context),
         .{ .size_prefixed_identifier = identifier },
@@ -327,7 +334,7 @@ test "prefixed child access preserves alignment bounds and headers" {
     };
     const table = try runtime.Table.from(
         bytes,
-        .{ .framed_root = options },
+        .{ .options = options },
     );
     const child = (try table.readTable(0)).?;
     const children = (try table.readVector(runtime.TableCodec(Child), 1)).?;
@@ -365,7 +372,7 @@ test "prefixed child access preserves alignment bounds and headers" {
     );
     const mutable = try runtime.MutableTable.from(
         bytes,
-        .{ .framed_root = options },
+        .{ .options = options },
     );
     const mutable_child = (try mutable.readTable(0)).?;
     try testing.expect(try mutable_child.mutateField(u64, 0, 42));

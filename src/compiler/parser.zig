@@ -19,7 +19,7 @@
 //! semantics. See https://flatbuffers.dev/schema/ and reflection/reflection.fbs.
 //!
 //! From Flatzz, run `zig build test`.
-//! Import with `const parser = @import("flatzz_compiler").parser;`.
+//! Import `const compiler = @import("flatzz_compiler");`, then `const parser = compiler.parser;`.
 //! Example inside a function with `std` and `parser` imported:
 //! ```zig
 //! var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
@@ -32,9 +32,57 @@
 
 const std = @import("std");
 const reflection = @import("reflection.zig");
-const wire = @import("flatzz").wire;
+const flatzz = @import("flatzz");
+
+const wire = flatzz.wire;
 const Allocator = std.mem.Allocator;
 const BaseType = reflection.BaseType;
+
+const scalar_types = std.StaticStringMap(BaseType).initComptime(.{
+    .{ "bool", .Bool },     .{ "byte", .Byte },     .{ "int8", .Byte },
+    .{ "ubyte", .UByte },   .{ "uint8", .UByte },   .{ "short", .Short },
+    .{ "int16", .Short },   .{ "ushort", .UShort }, .{ "uint16", .UShort },
+    .{ "int", .Int },       .{ "int32", .Int },     .{ "uint", .UInt },
+    .{ "uint32", .UInt },   .{ "long", .Long },     .{ "int64", .Long },
+    .{ "ulong", .ULong },   .{ "uint64", .ULong },  .{ "float", .Float },
+    .{ "float32", .Float }, .{ "double", .Double }, .{ "float64", .Double },
+    .{ "string", .String },
+});
+
+// FBS attribute spellings are external names; numeric tags have no wire meaning.
+const BuiltinAttribute = enum {
+    id,
+    required,
+    deprecated,
+    key,
+    force_align,
+    bit_flags,
+    nested_flatbuffer,
+    flexbuffer,
+    hash,
+    offset64,
+    vector64,
+    original_order,
+    shared,
+    native_inline,
+    native_custom_alloc,
+    native_type,
+    native_type_pack_name,
+    native_default,
+    native_include,
+    native_cpp_type,
+    cpp_type,
+    cpp_ptr_type,
+    cpp_str_type,
+    cpp_str_flex_ctor,
+    cpp_include,
+    streaming,
+    idempotent,
+    private,
+    force_empty,
+    force_empty_vector,
+    cpp_static_reflection,
+};
 
 /// Allocation, validation, supported-feature, include, and nesting failures.
 pub const Error = error{
@@ -112,7 +160,8 @@ pub fn parse(allocator: Allocator, source: []const u8) Error!reflection.Schema {
 /// there is no rollback of arena allocations. Loader `OutOfMemory` propagates,
 /// while other loader errors become `IncludeNotFound`.
 ///
-/// Inside a function with `std` and `parser = @import("flatzz_compiler").parser` imported:
+/// Inside a function with `std`, `compiler = @import("flatzz_compiler")`,
+/// and `parser = compiler.parser` declared:
 /// ```zig
 /// var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
 /// defer arena.deinit();
@@ -208,7 +257,7 @@ const Compiler = struct {
                 .filename = location.source.name,
                 .line = position.line + 1,
                 .column = position.column + 1,
-                .message = std.fmt.allocPrint(allocator, format, arguments) catch return error.OutOfMemory,
+                .message = allocator.print(format, arguments) catch return error.OutOfMemory,
             };
         }
         return failure;
@@ -223,7 +272,13 @@ const Compiler = struct {
         return self.fail(allocator, location, error.InvalidSchema, message, .{});
     }
 
-    fn load(self: *Compiler, allocator: Allocator, input: Source, depth: usize, main: bool) Error!void {
+    fn load(
+        self: *Compiler,
+        allocator: Allocator,
+        input: Source,
+        depth: usize,
+        main: bool,
+    ) Error!void {
         if (self.loaded.contains(input.name)) return;
         const source: Source = .{
             .name = try allocator.dupe(u8, input.name),
@@ -231,24 +286,50 @@ const Compiler = struct {
         };
         const location: Location = .{ .source = source, .offset = 0 };
         if (depth >= self.options.max_depth)
-            return self.fail(allocator, location, error.DepthLimitExceeded, "include depth limit exceeded", .{});
+            return self.fail(
+                allocator,
+                location,
+                error.DepthLimitExceeded,
+                "include depth limit exceeded",
+                .{},
+            );
         try self.loaded.put(allocator, source.name, {});
         var parser: Parser = .{ .compiler = self, .source = source, .depth = depth, .main = main };
         try parser.advance(allocator);
         try parser.declarations(allocator);
     }
 
-    fn register(self: *Compiler, allocator: Allocator, name: []const u8, symbol: Symbol, location: Location) Error!void {
+    fn register(
+        self: *Compiler,
+        allocator: Allocator,
+        name: []const u8,
+        symbol: Symbol,
+        location: Location,
+    ) Error!void {
         const entry = try self.symbols.getOrPut(allocator, name);
         if (entry.found_existing)
-            return self.fail(allocator, location, error.InvalidSchema, "duplicate type '{s}'", .{name});
+            return self.fail(
+                allocator,
+                location,
+                error.InvalidSchema,
+                "duplicate type '{s}'",
+                .{name},
+            );
         entry.value_ptr.* = symbol;
     }
 
-    fn lookup(self: *Compiler, allocator: Allocator, namespace: []const u8, name: []const u8, location: Location) Error!Symbol {
+    fn lookup(
+        self: *Compiler,
+        allocator: Allocator,
+        namespace: []const u8,
+        name: []const u8,
+        location: Location,
+    ) Error!Symbol {
         var scope = namespace;
         while (scope.len != 0) {
             const qualified = try qualify(allocator, scope, name);
+            // Nonempty scope makes this an owned key; lookup does not retain it.
+            defer allocator.free(qualified);
             if (self.symbols.get(qualified)) |symbol| return symbol;
             scope = scope[0 .. std.mem.lastIndexOfScalar(u8, scope, '.') orelse 0];
         }
@@ -256,7 +337,12 @@ const Compiler = struct {
             self.fail(allocator, location, error.InvalidSchema, "unknown type '{s}'", .{name});
     }
 
-    fn resolveType(self: *Compiler, allocator: Allocator, reference: TypeRef, namespace: []const u8) Error!void {
+    fn resolveType(
+        self: *Compiler,
+        allocator: Allocator,
+        reference: TypeRef,
+        namespace: []const u8,
+    ) Error!void {
         const field_type = reference.value;
         if (reference.name) |name| {
             const symbol = try self.lookup(allocator, namespace, name, reference.location);
@@ -267,10 +353,16 @@ const Compiler = struct {
                 .object => .Obj,
                 .enumeration => |index| enum_base_blk: {
                     const enumeration = self.enums.items[index].value;
-                    break :enum_base_blk if (enumeration.is_union) .Union else enumeration.underlying_type.base_type;
+                    break :enum_base_blk if (enumeration.is_union)
+                        .Union
+                    else
+                        enumeration.underlying_type.base_type;
                 },
             };
-            if (field_type.base_type == .Vector or field_type.base_type == .Array) field_type.element = base else field_type.base_type = base;
+            if (field_type.base_type == .Vector or field_type.base_type == .Array)
+                field_type.element = base
+            else
+                field_type.base_type = base;
         }
         field_type.base_size = baseSize(field_type.base_type);
         field_type.element_size = baseSize(field_type.element);
@@ -289,7 +381,11 @@ const Compiler = struct {
                 }
             }.less);
             for (definition[1], 0..) |item, index|
-                try self.symbols.put(allocator, item.value.name, @unionInit(Symbol, @tagName(definition[2]), index));
+                try self.symbols.put(
+                    allocator,
+                    item.value.name,
+                    @unionInit(Symbol, @tagName(definition[2]), index),
+                );
         }
 
         const objects = try allocator.alloc(reflection.Object, self.objects.items.len);
@@ -305,8 +401,13 @@ const Compiler = struct {
                 const field_type = item.type_ref.value;
                 if (enumeration.value.is_union and value_index != 0) {
                     if (field_type.base_type != .Obj and field_type.base_type != .String)
-                        return self.invalid(allocator, item.type_ref.location, "union alternatives must be tables, structs or strings");
-                    if (field_type.base_type == .String or self.objects.items[@intCast(field_type.index)].value.is_struct)
+                        return self.invalid(
+                            allocator,
+                            item.type_ref.location,
+                            "union alternatives must be tables, structs or strings",
+                        );
+                    if (field_type.base_type == .String or
+                        self.objects.items[@intCast(field_type.index)].value.is_struct)
                         self.features.advanced_union_features = true;
                 }
                 values[value_index] = item.value;
@@ -355,14 +456,23 @@ const Compiler = struct {
         for (object.fields) |*field| {
             try self.resolveType(allocator, field.type_ref, object.namespace);
             const field_type = field.type_ref.value;
-            if (field_type.base_type == .Union or (field_type.base_type == .Vector and field_type.element == .Union)) count += 1;
-            explicit_ids = explicit_ids or attribute(field.value.attributes, "id") != null;
+            if (field_type.base_type == .Union or
+                (field_type.base_type == .Vector and field_type.element == .Union)) count += 1;
+            explicit_ids = explicit_ids or attribute(field.value.attributes, .id) != null;
             try self.finishField(allocator, field, object);
             if (field.value.key) key_count += 1;
         }
-        if (key_count > 1) return self.invalid(allocator, object.location, "a table may have only one key");
+        if (key_count > 1) return self.invalid(
+            allocator,
+            object.location,
+            "a table may have only one key",
+        );
         if (count > wire.max_field_count)
-            return self.invalid(allocator, object.location, "too many fields for reflection/vtable metadata");
+            return self.invalid(
+                allocator,
+                object.location,
+                "too many fields for reflection/vtable metadata",
+            );
         const fields = try allocator.alloc(reflection.Field, count);
         const used = try allocator.alloc(bool, count);
         @memset(used, false);
@@ -372,11 +482,18 @@ const Compiler = struct {
             var value = field.value;
             const union_field = value.type.base_type == .Union or
                 (value.type.base_type == .Vector and value.type.element == .Union);
-            const id_attribute = attribute(value.attributes, "id");
+            const id_attribute = attribute(value.attributes, .id);
             if (explicit_ids and id_attribute == null)
-                return self.invalid(allocator, field.location, "use explicit IDs on every field or none");
+                return self.invalid(
+                    allocator,
+                    field.location,
+                    "use explicit IDs on every field or none",
+                );
             const field_id: usize = if (id_attribute) |item|
-                std.math.cast(usize, try self.integer(allocator, item.value.?, field.location)) orelse
+                std.math.cast(
+                    usize,
+                    try self.integer(allocator, item.value.?, field.location),
+                ) orelse
                     return self.invalid(allocator, field.location, "field ID must be nonnegative")
             else
                 next + @intFromBool(union_field);
@@ -388,7 +505,11 @@ const Compiler = struct {
             ) orelse
                 return self.invalid(allocator, field.location, "field ID exceeds vtable range");
             if (union_field) {
-                if (field_id == 0) return self.invalid(allocator, field.location, "union value ID must leave room for its type field");
+                if (field_id == 0) return self.invalid(
+                    allocator,
+                    field.location,
+                    "union value ID must leave room for its type field",
+                );
                 const vector = value.type.base_type == .Vector;
                 const tag_type = try allocator.create(reflection.Type);
                 tag_type.* = .{
@@ -399,7 +520,7 @@ const Compiler = struct {
                     .element_size = @sizeOf(wire.UnionTag),
                 };
                 const tag: reflection.Field = .{
-                    .name = try std.fmt.allocPrint(allocator, "{s}_type", .{value.name}),
+                    .name = try allocator.print("{s}_type", .{value.name}),
                     .type = tag_type,
                     .id = @intCast(field_id - 1),
                     .offset = value.offset - wire.vtable_entry_size,
@@ -419,57 +540,114 @@ const Compiler = struct {
         object.value.fields = fields;
     }
 
-    fn checkField(self: *Compiler, allocator: Allocator, field: reflection.Field, names: *std.StringHashMapUnmanaged(void), used: []bool, location: Location) Error!void {
+    fn checkField(
+        self: *Compiler,
+        allocator: Allocator,
+        field: reflection.Field,
+        names: *std.StringHashMapUnmanaged(void),
+        used: []bool,
+        location: Location,
+    ) Error!void {
         if (field.id >= used.len or used[field.id])
-            return self.invalid(allocator, location, "field IDs must be unique and contiguous from zero");
+            return self.invalid(
+                allocator,
+                location,
+                "field IDs must be unique and contiguous from zero",
+            );
         used[field.id] = true;
         if ((try names.getOrPut(allocator, field.name)).found_existing)
-            return self.fail(allocator, location, error.InvalidSchema, "duplicate field '{s}' (including union type fields)", .{field.name});
+            return self.fail(
+                allocator,
+                location,
+                error.InvalidSchema,
+                "duplicate field '{s}' (including union type fields)",
+                .{field.name},
+            );
     }
 
-    fn finishField(self: *Compiler, allocator: Allocator, field: *FieldDef, object: *const ObjectDef) Error!void {
+    fn finishField(
+        self: *Compiler,
+        allocator: Allocator,
+        field: *FieldDef,
+        object: *const ObjectDef,
+    ) Error!void {
         const field_type = field.type_ref.value;
         const scalar = isScalar(field_type.base_type);
         if (object.value.is_struct) {
-            if (field.default != null or attribute(field.value.attributes, "id") != null or
+            if (field.default != null or attribute(field.value.attributes, .id) != null or
                 field.value.required or field.value.deprecated or field.value.key)
-                return self.invalid(allocator, field.location, "struct members cannot have defaults or table-field attributes");
+                return self.invalid(
+                    allocator,
+                    field.location,
+                    "struct members cannot have defaults or table-field attributes",
+                );
             try self.checkInlineType(allocator, field_type, field.location);
             // Preserve the existing Flatzz schemas: inline enums have no
             // omitted-field default and need not declare a zero variant.
             return;
         }
         if (field_type.base_type == .Array)
-            return self.invalid(allocator, field.location, "fixed arrays are only allowed in structs");
+            return self.invalid(
+                allocator,
+                field.location,
+                "fixed arrays are only allowed in structs",
+            );
         if (field.value.required and scalar)
-            return self.invalid(allocator, field.location, "required is only valid on reference/struct fields");
+            return self.invalid(
+                allocator,
+                field.location,
+                "required is only valid on reference/struct fields",
+            );
         if (field.value.key and !scalar and field_type.base_type != .String)
             return self.invalid(allocator, field.location, "key requires a scalar or string");
         if (field.value.key and field_type.base_type == .String) field.value.required = true;
         field.value.optional = !scalar and !field.value.required;
-        if (field_type.base_type == .Vector and field_type.element == .Union) self.features.advanced_union_features = true;
+        if (field_type.base_type == .Vector and field_type.element == .Union)
+            self.features.advanced_union_features = true;
         if (!scalar) {
             if (field.default != null)
-                return self.fail(allocator, field.location, error.UnsupportedFeature, "non-scalar defaults are not supported", .{});
+                return self.fail(
+                    allocator,
+                    field.location,
+                    error.UnsupportedFeature,
+                    "non-scalar defaults are not supported",
+                    .{},
+                );
             return;
         }
         if (field.default) |value| {
             if (std.mem.eql(u8, value.text, "null")) {
                 if (field.value.key)
-                    return self.invalid(allocator, value.location, "a key cannot be an optional scalar");
+                    return self.invalid(
+                        allocator,
+                        value.location,
+                        "a key cannot be an optional scalar",
+                    );
                 field.value.optional = true;
                 self.features.optional_scalars = true;
                 return;
             }
             if (field_type.base_type == .Float or field_type.base_type == .Double) {
                 if (std.mem.indexOfScalar(u8, value.text, '_') != null)
-                    return self.invalid(allocator, value.location, "invalid floating-point default");
+                    return self.invalid(
+                        allocator,
+                        value.location,
+                        "invalid floating-point default",
+                    );
                 const number = std.fmt.parseFloat(f64, value.text) catch
-                    return self.invalid(allocator, value.location, "invalid floating-point default");
+                    return self.invalid(
+                        allocator,
+                        value.location,
+                        "invalid floating-point default",
+                    );
                 if (field_type.base_type == .Float) {
                     const narrowed: f32 = @floatCast(number);
                     if (std.math.isFinite(number) and !std.math.isFinite(narrowed))
-                        return self.invalid(allocator, value.location, "default is outside float32 range");
+                        return self.invalid(
+                            allocator,
+                            value.location,
+                            "default is outside float32 range",
+                        );
                 }
                 // Reflection carries the f64 parsing of the literal even for
                 // float32 fields. The generated field type performs narrowing.
@@ -480,7 +658,12 @@ const Compiler = struct {
                 else if (std.mem.eql(u8, value.text, "false"))
                     0
                 else
-                    try self.integerBits(allocator, try self.integer(allocator, value.text, value.location), .Bool, value.location);
+                    try self.integerBits(
+                        allocator,
+                        try self.integer(allocator, value.text, value.location),
+                        .Bool,
+                        value.location,
+                    );
             } else {
                 var number: i128 = undefined;
                 const named_default = value.text.len != 0 and
@@ -489,34 +672,82 @@ const Compiler = struct {
                     const enumeration = &self.enums.items[@intCast(field_type.index)];
                     var member = value.text;
                     if (std.mem.lastIndexOfScalar(u8, member, '.')) |dot| {
-                        const symbol = try self.lookup(allocator, object.namespace, member[0..dot], value.location);
-                        if (symbol != .enumeration or symbol.enumeration != @as(usize, @intCast(field_type.index)))
-                            return self.invalid(allocator, value.location, "default names a different enum");
+                        const symbol = try self.lookup(
+                            allocator,
+                            object.namespace,
+                            member[0..dot],
+                            value.location,
+                        );
+                        if (symbol != .enumeration or symbol.enumeration != @as(
+                            usize,
+                            @intCast(field_type.index),
+                        ))
+                            return self.invalid(
+                                allocator,
+                                value.location,
+                                "default names a different enum",
+                            );
                         member = member[dot + 1 ..];
                     }
                     const bits = enum_value_blk: {
                         for (enumeration.values) |item|
-                            if (std.mem.eql(u8, item.value.name, member)) break :enum_value_blk item.value.value;
-                        return self.fail(allocator, value.location, error.InvalidSchema, "unknown enum value '{s}'", .{member});
+                            if (std.mem.eql(
+                                u8,
+                                item.value.name,
+                                member,
+                            )) break :enum_value_blk item.value.value;
+                        return self.fail(
+                            allocator,
+                            value.location,
+                            error.InvalidSchema,
+                            "unknown enum value '{s}'",
+                            .{member},
+                        );
                     };
-                    number = if (isUnsigned(field_type.base_type)) @as(u64, @bitCast(bits)) else bits;
+                    number = if (isUnsigned(field_type.base_type)) @as(
+                        u64,
+                        @bitCast(bits),
+                    ) else bits;
                 } else number = try self.integer(allocator, value.text, value.location);
-                field.value.default_integer = try self.integerBits(allocator, number, field_type.base_type, value.location);
+                field.value.default_integer = try self.integerBits(
+                    allocator,
+                    number,
+                    field_type.base_type,
+                    value.location,
+                );
             }
         }
         if (field_type.index >= 0) {
             const enumeration = self.enums.items[@intCast(field_type.index)];
-            for (enumeration.values) |item| if (item.value.value == field.value.default_integer) return;
-            return self.invalid(allocator, field.location, "enum default must be a declared enum value");
+            for (enumeration.values) |item|
+                if (item.value.value == field.value.default_integer) return;
+            return self.invalid(
+                allocator,
+                field.location,
+                "enum default must be a declared enum value",
+            );
         }
     }
 
-    fn checkInlineType(self: *Compiler, allocator: Allocator, field_type: *const reflection.Type, location: Location) Error!void {
-        const base = if (field_type.base_type == .Array) field_type.element else field_type.base_type;
+    fn checkInlineType(
+        self: *Compiler,
+        allocator: Allocator,
+        field_type: *const reflection.Type,
+        location: Location,
+    ) Error!void {
+        const base = if (field_type.base_type == .Array)
+            field_type.element
+        else
+            field_type.base_type;
         if (field_type.base_type == .Array) self.features.advanced_array_features = true;
         if (isScalar(base) or
-            (base == .Obj and self.objects.items[@intCast(field_type.index)].value.is_struct)) return;
-        return self.invalid(allocator, location, "struct members must be scalars, structs or fixed arrays of them");
+            (base == .Obj and self.objects.items[@intCast(field_type.index)].value.is_struct))
+            return;
+        return self.invalid(
+            allocator,
+            location,
+            "struct members must be scalars, structs or fixed arrays of them",
+        );
     }
 
     fn layoutObject(self: *Compiler, allocator: Allocator, index: usize, depth: usize) Error!void {
@@ -525,13 +756,22 @@ const Compiler = struct {
         if (object.state == .visiting)
             return self.invalid(allocator, object.location, "recursive inline struct");
         if (depth >= self.options.max_depth)
-            return self.fail(allocator, object.location, error.DepthLimitExceeded, "struct nesting depth limit exceeded", .{});
+            return self.fail(
+                allocator,
+                object.location,
+                error.DepthLimitExceeded,
+                "struct nesting depth limit exceeded",
+                .{},
+            );
         object.state = .visiting;
         var size: u64 = 0;
         var alignment: u32 = 1;
         for (object.output_fields, 0..) |*field, field_index| {
             const field_type = field.type;
-            const base = if (field_type.base_type == .Array) field_type.element else field_type.base_type;
+            const base = if (field_type.base_type == .Array)
+                field_type.element
+            else
+                field_type.base_type;
             var member_size: u64 = baseSize(base);
             var member_alignment: u32 = @intCast(member_size);
             if (base == .Obj) {
@@ -543,13 +783,22 @@ const Compiler = struct {
             }
             if (field_type.base_type == .Array) member_size *= field_type.fixed_length;
             const offset = std.mem.alignForward(u64, size, member_alignment);
-            if (field_index > 0) object.output_fields[field_index - 1].padding = @intCast(offset - size);
+            if (field_index > 0)
+                object.output_fields[field_index - 1].padding = @intCast(offset - size);
             field.offset = std.math.cast(u16, offset) orelse
-                return self.invalid(allocator, object.location, "struct field offset exceeds reflection's u16 range");
+                return self.invalid(
+                    allocator,
+                    object.location,
+                    "struct field offset exceeds reflection's u16 range",
+                );
             size = offset + member_size;
             alignment = @max(alignment, member_alignment);
             if (size > std.math.maxInt(i32))
-                return self.invalid(allocator, object.location, "struct size exceeds reflection's i32 range");
+                return self.invalid(
+                    allocator,
+                    object.location,
+                    "struct size exceeds reflection's i32 range",
+                );
         }
         const final_size = std.mem.alignForward(u64, size, alignment);
         object.output_fields[object.output_fields.len - 1].padding = @intCast(final_size - size);
@@ -558,33 +807,60 @@ const Compiler = struct {
         object.state = .done;
     }
 
-    fn integer(self: *Compiler, allocator: Allocator, text: []const u8, location: Location) Error!i128 {
+    fn integer(
+        self: *Compiler,
+        allocator: Allocator,
+        text: []const u8,
+        location: Location,
+    ) Error!i128 {
         var digits = text;
         var negative = false;
         if (digits.len > 0 and (digits[0] == '-' or digits[0] == '+')) {
             negative = digits[0] == '-';
             digits = digits[1..];
         }
-        const hexadecimal = std.mem.startsWith(u8, digits, "0x") or std.mem.startsWith(u8, digits, "0X");
+        const hexadecimal = std.mem.startsWith(
+            u8,
+            digits,
+            "0x",
+        ) or std.mem.startsWith(u8, digits, "0X");
         if (hexadecimal) digits = digits[2..];
         if (digits.len == 0) return self.invalid(allocator, location, "expected integer");
         for (digits) |byte| {
             if (!(if (hexadecimal) std.ascii.isHex(byte) else std.ascii.isDigit(byte)))
-                return self.fail(allocator, location, error.InvalidSchema, "invalid integer '{s}'", .{text});
+                return self.fail(
+                    allocator,
+                    location,
+                    error.InvalidSchema,
+                    "invalid integer '{s}'",
+                    .{text},
+                );
         }
         const magnitude = std.fmt.parseInt(i128, digits, if (hexadecimal) 16 else 10) catch
             return self.invalid(allocator, location, "integer is too large");
         return if (negative) -magnitude else magnitude;
     }
 
-    fn integerBits(self: *Compiler, allocator: Allocator, value: i128, base: BaseType, location: Location) Error!i64 {
+    fn integerBits(
+        self: *Compiler,
+        allocator: Allocator,
+        value: i128,
+        base: BaseType,
+        location: Location,
+    ) Error!i64 {
         const bits: u7 = @intCast(baseSize(base) * 8);
         const unsigned = isUnsigned(base);
         const limit = @as(i128, 1) << (if (unsigned) bits else bits - 1);
         const minimum: i128 = if (unsigned) 0 else -limit;
         const maximum: i128 = if (base == .Bool) 1 else limit - 1;
         if (value < minimum or value > maximum)
-            return self.fail(allocator, location, error.InvalidSchema, "integer is outside {s} range", .{@tagName(base)});
+            return self.fail(
+                allocator,
+                location,
+                error.InvalidSchema,
+                "integer is outside {s} range",
+                .{@tagName(base)},
+            );
         return if (unsigned) @bitCast(@as(u64, @intCast(value))) else @intCast(value);
     }
 };
@@ -611,7 +887,13 @@ const Parser = struct {
         return true;
     }
     fn expect(self: *Parser, allocator: Allocator, text: []const u8) Error!void {
-        if (!try self.take(allocator, text)) return self.compiler.fail(allocator, self.location(), error.InvalidSchema, "expected '{s}', found '{s}'", .{ text, self.token.text });
+        if (!try self.take(allocator, text)) return self.compiler.fail(
+            allocator,
+            self.location(),
+            error.InvalidSchema,
+            "expected '{s}', found '{s}'",
+            .{ text, self.token.text },
+        );
     }
     fn identifier(self: *Parser, allocator: Allocator) Error![]const u8 {
         if (self.token.kind != .identifier)
@@ -622,15 +904,28 @@ const Parser = struct {
     }
     fn name(self: *Parser, allocator: Allocator) Error![]const u8 {
         var result = try self.identifier(allocator);
-        while (try self.take(allocator, ".")) result = try qualify(allocator, result, try self.identifier(allocator));
+        while (try self.take(allocator, ".")) result = try qualify(
+            allocator,
+            result,
+            try self.identifier(allocator),
+        );
         return result;
     }
     fn string(self: *Parser, allocator: Allocator) Error![]const u8 {
         if (self.token.kind != .string)
             return self.compiler.invalid(allocator, self.location(), "expected quoted string");
-        const result = std.json.parseFromSliceLeaky([]const u8, allocator, self.token.text, .{ .allocate = .alloc_always }) catch |failure| {
+        const result = std.json.parseFromSliceLeaky(
+            []const u8,
+            allocator,
+            self.token.text,
+            .{ .allocate = .alloc_always },
+        ) catch |failure| {
             if (failure == error.OutOfMemory) return error.OutOfMemory;
-            return self.compiler.invalid(allocator, self.location(), "invalid string or escape sequence");
+            return self.compiler.invalid(
+                allocator,
+                self.location(),
+                "invalid string or escape sequence",
+            );
         };
         try self.advance(allocator);
         return result;
@@ -645,7 +940,11 @@ const Parser = struct {
                 try self.advance(allocator);
                 break :number_text_blk token.text;
             },
-            else => return self.compiler.invalid(allocator, token_location, "expected a literal or enum value"),
+            else => return self.compiler.invalid(
+                allocator,
+                token_location,
+                "expected a literal or enum value",
+            ),
         };
         return .{ .kind = token.kind, .text = text, .location = token_location };
     }
@@ -660,14 +959,35 @@ const Parser = struct {
         while (self.token.kind != .eof) {
             const token_location = self.location();
             if (try self.take(allocator, "include")) {
-                if (saw_declaration) return compiler.invalid(allocator, token_location, "includes must precede declarations");
+                if (saw_declaration) return compiler.invalid(
+                    allocator,
+                    token_location,
+                    "includes must precede declarations",
+                );
                 const requested = try self.string(allocator);
                 try self.expect(allocator, ";");
                 const loader = compiler.options.include_loader orelse
-                    return compiler.fail(allocator, token_location, error.IncludeNotFound, "no include loader for '{s}'", .{requested});
-                const included = loader(compiler.options.include_context, allocator, self.source.name, requested) catch |failure| {
+                    return compiler.fail(
+                        allocator,
+                        token_location,
+                        error.IncludeNotFound,
+                        "no include loader for '{s}'",
+                        .{requested},
+                    );
+                const included = loader(
+                    compiler.options.include_context,
+                    allocator,
+                    self.source.name,
+                    requested,
+                ) catch |failure| {
                     if (failure == error.OutOfMemory) return error.OutOfMemory;
-                    return compiler.fail(allocator, token_location, error.IncludeNotFound, "cannot include '{s}': {s}", .{ requested, @errorName(failure) });
+                    return compiler.fail(
+                        allocator,
+                        token_location,
+                        error.IncludeNotFound,
+                        "cannot include '{s}': {s}",
+                        .{ requested, @errorName(failure) },
+                    );
                 };
                 try includes.append(allocator, try allocator.dupe(u8, included.name));
                 try compiler.load(allocator, included, self.depth + 1, false);
@@ -682,35 +1002,80 @@ const Parser = struct {
             } else if (self.matchesToken("enum") or self.matchesToken("union")) {
                 try self.enumeration(allocator);
             } else if (try self.take(allocator, "root_type")) {
-                if (saw_root) return compiler.invalid(allocator, token_location, "duplicate root_type");
+                if (saw_root) return compiler.invalid(
+                    allocator,
+                    token_location,
+                    "duplicate root_type",
+                );
                 saw_root = true;
-                try compiler.roots.append(allocator, .{ .name = try self.name(allocator), .namespace = self.namespace, .location = token_location, .main = self.main });
+                try compiler.roots.append(
+                    allocator,
+                    .{
+                        .name = try self.name(allocator),
+                        .namespace = self.namespace,
+                        .location = token_location,
+                        .main = self.main,
+                    },
+                );
                 try self.expect(allocator, ";");
             } else if (try self.take(allocator, "file_identifier")) {
-                if (saw_identifier) return compiler.invalid(allocator, token_location, "duplicate file_identifier");
+                if (saw_identifier) return compiler.invalid(
+                    allocator,
+                    token_location,
+                    "duplicate file_identifier",
+                );
                 saw_identifier = true;
                 const value = try self.string(allocator);
                 if (value.len != wire.file_identifier_size)
-                    return compiler.invalid(allocator, token_location, "file_identifier must contain exactly four bytes");
+                    return compiler.invalid(
+                        allocator,
+                        token_location,
+                        "file_identifier must contain exactly four bytes",
+                    );
                 if (self.main) compiler.file_ident = value;
                 try self.expect(allocator, ";");
             } else if (try self.take(allocator, "file_extension")) {
-                if (saw_extension) return compiler.invalid(allocator, token_location, "duplicate file_extension");
+                if (saw_extension) return compiler.invalid(
+                    allocator,
+                    token_location,
+                    "duplicate file_extension",
+                );
                 saw_extension = true;
                 const value = try self.string(allocator);
                 if (self.main) compiler.file_ext = value;
                 try self.expect(allocator, ";");
             } else if (try self.take(allocator, "attribute")) {
-                const value = if (self.token.kind == .string) try self.string(allocator) else try self.identifier(allocator);
-                if (builtin(value)) return compiler.fail(allocator, token_location, error.InvalidSchema, "cannot redeclare built-in attribute '{s}'", .{value});
+                const value = if (self.token.kind == .string)
+                    try self.string(allocator)
+                else
+                    try self.identifier(allocator);
+                if (std.meta.stringToEnum(BuiltinAttribute, value) != null) return compiler.fail(
+                    allocator,
+                    token_location,
+                    error.InvalidSchema,
+                    "cannot redeclare built-in attribute '{s}'",
+                    .{value},
+                );
                 try compiler.custom_attributes.put(allocator, value, {});
                 try self.expect(allocator, ";");
             } else {
-                const failure: Error = if (self.matchesToken("rpc_service")) error.UnsupportedFeature else error.InvalidSchema;
-                return compiler.fail(allocator, token_location, failure, "unsupported declaration '{s}'", .{self.token.text});
+                const failure: Error = if (self.matchesToken("rpc_service"))
+                    error.UnsupportedFeature
+                else
+                    error.InvalidSchema;
+                return compiler.fail(
+                    allocator,
+                    token_location,
+                    failure,
+                    "unsupported declaration '{s}'",
+                    .{self.token.text},
+                );
             }
         }
-        try compiler.files.append(allocator, .{ .filename = self.source.name, .included_filenames = includes.items });
+        try compiler.files.append(
+            allocator,
+            .{ .filename = self.source.name, .included_filenames = includes.items },
+        );
     }
 
     fn object(self: *Parser, allocator: Allocator) Error!void {
@@ -719,7 +1084,12 @@ const Parser = struct {
         const structure = self.matchesToken("struct");
         try self.advance(allocator);
         const object_name = try qualify(allocator, self.namespace, try self.identifier(allocator));
-        try compiler.register(allocator, object_name, .{ .object = compiler.objects.items.len }, token_location);
+        try compiler.register(
+            allocator,
+            object_name,
+            .{ .object = compiler.objects.items.len },
+            token_location,
+        );
         const declaration_attributes = try self.attributes(allocator, false);
         try self.expect(allocator, "{");
         var fields: std.ArrayList(FieldDef) = .empty;
@@ -728,7 +1098,13 @@ const Parser = struct {
             const field_location = self.location();
             const field_name = try self.identifier(allocator);
             if ((try names.getOrPut(allocator, field_name)).found_existing)
-                return compiler.fail(allocator, field_location, error.InvalidSchema, "duplicate field '{s}'", .{field_name});
+                return compiler.fail(
+                    allocator,
+                    field_location,
+                    error.InvalidSchema,
+                    "duplicate field '{s}'",
+                    .{field_name},
+                );
             try self.expect(allocator, ":");
             const reference = try self.typeReference(allocator);
             const default = if (try self.take(allocator, "=")) try self.atom(allocator) else null;
@@ -739,9 +1115,9 @@ const Parser = struct {
                     .name = field_name,
                     .type = reference.value,
                     .attributes = field_attributes,
-                    .required = attribute(field_attributes, "required") != null,
-                    .deprecated = attribute(field_attributes, "deprecated") != null,
-                    .key = attribute(field_attributes, "key") != null,
+                    .required = attribute(field_attributes, .required) != null,
+                    .deprecated = attribute(field_attributes, .deprecated) != null,
+                    .key = attribute(field_attributes, .key) != null,
                 },
                 .type_ref = reference,
                 .default = default,
@@ -749,7 +1125,11 @@ const Parser = struct {
             });
         }
         _ = try self.take(allocator, ";");
-        if (structure and fields.items.len == 0) return compiler.invalid(allocator, token_location, "structs must have at least one member");
+        if (structure and fields.items.len == 0) return compiler.invalid(
+            allocator,
+            token_location,
+            "structs must have at least one member",
+        );
         try compiler.objects.append(allocator, .{
             .value = .{
                 .name = object_name,
@@ -771,16 +1151,36 @@ const Parser = struct {
         const union_type = self.matchesToken("union");
         try self.advance(allocator);
         const enum_name = try qualify(allocator, self.namespace, try self.identifier(allocator));
-        try compiler.register(allocator, enum_name, .{ .enumeration = compiler.enums.items.len }, token_location);
+        try compiler.register(
+            allocator,
+            enum_name,
+            .{ .enumeration = compiler.enums.items.len },
+            token_location,
+        );
         var underlying_base: BaseType = .UType;
         if (!union_type) {
             try self.expect(allocator, ":");
             underlying_base = scalarType(try self.identifier(allocator)) orelse .None;
-            if (!isScalar(underlying_base) or underlying_base == .Bool or underlying_base == .Float or underlying_base == .Double)
-                return compiler.invalid(allocator, token_location, "enum underlying type must be an integer");
-        } else if (self.matchesToken(":")) return compiler.fail(allocator, token_location, error.UnsupportedFeature, "custom union tag types are not supported", .{});
+            if (!isScalar(underlying_base) or underlying_base == .Bool or
+                underlying_base == .Float or underlying_base == .Double)
+                return compiler.invalid(
+                    allocator,
+                    token_location,
+                    "enum underlying type must be an integer",
+                );
+        } else if (self.matchesToken(":")) return compiler.fail(
+            allocator,
+            token_location,
+            error.UnsupportedFeature,
+            "custom union tag types are not supported",
+            .{},
+        );
         const underlying = try allocator.create(reflection.Type);
-        underlying.* = .{ .base_type = underlying_base, .base_size = baseSize(underlying_base), .element_size = 1 };
+        underlying.* = .{
+            .base_type = underlying_base,
+            .base_size = baseSize(underlying_base),
+            .element_size = 1,
+        };
         const declaration_attributes = try self.attributes(allocator, false);
         try self.expect(allocator, "{");
         var values: std.ArrayList(EnumValueDef) = .empty;
@@ -788,20 +1188,30 @@ const Parser = struct {
         var next_value: i128 = 0;
         if (union_type) {
             const none = try emptyType(allocator, token_location);
-            try values.append(allocator, .{ .value = .{ .name = "NONE", .union_type = none.value }, .type_ref = none });
+            try values.append(
+                allocator,
+                .{ .value = .{ .name = "NONE", .union_type = none.value }, .type_ref = none },
+            );
             try names.put(allocator, "NONE", {});
             next_value = 1;
         }
         while (!try self.take(allocator, "}")) {
             const member_location = self.location();
-            var member_name = if (union_type) try self.name(allocator) else try self.identifier(allocator);
+            var member_name = if (union_type)
+                try self.name(allocator)
+            else
+                try self.identifier(allocator);
             var reference = try emptyType(allocator, member_location);
             if (union_type) {
                 var target = member_name;
                 const aliased = try self.take(allocator, ":");
                 if (aliased) {
                     if (std.mem.indexOfScalar(u8, member_name, '.') != null)
-                        return compiler.invalid(allocator, member_location, "a union alias must be an unqualified identifier");
+                        return compiler.invalid(
+                            allocator,
+                            member_location,
+                            "a union alias must be an unqualified identifier",
+                        );
                     target = try self.name(allocator);
                 } else if (std.mem.indexOfScalar(u8, member_name, '.') != null) {
                     const renamed = try allocator.dupe(u8, member_name);
@@ -811,24 +1221,52 @@ const Parser = struct {
                     member_name = renamed;
                 }
                 if (scalarType(target)) |base| {
-                    if (!aliased) return compiler.invalid(allocator, member_location, "built-in union alternatives require an alias, for example Text:string");
+                    if (!aliased) return compiler.invalid(
+                        allocator,
+                        member_location,
+                        "built-in union alternatives require an alias, for example Text:string",
+                    );
                     reference.value.base_type = base;
                 } else reference.name = target;
             }
             if ((try names.getOrPut(allocator, member_name)).found_existing)
-                return compiler.fail(allocator, member_location, error.InvalidSchema, "duplicate enum/union member '{s}'", .{member_name});
+                return compiler.fail(
+                    allocator,
+                    member_location,
+                    error.InvalidSchema,
+                    "duplicate enum/union member '{s}'",
+                    .{member_name},
+                );
             var numeric_value = next_value;
             if (try self.take(allocator, "=")) {
                 const number = try self.atom(allocator);
-                if (number.kind != .number) return compiler.invalid(allocator, number.location, "enum values must be integer literals");
+                if (number.kind != .number) return compiler.invalid(
+                    allocator,
+                    number.location,
+                    "enum values must be integer literals",
+                );
                 numeric_value = try compiler.integer(allocator, number.text, number.location);
                 if (numeric_value < next_value and values.items.len != 0)
-                    return compiler.invalid(allocator, member_location, "enum values must be strictly increasing");
+                    return compiler.invalid(
+                        allocator,
+                        member_location,
+                        "enum values must be strictly increasing",
+                    );
             }
-            const bits = try compiler.integerBits(allocator, numeric_value, underlying_base, member_location);
+            const bits = try compiler.integerBits(
+                allocator,
+                numeric_value,
+                underlying_base,
+                member_location,
+            );
             const member_attributes = try self.attributes(allocator, false);
             try values.append(allocator, .{
-                .value = .{ .name = member_name, .value = bits, .union_type = reference.value, .attributes = member_attributes },
+                .value = .{
+                    .name = member_name,
+                    .value = bits,
+                    .union_type = reference.value,
+                    .attributes = member_attributes,
+                },
                 .type_ref = reference,
             });
             next_value = numeric_value + 1;
@@ -837,7 +1275,11 @@ const Parser = struct {
             break;
         }
         _ = try self.take(allocator, ";");
-        if (values.items.len == 0) return compiler.invalid(allocator, token_location, "enum must contain at least one value");
+        if (values.items.len == 0) return compiler.invalid(
+            allocator,
+            token_location,
+            "enum must contain at least one value",
+        );
         try compiler.enums.append(allocator, .{
             .value = .{
                 .name = enum_name,
@@ -871,11 +1313,23 @@ const Parser = struct {
         if (sequence) {
             if (try self.take(allocator, ":")) {
                 const count = try self.atom(allocator);
-                if (count.kind != .number) return compiler.invalid(allocator, count.location, "array length must be an integer");
+                if (count.kind != .number) return compiler.invalid(
+                    allocator,
+                    count.location,
+                    "array length must be an integer",
+                );
                 const length = try compiler.integer(allocator, count.text, count.location);
                 if (length < 0 or length > wire.max_array_length)
-                    return compiler.invalid(allocator, count.location, "array length must fit in u16");
-                if (length == 0) return compiler.invalid(allocator, count.location, "array length must be positive");
+                    return compiler.invalid(
+                        allocator,
+                        count.location,
+                        "array length must fit in u16",
+                    );
+                if (length == 0) return compiler.invalid(
+                    allocator,
+                    count.location,
+                    "array length must be positive",
+                );
                 reference.value.base_type = .Array;
                 reference.value.fixed_length = @intCast(length);
             }
@@ -891,17 +1345,53 @@ const Parser = struct {
         while (true) {
             const token_location = self.location();
             const key = try self.identifier(allocator);
-            if (attribute(result.items, key) != null)
-                return compiler.fail(allocator, token_location, error.InvalidSchema, "duplicate attribute '{s}'", .{key});
-            const value: ?[]const u8 = if (try self.take(allocator, ":")) (try self.atom(allocator)).text else null;
-            if (std.meta.stringToEnum(enum { id, required, deprecated, key }, key)) |kind| {
-                if (!field) return compiler.fail(allocator, token_location, error.InvalidSchema, "'{s}' is a field attribute", .{key});
-                if ((kind == .id) != (value != null))
-                    return compiler.fail(allocator, token_location, error.InvalidSchema, "invalid value for attribute '{s}'", .{key});
-            } else if (builtin(key)) {
-                return compiler.fail(allocator, token_location, error.UnsupportedFeature, "attribute '{s}' is not supported", .{key});
+            for (result.items) |item| if (std.mem.eql(u8, item.key, key))
+                return compiler.fail(
+                    allocator,
+                    token_location,
+                    error.InvalidSchema,
+                    "duplicate attribute '{s}'",
+                    .{key},
+                );
+            const value: ?[]const u8 = if (try self.take(
+                allocator,
+                ":",
+            )) (try self.atom(allocator)).text else null;
+            if (std.meta.stringToEnum(BuiltinAttribute, key)) |kind| {
+                switch (kind) {
+                    .id, .required, .deprecated, .key => {
+                        if (!field) return compiler.fail(
+                            allocator,
+                            token_location,
+                            error.InvalidSchema,
+                            "'{s}' is a field attribute",
+                            .{key},
+                        );
+                        if ((kind == .id) != (value != null))
+                            return compiler.fail(
+                                allocator,
+                                token_location,
+                                error.InvalidSchema,
+                                "invalid value for attribute '{s}'",
+                                .{key},
+                            );
+                    },
+                    else => return compiler.fail(
+                        allocator,
+                        token_location,
+                        error.UnsupportedFeature,
+                        "attribute '{s}' is not supported",
+                        .{key},
+                    ),
+                }
             } else if (!compiler.custom_attributes.contains(key)) {
-                return compiler.fail(allocator, token_location, error.InvalidSchema, "attribute '{s}' must be declared first", .{key});
+                return compiler.fail(
+                    allocator,
+                    token_location,
+                    error.InvalidSchema,
+                    "attribute '{s}' must be declared first",
+                    .{key},
+                );
             }
             try result.append(allocator, .{ .key = key, .value = value });
             if (!try self.take(allocator, ",")) break;
@@ -922,26 +1412,40 @@ const Parser = struct {
             if (byte == '/' and start + 1 < bytes.len) {
                 if (bytes[start + 1] == '/') {
                     self.position += 2;
-                    while (self.position < bytes.len and bytes[self.position] != '\n') self.position += 1;
+                    while (self.position < bytes.len and bytes[self.position] != '\n')
+                        self.position += 1;
                     continue;
                 }
                 if (bytes[start + 1] == '*') {
                     const tail = std.mem.indexOf(u8, bytes[start + 2 ..], "*/") orelse
-                        return self.compiler.invalid(allocator, .{ .source = self.source, .offset = start }, "unterminated block comment");
+                        return self.compiler.invalid(
+                            allocator,
+                            .{ .source = self.source, .offset = start },
+                            "unterminated block comment",
+                        );
                     self.position = start + 2 + tail + 2;
                     continue;
                 }
             }
             self.position += 1;
-            const kind: TokenKind = if (std.ascii.isAlphabetic(byte) or byte == '_') identifier_token_blk: {
-                while (self.position < bytes.len and (std.ascii.isAlphanumeric(bytes[self.position]) or bytes[self.position] == '_')) self.position += 1;
+            const kind: TokenKind = if (std.ascii.isAlphabetic(byte) or
+                byte == '_')
+            identifier_token_blk: {
+                while (self.position < bytes.len and
+                    (std.ascii.isAlphanumeric(bytes[self.position]) or bytes[self.position] == '_'))
+                    self.position += 1;
                 break :identifier_token_blk .identifier;
             } else if (std.ascii.isDigit(byte) or byte == '+' or byte == '-' or
-                (byte == '.' and self.position < bytes.len and std.ascii.isDigit(bytes[self.position])))
+                (byte == '.' and self.position < bytes.len and
+                    std.ascii.isDigit(bytes[self.position])))
             number_token_blk: {
                 while (self.position < bytes.len) {
                     const next = bytes[self.position];
-                    if (!std.ascii.isAlphanumeric(next) and std.mem.indexOfScalar(u8, ".+-_", next) == null) break;
+                    if (!std.ascii.isAlphanumeric(next) and std.mem.indexOfScalar(
+                        u8,
+                        ".+-_",
+                        next,
+                    ) == null) break;
                     self.position += 1;
                 }
                 break :number_token_blk .number;
@@ -952,8 +1456,20 @@ const Parser = struct {
                     if (next == '"') break :string_token_blk .string;
                     if (next == '\\' and self.position < bytes.len) self.position += 1;
                 }
-                return self.compiler.invalid(allocator, .{ .source = self.source, .offset = start }, "unterminated string");
-            } else if (std.mem.indexOfScalar(u8, "{}[]():;,.=", byte) != null) .punctuation else return self.compiler.invalid(allocator, .{ .source = self.source, .offset = start }, "unexpected character");
+                return self.compiler.invalid(
+                    allocator,
+                    .{ .source = self.source, .offset = start },
+                    "unterminated string",
+                );
+            } else if (std.mem.indexOfScalar(
+                u8,
+                "{}[]():;,.=",
+                byte,
+            ) != null) .punctuation else return self.compiler.invalid(
+                allocator,
+                .{ .source = self.source, .offset = start },
+                "unexpected character",
+            );
             self.token = .{ .kind = kind, .text = bytes[start..self.position], .offset = start };
             return;
         }
@@ -961,39 +1477,35 @@ const Parser = struct {
     }
 };
 
-fn attribute(attributes: ?Attributes, key: []const u8) ?reflection.KeyValue {
-    for (attributes orelse &.{}) |item| if (std.mem.eql(u8, item.key, key)) return item;
+fn attribute(attributes: ?Attributes, comptime key: BuiltinAttribute) ?reflection.KeyValue {
+    for (attributes orelse &.{}) |item| if (std.mem.eql(u8, item.key, @tagName(key))) return item;
     return null;
 }
-fn qualify(allocator: Allocator, namespace: []const u8, name: []const u8) Allocator.Error![]const u8 {
-    return if (namespace.len == 0) name else std.fmt.allocPrint(allocator, "{s}.{s}", .{ namespace, name });
+fn qualify(
+    allocator: Allocator,
+    namespace: []const u8,
+    name: []const u8,
+) Allocator.Error![]const u8 {
+    return if (namespace.len == 0) name else allocator.print("{s}.{s}", .{ namespace, name });
 }
 fn scalarType(name: []const u8) ?BaseType {
-    return std.StaticStringMap(BaseType).initComptime(.{
-        .{ "bool", .Bool },     .{ "byte", .Byte },     .{ "int8", .Byte },
-        .{ "ubyte", .UByte },   .{ "uint8", .UByte },   .{ "short", .Short },
-        .{ "int16", .Short },   .{ "ushort", .UShort }, .{ "uint16", .UShort },
-        .{ "int", .Int },       .{ "int32", .Int },     .{ "uint", .UInt },
-        .{ "uint32", .UInt },   .{ "long", .Long },     .{ "int64", .Long },
-        .{ "ulong", .ULong },   .{ "uint64", .ULong },  .{ "float", .Float },
-        .{ "float32", .Float }, .{ "double", .Double }, .{ "float64", .Double },
-        .{ "string", .String },
-    }).get(name);
-}
-fn builtin(name: []const u8) bool {
-    const names = [_][]const u8{
-        "id",                  "required",           "deprecated",            "key",            "force_align",    "bit_flags",       "nested_flatbuffer",
-        "flexbuffer",          "hash",               "offset64",              "vector64",       "original_order", "shared",          "native_inline",
-        "native_custom_alloc", "native_type",        "native_type_pack_name", "native_default", "native_include", "native_cpp_type", "cpp_type",
-        "cpp_ptr_type",        "cpp_str_type",       "cpp_str_flex_ctor",     "cpp_include",    "streaming",      "idempotent",      "private",
-        "force_empty",         "force_empty_vector", "cpp_static_reflection",
-    };
-    for (names) |candidate| if (std.mem.eql(u8, name, candidate)) return true;
-    return false;
+    return scalar_types.get(name);
 }
 fn isScalar(base: BaseType) bool {
     return switch (base) {
-        .UType, .Bool, .Byte, .UByte, .Short, .UShort, .Int, .UInt, .Long, .ULong, .Float, .Double => true,
+        .UType,
+        .Bool,
+        .Byte,
+        .UByte,
+        .Short,
+        .UShort,
+        .Int,
+        .UInt,
+        .Long,
+        .ULong,
+        .Float,
+        .Double,
+        => true,
         else => false,
     };
 }
@@ -1017,6 +1529,72 @@ fn lessField(_: void, left: reflection.Field, right: reflection.Field) bool {
 fn lessFile(_: void, left: reflection.SchemaFile, right: reflection.SchemaFile) bool {
     return std.mem.lessThan(u8, left.filename, right.filename);
 }
+
+const attribute_diagnostics = [_]struct {
+    source: []const u8,
+    line: usize,
+    column: usize,
+    message: []const u8,
+}{
+    .{
+        .source = "table Message {\n    label:string (required, required:);\n}",
+        .line = 2,
+        .column = 29,
+        .message = "duplicate attribute 'required'",
+    },
+    .{
+        .source = "table Message {\n    label:string (force_align:);\n}",
+        .line = 2,
+        .column = 31,
+        .message = "expected a literal or enum value",
+    },
+    .{
+        .source = "table Message (required:true) {}",
+        .line = 1,
+        .column = 16,
+        .message = "'required' is a field attribute",
+    },
+    .{
+        .source = "attribute \"force_align\"\ntable Message {}",
+        .line = 1,
+        .column = 1,
+        .message = "cannot redeclare built-in attribute 'force_align'",
+    },
+    .{
+        .source = "table Message {\n    label:string (custom_flag);\n}",
+        .line = 2,
+        .column = 19,
+        .message = "attribute 'custom_flag' must be declared first",
+    },
+};
+
+const malformed_schema_sources = [_][]const u8{
+    "table T { x:Missing; }",
+    "struct S { self:S; }",
+    "struct S { text:string; }",
+    "table T { x:int (required); }",
+    "table T { x:byte = 128; }",
+    "table T { x:long = -9223372036854775809; }",
+    "table T { x:ulong = 18446744073709551616; }",
+    "table T { x:int (id:0); y:int; }",
+    "table T { x:int (id:1); }",
+    "table T { x:int (id:18446744073709551615); }",
+    "table T { x:int (id); }",
+    "table T { x:int (required:true); }",
+    "table T { x:int (deprecated:false); }",
+    "table T { x:int (key:true); }",
+    "struct S { x:[int:0]; }",
+    "struct S { x:[int:-1]; }",
+    "struct S { x:[int:65536]; }",
+    "table T { x:[int:3]; }",
+    "struct S { x:int; } root_type S;",
+    "union U { string }",
+    "table Item {} union U { Item } table T { u:U; u_type:int; }",
+    "enum E:byte { A=1 } table T { x:E; }",
+    "table T {} file_identifier \"LONGER\";",
+    "table T {} file_identifier \"ABC\";",
+    "table T { x:int }",
+};
 
 // Keep parser tests in this file; run `zig build test` from Flatzz.
 test parse {
@@ -1042,11 +1620,56 @@ test parse {
     try std.testing.expectEqual(@as(u16, 1), (try testField(root, "current")).id);
     try std.testing.expectEqual(@as(u16, 2), (try testField(root, "history_type")).id);
     try std.testing.expectEqual(@as(u16, 3), (try testField(root, "history")).id);
-    try std.testing.expectEqual(BaseType.UType, (try testField(root, "current_type")).type.base_type);
+    try std.testing.expectEqual(
+        BaseType.UType,
+        (try testField(root, "current_type")).type.base_type,
+    );
     try std.testing.expectEqual(BaseType.UType, (try testField(root, "history_type")).type.element);
     try std.testing.expect((try testField(root, "temperature")).optional);
     try std.testing.expectEqual(@as(u64, 7), @as(u64, @bitCast(schema.advanced_features)));
-    try std.testing.expectEqual(@as(i64, 1), (try testField(try testObject(schema, "Demo.Event"), "status")).default_integer);
+    try std.testing.expectEqual(
+        @as(i64, 1),
+        (try testField(try testObject(schema, "Demo.Event"), "status")).default_integer,
+    );
+}
+
+test "nested namespace lookup retains nearest parent global and qualified references" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const schema = try parse(arena.allocator(),
+        \\table Global {}
+        \\namespace Parent;
+        \\table Shared {}
+        \\table Ancestor {}
+        \\namespace Parent.Child;
+        \\table Shared {}
+        \\table Reading {
+        \\    nearest:Shared;
+        \\    parent:Ancestor;
+        \\    global:Global;
+        \\    qualified:Parent.Shared;
+        \\}
+        \\root_type Reading;
+    );
+    const root = schema.root_table.?;
+    try std.testing.expectEqualStrings("Parent.Child.Reading", root.name);
+    const nearest = try testField(root, "nearest");
+    const ancestor = try testField(root, "parent");
+    const global = try testField(root, "global");
+    const qualified = try testField(root, "qualified");
+    try std.testing.expectEqualStrings(
+        "Parent.Child.Shared",
+        schema.objects[@intCast(nearest.type.index)].name,
+    );
+    try std.testing.expectEqualStrings(
+        "Parent.Ancestor",
+        schema.objects[@intCast(ancestor.type.index)].name,
+    );
+    try std.testing.expectEqualStrings("Global", schema.objects[@intCast(global.type.index)].name);
+    try std.testing.expectEqualStrings(
+        "Parent.Shared",
+        schema.objects[@intCast(qualified.type.index)].name,
+    );
 }
 
 test "wire padding survives sorting, explicit IDs include union discriminators" {
@@ -1098,7 +1721,12 @@ test "defaults preserve signed and unsigned limits and floating literal metadata
 
 test parseWithOptions {
     const loader = struct {
-        fn load(_: ?*anyopaque, _: Allocator, _: []const u8, requested: []const u8) anyerror!Source {
+        fn load(
+            _: ?*anyopaque,
+            _: Allocator,
+            _: []const u8,
+            requested: []const u8,
+        ) anyerror!Source {
             if (!std.mem.endsWith(u8, requested, "shared.fbs")) return error.NotFound;
             return .{
                 .name = "shared.fbs",
@@ -1118,7 +1746,10 @@ test parseWithOptions {
     try std.testing.expectEqualStrings("Root", schema.root_table.?.name);
     try std.testing.expectEqual(@as(?[]const u8, null), schema.file_ident);
     const item = try testField(schema.root_table.?, "value");
-    try std.testing.expectEqualStrings("Shared.Item", schema.objects[@intCast(item.type.index)].name);
+    try std.testing.expectEqualStrings(
+        "Shared.Item",
+        schema.objects[@intCast(item.type.index)].name,
+    );
 }
 
 test "source ownership and error diagnostics" {
@@ -1129,53 +1760,57 @@ test "source ownership and error diagnostics" {
     @memset(&source, 'x');
     try std.testing.expectEqualStrings("Owned", schema.root_table.?.name);
     var diagnostic: Diagnostic = .{};
-    try std.testing.expectError(error.InvalidSchema, parseWithOptions(arena.allocator(), "table T {\nvalue:Missing;\n}", .{
-        .filename = "bad.fbs",
-        .diagnostic = &diagnostic,
-    }));
+    try std.testing.expectError(error.InvalidSchema, parseWithOptions(
+        arena.allocator(),
+        "table T {\nvalue:Missing;\n}",
+        .{ .filename = "bad.fbs", .diagnostic = &diagnostic },
+    ));
     try std.testing.expectEqualStrings("bad.fbs", diagnostic.filename);
     try std.testing.expectEqual(@as(usize, 2), diagnostic.line);
     try std.testing.expect(diagnostic.message.len != 0);
 }
 
+test "attribute classification preserves validation order and diagnostics" {
+    for (attribute_diagnostics) |expected| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        var diagnostic: Diagnostic = .{};
+        try std.testing.expectError(error.InvalidSchema, parseWithOptions(
+            arena.allocator(),
+            expected.source,
+            .{ .filename = "attributes.fbs", .diagnostic = &diagnostic },
+        ));
+        try std.testing.expectEqualStrings("attributes.fbs", diagnostic.filename);
+        try std.testing.expectEqual(expected.line, diagnostic.line);
+        try std.testing.expectEqual(expected.column, diagnostic.column);
+        try std.testing.expectEqualStrings(expected.message, diagnostic.message);
+    }
+}
+
 test "malformed schemas fail without accepting incomplete metadata" {
-    const sources = [_][]const u8{
-        "table T { x:Missing; }",
-        "struct S { self:S; }",
-        "struct S { text:string; }",
-        "table T { x:int (required); }",
-        "table T { x:byte = 128; }",
-        "table T { x:long = -9223372036854775809; }",
-        "table T { x:ulong = 18446744073709551616; }",
-        "table T { x:int (id:0); y:int; }",
-        "table T { x:int (id:1); }",
-        "table T { x:int (id:18446744073709551615); }",
-        "table T { x:int (id); }",
-        "table T { x:int (required:true); }",
-        "table T { x:int (deprecated:false); }",
-        "table T { x:int (key:true); }",
-        "struct S { x:[int:0]; }",
-        "struct S { x:[int:-1]; }",
-        "struct S { x:[int:65536]; }",
-        "table T { x:[int:3]; }",
-        "struct S { x:int; } root_type S;",
-        "union U { string }",
-        "table Item {} union U { Item } table T { u:U; u_type:int; }",
-        "enum E:byte { A=1 } table T { x:E; }",
-        "table T {} file_identifier \"LONGER\";",
-        "table T {} file_identifier \"ABC\";",
-        "table T { x:int }",
-    };
-    for (sources) |source| {
+    for (malformed_schema_sources) |source| {
         var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
         defer arena.deinit();
         try std.testing.expectError(error.InvalidSchema, parse(arena.allocator(), source));
     }
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    try std.testing.expectError(error.UnsupportedFeature, parse(arena.allocator(), "struct S (force_align:16) { x:int; }"));
-    try std.testing.expectError(error.IncludeNotFound, parse(arena.allocator(), "include \"missing.fbs\";"));
-    try std.testing.expectError(error.DepthLimitExceeded, parseWithOptions(arena.allocator(), "struct A { b:B; } struct B { x:int; }", .{ .max_depth = 1 }));
+    try std.testing.expectError(
+        error.UnsupportedFeature,
+        parse(arena.allocator(), "struct S (force_align:16) { x:int; }"),
+    );
+    try std.testing.expectError(
+        error.IncludeNotFound,
+        parse(arena.allocator(), "include \"missing.fbs\";"),
+    );
+    try std.testing.expectError(
+        error.DepthLimitExceeded,
+        parseWithOptions(
+            arena.allocator(),
+            "struct A { b:B; } struct B { x:int; }",
+            .{ .max_depth = 1 },
+        ),
+    );
 }
 
 test "fixed arrays accept the maximum wire length" {

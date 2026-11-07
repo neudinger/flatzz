@@ -2,7 +2,14 @@
 //! `zig build docs` installs the public API reference under `zig-out/docs`.
 
 const std = @import("std");
+const schema_build = @import("tools/build.zig");
+const compile_fail = @import("tests/compile_fail.zig");
+
 const Step = std.Build.Step;
+
+const format_paths = [_][]const u8{
+    "build.zig", "build.zig.zon", "src", "tests", "tools", "example",
+};
 
 /// Register host-side Reading generation; the output path belongs to the build.
 fn compileReading(builder: *std.Build, schema_tool: *Step.Compile) std.Build.LazyPath {
@@ -35,7 +42,10 @@ pub fn build(builder: *std.Build) void {
 
     const docs = docs_blk: {
         // Zig's doc renderer recognizes the module root by its matching filename.
-        const documentation = builder.addObject(.{ .name = "runtime", .root_module = runtime_module });
+        const documentation = builder.addObject(.{
+            .name = "runtime",
+            .root_module = runtime_module,
+        });
         const install_docs = builder.addInstallDirectory(.{
             .source_dir = documentation.getEmittedDocs(),
             .install_dir = .prefix,
@@ -63,21 +73,30 @@ pub fn build(builder: *std.Build) void {
             .imports = test_imports,
         });
 
-        const executable = builder.addExecutable(.{ .name = "flatzz-builder-example", .root_module = module });
+        const executable = builder.addExecutable(.{
+            .name = "flatzz-builder-example",
+            .root_module = module,
+        });
         builder.installArtifact(executable);
         const run = builder.addRunArtifact(executable);
         run.addPassthruArgs();
         break :builder_example_blk .{ .compile = &executable.step, .run = &run.step };
     };
 
-    const schema_tools = if (builder.option(bool, "schema-tools", "Build host schema tooling (defaults on for root builds)") orelse builder.isRoot())
-        @import("tools/build.zig").add(builder)
+    const schema_tools = if (builder.option(
+        bool,
+        "schema-tools",
+        "Build host schema tooling (defaults on for root builds)",
+    ) orelse builder.isRoot())
+        schema_build.add(builder)
     else
         null;
 
     const generated_reading = if (schema_tools) |tools| reading_module_blk: {
         const source = compileReading(builder, tools.executable);
-        builder.getInstallStep().dependOn(&builder.addInstallFile(source, "schema/reading.zig").step);
+        builder.getInstallStep().dependOn(
+            &builder.addInstallFile(source, "schema/reading.zig").step,
+        );
         break :reading_module_blk builder.createModule(.{
             .root_source_file = source,
             .target = target,
@@ -136,10 +155,10 @@ pub fn build(builder: *std.Build) void {
     };
 
     const contracts = contracts_blk: {
-        const failures = @import("tests/compile_fail.zig").cases;
+        const failures = compile_fail.cases;
         const sources = builder.addWriteFiles();
         var steps: [failures.len]*Step = undefined;
-        inline for (failures, 0..) |failure, failure_index| {
+        for (failures, 0..) |failure, failure_index| {
             const rejected = builder.addTest(.{ .root_module = builder.createModule(.{
                 .root_source_file = sources.add(
                     builder.fmt("test_{s}.zig", .{failure.name}),
@@ -157,7 +176,7 @@ pub fn build(builder: *std.Build) void {
 
     const format = format_blk: {
         const check_format = builder.addFmt(.{
-            .paths = builder.pathList(&.{ "build.zig", "build.zig.zon", "src", "tests", "tools", "example" }),
+            .paths = builder.pathList(&format_paths),
             .check = true,
         });
         break :format_blk &check_format.step;
@@ -205,8 +224,11 @@ pub fn build(builder: *std.Build) void {
         },
         .{
             .tag = .@"generate-reading",
-            .description = "Regenerate tests/fixtures/reading/reading.zig from tests/fixtures/reading/reading.fbs",
-            .prerequisites = if (schema_tools) |tools| @as([]const *Step, &.{tools.generate_reading}) else &.{},
+            .description = "Regenerate the checked-in Reading fixture",
+            .prerequisites = if (schema_tools) |tools|
+                @as([]const *Step, &.{tools.generate_reading})
+            else
+                &.{},
         },
         .{
             .tag = .fmt,

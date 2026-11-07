@@ -1,3 +1,5 @@
+//! Generate Reading and build the construction, mutation, and union example.
+
 const std = @import("std");
 
 /// Register host-side Reading generation; the output path belongs to the build.
@@ -24,7 +26,9 @@ pub fn build(builder: *std.Build) void {
 
     const reading = reading_module_blk: {
         const source = compileReading(builder, flatzz);
-        builder.getInstallStep().dependOn(&builder.addInstallFile(source, "schema/reading.zig").step);
+        builder.getInstallStep().dependOn(
+            &builder.addInstallFile(source, "schema/reading.zig").step,
+        );
         break :reading_module_blk builder.createModule(.{
             .root_source_file = source,
             .target = target,

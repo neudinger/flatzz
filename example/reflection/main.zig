@@ -17,9 +17,11 @@ pub fn main(init: std.process.Init) !void {
     if (arguments.len != 2) return error.ExpectedSchemaPath;
 
     const source = try std.Io.Dir.cwd().readFileAlloc(init.io, arguments[1], allocator, .unlimited);
-    const schema: compiler.reflection.Schema = try compiler.parser.parseWithOptions(allocator, source, .{
-        .filename = arguments[1],
-    });
+    const schema: compiler.reflection.Schema = try compiler.parser.parseWithOptions(
+        allocator,
+        source,
+        .{ .filename = arguments[1] },
+    );
     const root_table = schema.root_table orelse return error.MissingRootTable;
 
     var output_buffer: [4096]u8 = undefined;

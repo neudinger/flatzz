@@ -1,3 +1,5 @@
+//! Generate tracked BFBS/JSON outputs and build their path printer.
+
 const std = @import("std");
 
 /// A generated schema file and its path beneath the installation prefix.
@@ -19,7 +21,11 @@ fn compileSchemas(builder: *std.Build) ![]const SchemaOutput {
     builder.dependOnDirectoryContents(schema_directory);
 
     const build_io = builder.graph.io;
-    var schemas = try flatzz.builder.root.openDir(build_io, "example/flatbuf", .{ .iterate = true });
+    var schemas = try flatzz.builder.root.openDir(
+        build_io,
+        "example/flatbuf",
+        .{ .iterate = true },
+    );
     defer schemas.close(build_io);
     var walker = try schemas.walk(builder.allocator);
     defer walker.deinit();
@@ -34,7 +40,7 @@ fn compileSchemas(builder: *std.Build) ![]const SchemaOutput {
         if (entry.kind != .file or !std.mem.endsWith(u8, entry.basename, ".fbs")) continue;
         const basename = std.fs.path.stem(entry.basename);
         const relative_stem = entry.path[0 .. entry.path.len - ".fbs".len];
-    
+
         const binary_schema = binary_schema_blk: {
             const compile_schema = builder.addRunArtifact(schema_tool);
             compile_schema.step.name = builder.fmt("compile {s}", .{entry.path});
@@ -43,7 +49,9 @@ fn compileSchemas(builder: *std.Build) ![]const SchemaOutput {
             compile_schema.addArg("--depfile");
             _ = compile_schema.addDepFileOutputArg2("schema.d", .{});
             compile_schema.addFileArg(source_path);
-            break :binary_schema_blk compile_schema.captureStdOut(.{ .basename = builder.fmt("{s}.bfbs", .{basename}) });
+            break :binary_schema_blk compile_schema.captureStdOut(
+                .{ .basename = builder.fmt("{s}.bfbs", .{basename}) },
+            );
         };
 
         const json_schema = json_schema_blk: {
@@ -51,12 +59,20 @@ fn compileSchemas(builder: *std.Build) ![]const SchemaOutput {
             print_json.step.name = builder.fmt("decode {s}", .{entry.path});
             print_json.addArg("--json");
             print_json.addFileArg(binary_schema);
-            break :json_schema_blk print_json.captureStdOut(.{ .basename = builder.fmt("{s}.json", .{basename}) });
+            break :json_schema_blk print_json.captureStdOut(
+                .{ .basename = builder.fmt("{s}.json", .{basename}) },
+            );
         };
 
         try outputs.appendSlice(builder.allocator, &.{
-            .{ .source = json_schema, .destination = builder.fmt("schema/{s}.json", .{relative_stem}) },
-            .{ .source = binary_schema, .destination = builder.fmt("schema/{s}.bfbs", .{relative_stem}) },
+            .{
+                .source = json_schema,
+                .destination = builder.fmt("schema/{s}.json", .{relative_stem}),
+            },
+            .{
+                .source = binary_schema,
+                .destination = builder.fmt("schema/{s}.bfbs", .{relative_stem}),
+            },
         });
     }
     return outputs.items;
@@ -83,7 +99,10 @@ pub fn build(builder: *std.Build) !void {
             const install = builder.addInstallFile(schema_file.source, schema_file.destination);
             builder.getInstallStep().dependOn(&install.step);
             run.step.dependOn(&install.step);
-            run.addFileArg2(builder.graph.path(.install_prefix, schema_file.destination), .{ .make_absolute = true });
+            run.addFileArg2(
+                builder.graph.path(.install_prefix, schema_file.destination),
+                .{ .make_absolute = true },
+            );
         }
         break :app_blk .{ .compile = &executable.step, .run = &run.step };
     };

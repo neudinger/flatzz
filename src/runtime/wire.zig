@@ -1,8 +1,10 @@
 //! Scalar wire representations and physical FlatBuffers sizes, independent of Zig ABI.
 //! Fixed-width encode/decode operate on caller-selected ranges. Use the public
 //! `flatzz.read`/`flatzz.write` helpers when byte-range checks are required.
-const standard_library = @import("std");
-const DecodeError = @import("errors.zig").DecodeError;
+const std = @import("std");
+const errors = @import("errors.zig");
+
+const DecodeError = errors.DecodeError;
 
 /// The buffer begins with a u32 offset to its root table.
 /// https://flatbuffers.dev/internals/#offsets
@@ -51,9 +53,8 @@ pub const vtable_header_size = vtable_table_size_offset + vtable_entry_size;
 
 /// The complete vtable size must fit in its u16 size entry.
 /// https://flatbuffers.dev/internals/#tables
-pub const max_field_count = (standard_library.math.maxInt(
-    u16,
-) - vtable_header_size) / vtable_entry_size;
+pub const max_field_count =
+    (std.math.maxInt(u16) - vtable_header_size) / vtable_entry_size;
 
 /// A zero vtable field offset denotes an absent field.
 /// https://flatbuffers.dev/internals/#tables
@@ -66,7 +67,7 @@ pub const storage_alignment = @sizeOf(u64);
 
 /// Fixed array counts are positive u16 schema metadata, not buffer prefixes.
 /// https://github.com/google/flatbuffers/blob/b8431fbcd7a5c71817f314e18b332c0648554efa/src/idl_parser.cpp#L874
-pub const max_array_length = standard_library.math.maxInt(u16);
+pub const max_array_length = std.math.maxInt(u16);
 
 /// Unions use an unsigned byte tag; zero means no selected payload.
 /// https://flatbuffers.dev/internals/#unions
@@ -114,12 +115,7 @@ pub fn encode(
         .@"enum" => @bitCast(@backingInt(value)),
         else => @bitCast(value),
     };
-    standard_library.mem.writeInt(
-        WireType,
-        destination_bytes,
-        scalar_bits,
-        .little,
-    );
+    std.mem.writeInt(WireType, destination_bytes, scalar_bits, .little);
 }
 
 /// Unaligned input is supported. Wire alignment belongs to object validation.
@@ -130,14 +126,10 @@ pub fn decode(
     comptime ScalarType: type,
     source_bytes: *const [@sizeOf(Bits(ScalarType))]u8,
 ) DecodeError!ScalarType {
-    const scalar_bits = standard_library.mem.readInt(
-        Bits(ScalarType),
-        source_bytes,
-        .little,
-    );
+    const scalar_bits = std.mem.readInt(Bits(ScalarType), source_bytes, .little);
     return switch (@typeInfo(ScalarType)) {
         .bool => scalar_bits != 0,
-        .@"enum" => |enum_info| standard_library.enums.fromInt(
+        .@"enum" => |enum_info| std.enums.fromInt(
             ScalarType,
             @as(enum_info.tag_type, @bitCast(scalar_bits)),
         ) orelse DecodeError.InvalidBuffer,

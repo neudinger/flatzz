@@ -13,8 +13,8 @@
 //! var storage: [128]u8 align(runtime.storage_alignment) = undefined;
 //! var builder = runtime.Builder.init(&storage);
 //! const text = try builder.createString("hello");
-//! const value: Payload.Value = .{ .text = text };
-//! const selected = Payload.tag(value);
+//! const value: Payload.Handle = .{ .text = text };
+//! const selected = std.meta.activeTag(value);
 //! const handle = Payload.offset(value);
 //! try std.testing.expectEqual(Payload.Tag.text, selected);
 //! try std.testing.expectEqual(text, handle.?);
@@ -22,14 +22,20 @@
 //! Expected result: `selected == .text` and `handle.? == text`; nothing is printed.
 //! `value` is a construction handle, not serialized bytes or a decoded view.
 //! The builder and its storage must remain valid until the enclosing table is finished.
-const standard_library = @import("std");
+const std = @import("std");
 const wire = @import("wire.zig");
 const validation = @import("validation.zig");
 const sequence = @import("sequence.zig");
-const tables = @import("table_view.zig");
-const StructView = @import("struct_view.zig").StructView;
+const table_view = @import("table_view.zig");
+const struct_view = @import("struct_view.zig");
 const Builder = @import("Builder.zig");
 const errors = @import("errors.zig");
+
+const AccessError = errors.AccessError;
+
+const Access = table_view.Access;
+const TableView = table_view.TableView;
+const StructView = struct_view.StructView;
 
 /// Interpretation of a named union alternative; the native Zig union is not a wire layout.
 pub const Kind = union(enum) {
@@ -59,9 +65,10 @@ pub const Location = struct {
     context: validation.Context,
 };
 
-/// Handles are explicit, like C++ Offset<void> / flatcc union references.
-/// Build the selected child first. Names/tags carry the schema alternative;
-/// a handle does not prove the object's kind or ownership (as for all offsets).
+/// Native values contain table pointers, inline struct values, or UTF-8 strings.
+/// Schema serialization builds these payloads before their enclosing union field.
+/// Explicit Builder construction uses Handle values with completed child offsets.
+/// Handles do not prove object kind or ownership; use the originating builder.
 /// Tags must be an exhaustive u8 enum with `none = 0`, and alternatives must
 /// match its field names. Invalid declarations fail at compile time.
 /// Borrowed views allocate nothing and remain valid only while frame storage is retained.
@@ -85,9 +92,7 @@ pub fn Union(
             switch (kind) {
                 .structure => |Layout| {
                     if (Layout.layout_kind != .structure)
-                        @compileError(
-                            "union struct alternatives need a struct layout",
-                        );
+                        @compileError("union struct alternatives need a struct layout");
                 },
                 else => {},
             }
@@ -98,25 +103,37 @@ pub fn Union(
         pub const Tag = TagType;
         /// Compile-time payload interpretation keyed by tag name.
         pub const variants = alternatives;
-        /// Construction union: non-none cases carry completed Builder offsets.
-        pub const Value = construction_value_blk: {
+        /// Native input; table pointers and string slices must remain valid while packing.
+        /// Struct alternatives contain their native value, independently of wire layout.
+        pub const Value = PayloadType(true);
+        /// Explicit construction input; non-none alternatives carry completed Builder offsets.
+        /// All offsets must belong to the builder receiving this value, since its last reset.
+        pub const Handle = PayloadType(false);
+
+        fn PayloadType(comptime native: bool) type {
             var types: [names.len]type = undefined;
             for (names, 0..) |name, field_index| {
-                types[field_index] = switch (@field(alternatives, name)) {
+                const kind = @field(alternatives, name);
+                types[field_index] = if (!native and kind != .none)
+                    Builder.Offset
+                else switch (kind) {
                     .none => void,
-                    else => Builder.Offset,
+                    .table => |TableType| *const TableType,
+                    .structure => |Layout| Layout.Value,
+                    .string => []const u8,
                 };
             }
-            break :construction_value_blk @Union(.auto, Tag, names, &types, &@splat(.{}));
-        };
+            return @Union(.auto, Tag, names, &types, &@splat(.{}));
+        }
 
-        /// Decoded union of borrowed alternatives; table and struct payloads retain access capability.
-        pub fn View(comptime access: tables.Access) type {
+        /// Decoded union of borrowed alternatives; table/struct payloads retain access capability.
+        /// String payloads remain read-only even when access is mutable.
+        pub fn View(comptime access: Access) type {
             var types: [names.len]type = undefined;
             for (names, 0..) |name, field_index| {
                 types[field_index] = switch (@field(alternatives, name)) {
                     .none => void,
-                    .table => tables.TableView(access),
+                    .table => TableView(access),
                     .structure => |Layout| StructView(Layout, access),
                     .string => []const u8,
                 };
@@ -125,18 +142,13 @@ pub fn Union(
         }
 
         /// Convert a raw wire discriminator; return UnknownUnionTag for unrecognized values.
-        pub fn parseTag(raw_tag: wire.UnionTag) errors.AccessError!Tag {
-            return standard_library.enums.fromInt(Tag, raw_tag) orelse
-                errors.AccessError.UnknownUnionTag;
-        }
-
-        /// Extract the discriminator from a native construction value.
-        pub fn tag(value: Value) Tag {
-            return standard_library.meta.activeTag(value);
+        pub fn parseTag(raw_tag: wire.UnionTag) AccessError!Tag {
+            return std.enums.fromInt(Tag, raw_tag) orelse
+                AccessError.UnknownUnionTag;
         }
 
         /// Extract a completed payload handle; return null for `.none`.
-        pub fn offset(value: Value) ?Builder.Offset {
+        pub fn offset(value: Handle) ?Builder.Offset {
             return switch (value) {
                 .none => null,
                 inline else => |handle| handle,
@@ -148,43 +160,36 @@ pub fn Union(
         pub fn check(
             bytes: []const u8,
             location: Location,
-        ) errors.AccessError!Tag {
+        ) AccessError!Tag {
             const selected = try parseTag(location.tag);
             const reference_start = location.reference_start orelse {
-                if (selected != .none) return errors.AccessError.InvalidUnion;
+                if (selected != .none) return AccessError.InvalidUnion;
                 return selected;
             };
-            const relative_offset = try validation.readScalar(
-                u32,
-                bytes,
-                reference_start,
-            );
+            const relative_offset = try validation.readScalar(u32, bytes, reference_start);
             if ((selected == .none) != (relative_offset == 0))
-                return errors.AccessError.InvalidUnion;
+                return AccessError.InvalidUnion;
             return selected;
         }
 
         /// Validate pairing, then borrow the selected payload using local wire checks.
-        /// Table payload fields are not traversed; full verification belongs to the schema verifier.
+        /// Table fields are not traversed; full verification belongs to the schema verifier.
         pub fn read(
-            comptime access: tables.Access,
+            comptime access: Access,
             bytes: switch (access) {
                 .read_only => []const u8,
                 .mutable => []u8,
             },
             location: Location,
-        ) errors.AccessError!View(access) {
+        ) AccessError!View(access) {
             const selected = try check(bytes, location);
             return switch (selected) {
                 .none => .none,
                 inline else => |choice| borrowed_alternative_blk: {
                     const reference_start = location.reference_start.?;
-                    const value = switch (@field(
-                        alternatives,
-                        @tagName(choice),
-                    )) {
+                    const value = switch (@field(alternatives, @tagName(choice))) {
                         .none => unreachable,
-                        .table => tables.TableView(access){
+                        .table => TableView(access){
                             .bytes = bytes,
                             .layout = try validation.referencedTable(
                                 bytes,
@@ -198,10 +203,7 @@ pub fn Union(
                             reference_start,
                         ),
                         .structure => |Layout| borrowed_struct_blk: {
-                            const target = try validation.referenceTarget(
-                                bytes,
-                                reference_start,
-                            );
+                            const target = try validation.referenceTarget(bytes, reference_start);
                             try location.context.checkObject(.{
                                 .start = target,
                                 .size = Layout.wire_size,
@@ -233,15 +235,11 @@ fn Alternatives(comptime Tag: type) type {
 pub fn field(
     table: anytype,
     comptime field_ids: FieldIds,
-) errors.AccessError!Location {
-    const raw_tag = try table.readField(
-        wire.UnionTag,
-        field_ids.tag,
-        wire.union_none,
-    );
+) AccessError!Location {
+    const raw_tag = try table.readField(wire.UnionTag, field_ids.tag, wire.union_none);
     const reference_start = try table.fieldPosition(u32, field_ids.value);
     if ((raw_tag == wire.union_none) != (reference_start == null))
-        return errors.AccessError.InvalidUnion;
+        return AccessError.InvalidUnion;
     return .{
         .tag = raw_tag,
         .reference_start = reference_start,
@@ -254,7 +252,7 @@ pub fn field(
 /// checks each selected alternative lazily. Storage reuse invalidates all borrowed views.
 pub fn VectorView(
     comptime UnionType: type,
-    comptime access: tables.Access,
+    comptime access: Access,
 ) type {
     return struct {
         const Self = @This();
@@ -282,7 +280,7 @@ pub fn VectorView(
             context: validation.Context,
             tags_reference: usize,
             values_reference: usize,
-        ) errors.AccessError!Self {
+        ) AccessError!Self {
             const tags = try validation.sequenceAt(
                 @sizeOf(wire.UnionTag),
                 @sizeOf(wire.UnionTag),
@@ -300,7 +298,7 @@ pub fn VectorView(
                 values_reference,
             );
             if (tags.element_count != values.element_count)
-                return errors.AccessError.InvalidUnion;
+                return AccessError.InvalidUnion;
             const result: Self = .{
                 .bytes = bytes,
                 .tags_start = tags.payload_start,
@@ -310,13 +308,10 @@ pub fn VectorView(
             };
             // Sharing one empty vector is harmless. Any other metadata/payload
             // overlap would let offsets reinterpret discriminator bytes.
-            if (validation.rangesOverlap(
-                result.tagsRange(),
-                result.valuesRange(),
-            ) and
+            if (validation.rangesOverlap(result.tagsRange(), result.valuesRange()) and
                 !(result.element_count == 0 and
                     result.tags_start == result.values_start))
-                return errors.AccessError.InvalidUnion;
+                return AccessError.InvalidUnion;
             return result;
         }
 
@@ -324,27 +319,21 @@ pub fn VectorView(
         pub fn get(
             self: Self,
             element_index: usize,
-        ) errors.AccessError!Value {
-            return UnionType.read(
-                access,
-                self.bytes,
-                try self.element(element_index),
-            );
+        ) AccessError!Value {
+            return UnionType.read(access, self.bytes, try self.element(element_index));
         }
 
         /// Checked slot locations for budgeted verifier traversal.
         pub fn element(
             self: Self,
             element_index: usize,
-        ) errors.AccessError!Location {
-            const tags: sequence.Sequence(sequence.ScalarCodec(
-                wire.UnionTag,
-            )) = .{
+        ) AccessError!Location {
+            const tags: sequence.SequenceView(sequence.ScalarCodec(wire.UnionTag), .read_only) = .{
                 .bytes = self.bytes,
                 .payload_start = self.tags_start,
                 .element_count = self.element_count,
             };
-            const values: sequence.Sequence(sequence.ScalarCodec(u32)) = .{
+            const values: sequence.SequenceView(sequence.ScalarCodec(u32), .read_only) = .{
                 .bytes = self.bytes,
                 .payload_start = self.values_start,
                 .element_count = self.element_count,
@@ -354,16 +343,12 @@ pub fn VectorView(
             const values_slot = try values.elementStart(element_index);
             if (self.tags_start < wire.sequence_length_size or
                 self.values_start < wire.sequence_length_size)
-                return errors.AccessError.InvalidBuffer;
+                return AccessError.InvalidBuffer;
             var context = self.context;
             context.vector = self.valuesRange();
             context.protected = self.tagsRange();
             return .{
-                .tag = try validation.readScalar(
-                    wire.UnionTag,
-                    self.bytes,
-                    tags_slot,
-                ),
+                .tag = try validation.readScalar(wire.UnionTag, self.bytes, tags_slot),
                 .reference_start = values_slot,
                 .context = context,
             };

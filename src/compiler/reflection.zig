@@ -4,7 +4,7 @@
 //! Wire schema: FlatBuffers v25.2.10, commit 1c514626e83c20fffa8557e75641848e1e15cd5e.
 //! https://github.com/google/flatbuffers/blob/1c514626e83c20fffa8557e75641848e1e15cd5e/reflection/reflection.fbs
 //!
-//! Import through `const reflection = @import("flatzz_compiler").reflection;`.
+//! Import `const compiler = @import("flatzz_compiler");`, then alias `compiler.reflection`.
 //! Records preserve reflection.fbs names, defaults, and field order: the BFBS
 //! codec derives wire field IDs from that order. `null` optional metadata differs
 //! from a present empty string or slice. Constructing these records does not

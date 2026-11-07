@@ -42,6 +42,7 @@
 const std = @import("std");
 const reflection = @import("reflection.zig");
 const runtime = @import("flatzz");
+
 const wire = runtime.wire;
 const Builder = runtime.Builder;
 const TableBuilder = runtime.TableBuilder;
@@ -131,12 +132,18 @@ fn isReference(comptime Value: type) bool {
 }
 
 fn tableKind(comptime Record: type) u8 {
-    inline for (.{
-        reflection.Type,       reflection.KeyValue, reflection.EnumVal, reflection.Enum,
-        reflection.Field,      reflection.Object,   reflection.RPCCall, reflection.Service,
-        reflection.SchemaFile, reflection.Schema,
-    }, 0..) |Known, index| {
-        if (Record == Known) return index;
+    // Reflection's public auto-layout structs are BFBS table records.
+    // Declaration indices identify cache entries, never serialized wire types.
+    inline for (@typeInfo(reflection).@"struct".decl_names, 0..) |name, index| {
+        const Declaration = @field(reflection, name);
+        if (@TypeOf(Declaration) == type and Declaration == Record) {
+            const information = @typeInfo(Declaration);
+            if (information == .@"struct" and information.@"struct".layout == .auto) {
+                if (index > std.math.maxInt(u8))
+                    @compileError("reflection table kind exceeds u8");
+                return @intCast(index);
+            }
+        }
     }
     @compileError("unsupported reflection table");
 }
@@ -152,8 +159,15 @@ fn tableKind(comptime Record: type) u8 {
 /// errors propagate; all internal allocations are released when encoding fails.
 /// This encodes reflection metadata, not application message values.
 /// Unknown appended BFBS fields cannot be reproduced from this metadata model.
-pub fn encode(allocator: std.mem.Allocator, schema: reflection.Schema) Error![]align(wire.storage_alignment) u8 {
-    const storage = try allocator.alignedAlloc(u8, comptime .fromByteUnits(wire.storage_alignment), 256);
+pub fn encode(
+    allocator: std.mem.Allocator,
+    schema: reflection.Schema,
+) Error![]align(wire.storage_alignment) u8 {
+    const storage = try allocator.alignedAlloc(
+        u8,
+        comptime .fromByteUnits(wire.storage_alignment),
+        256,
+    );
     var encoder: Encoder = .{ .builder = Builder.init(storage), .objects = schema.objects };
     defer encoder.tables.deinit(allocator);
     errdefer allocator.free(encoder.builder.buffer);
@@ -176,7 +190,11 @@ const Encoder = struct {
     /// Backward handles measure distances from the end, so moving the complete
     /// used suffix preserves every completed object and active table context.
     fn reserve(self: *Encoder, allocator: std.mem.Allocator, required: usize) Error!void {
-        const maximum = std.mem.alignBackward(usize, Builder.max_buffer_size, wire.storage_alignment);
+        const maximum = std.mem.alignBackward(
+            usize,
+            Builder.max_buffer_size,
+            wire.storage_alignment,
+        );
         const used = self.builder.used();
         if (required > maximum - used) return error.BufferTooLarge;
         if (required <= self.builder.write_cursor) return;
@@ -195,17 +213,42 @@ const Encoder = struct {
         return count * width + overhead;
     }
 
-    fn string(self: *Encoder, allocator: std.mem.Allocator, value: []const u8) Error!Builder.Offset {
+    fn string(
+        self: *Encoder,
+        allocator: std.mem.Allocator,
+        value: []const u8,
+    ) Error!Builder.Offset {
         if (!std.unicode.utf8ValidateSlice(value)) return error.InvalidSchema;
-        try self.reserve(allocator, try sequenceSpace(value.len, 1, wire.sequence_length_size + wire.string_terminator_size + wire.sequence_length_size - 1));
+        try self.reserve(
+            allocator,
+            try sequenceSpace(
+                value.len,
+                1,
+                wire.sequence_length_size + wire.string_terminator_size +
+                    wire.sequence_length_size - 1,
+            ),
+        );
         return self.builder.createString(value);
     }
 
-    fn strings(self: *Encoder, allocator: std.mem.Allocator, values: []const []const u8) Error!Builder.Offset {
-        var required = try sequenceSpace(values.len, wire.field_offset_size, wire.sequence_length_size + wire.field_offset_size - 1);
+    fn strings(
+        self: *Encoder,
+        allocator: std.mem.Allocator,
+        values: []const []const u8,
+    ) Error!Builder.Offset {
+        var required = try sequenceSpace(
+            values.len,
+            wire.field_offset_size,
+            wire.sequence_length_size + wire.field_offset_size - 1,
+        );
         for (values) |value| {
             if (!std.unicode.utf8ValidateSlice(value)) return error.InvalidSchema;
-            const size = try sequenceSpace(value.len, 1, wire.sequence_length_size + wire.string_terminator_size + wire.sequence_length_size - 1);
+            const size = try sequenceSpace(
+                value.len,
+                1,
+                wire.sequence_length_size + wire.string_terminator_size +
+                    wire.sequence_length_size - 1,
+            );
             if (size > Builder.max_buffer_size - required) return error.BufferTooLarge;
             required += size;
         }
@@ -218,7 +261,10 @@ const Encoder = struct {
         var required = wire.table_header_size + wire.table_header_size - 1 +
             wire.vtable_header_size + wire.vtable_entry_size * structure.field_names.len;
         for (structure.field_types) |Field| {
-            const width = if (isReference(Field)) wire.field_offset_size else @sizeOf(Scalar(Field));
+            const width = if (isReference(Field))
+                wire.field_offset_size
+            else
+                @sizeOf(Scalar(Field));
             required += width + width - 1;
         }
         return required;
@@ -239,7 +285,10 @@ const Encoder = struct {
         // Schema.objects is visited before enums, root_table, and RPC metadata,
         // so their shared Object pointers reuse the already-completed handles.
         inline for (structure.field_names, structure.field_types, 0..) |name, Field, index| {
-            if (comptime isReference(Field)) children[index] = try self.reference(allocator, @field(record.*, name));
+            if (comptime isReference(Field)) children[index] = try self.reference(
+                allocator,
+                @field(record.*, name),
+            );
         }
         try self.reserve(allocator, comptime tableSpace(Record));
         var context = try TableBuilder(structure.field_names.len).init(&self.builder);
@@ -249,7 +298,12 @@ const Encoder = struct {
                     @bitCast(@field(record.*, name))
                 else
                     @field(record.*, name);
-                try context.addScalar(Scalar(Field), index, value, comptime scalarDefault(Record, index));
+                try context.addScalar(
+                    Scalar(Field),
+                    index,
+                    value,
+                    comptime scalarDefault(Record, index),
+                );
             } else {
                 try context.addOffset(index, children[index]);
                 if (@typeInfo(Field) != .optional) try context.requireField(index);
@@ -260,7 +314,11 @@ const Encoder = struct {
         return handle;
     }
 
-    fn reference(self: *Encoder, allocator: std.mem.Allocator, value: anytype) Error!?Builder.Offset {
+    fn reference(
+        self: *Encoder,
+        allocator: std.mem.Allocator,
+        value: anytype,
+    ) Error!?Builder.Offset {
         return switch (@typeInfo(@TypeOf(value))) {
             .optional => if (value) |present| try self.reference(allocator, present) else null,
             .pointer => |pointer| switch (pointer.size) {
@@ -270,7 +328,11 @@ const Encoder = struct {
                 else if (pointer.child == []const u8)
                     try self.strings(allocator, value)
                 else offset_vector_blk: {
-                    const required = try sequenceSpace(value.len, wire.field_offset_size, wire.sequence_length_size + wire.field_offset_size - 1);
+                    const required = try sequenceSpace(
+                        value.len,
+                        wire.field_offset_size,
+                        wire.sequence_length_size + wire.field_offset_size - 1,
+                    );
                     const handles = try allocator.alloc(Builder.Offset, value.len);
                     defer allocator.free(handles);
                     if (pointer.child == reflection.KeyValue) {
@@ -278,16 +340,26 @@ const Encoder = struct {
                         defer allocator.free(sorted);
                         for (value, 0..) |*record, index| sorted[index] = record;
                         std.mem.sort(*const reflection.KeyValue, sorted, {}, struct {
-                            fn less(_: void, left: *const reflection.KeyValue, right: *const reflection.KeyValue) bool {
+                            fn less(
+                                _: void,
+                                left: *const reflection.KeyValue,
+                                right: *const reflection.KeyValue,
+                            ) bool {
                                 return std.mem.lessThan(u8, left.key, right.key);
                             }
                         }.less);
-                        for (sorted, 0..) |record, index| handles[index] = try self.table(allocator, record);
+                        for (sorted, 0..) |record, index| handles[index] = try self.table(
+                            allocator,
+                            record,
+                        );
                     } else {
-                        for (value, 0..) |*record, index| handles[index] = try self.table(allocator, record);
+                        for (value, 0..) |*record, index| handles[index] = try self.table(
+                            allocator,
+                            record,
+                        );
                     }
                     try self.reserve(allocator, required);
-                    break :offset_vector_blk try self.builder.createOffsetVector(handles);
+                    break :offset_vector_blk try self.builder.createReferenceVector(handles, .{});
                 },
                 else => @compileError("BFBS references require single pointers or slices"),
             },
@@ -321,14 +393,19 @@ const Decoder = struct {
         try self.charge(amount);
     }
 
-    fn allocate(self: *Decoder, allocator: std.mem.Allocator, comptime Value: type, count: usize) Error![]Value {
+    fn allocate(
+        self: *Decoder,
+        allocator: std.mem.Allocator,
+        comptime Value: type,
+        count: usize,
+    ) Error![]Value {
         if (count > (self.options.max_work - self.work) / @sizeOf(Value)) return error.WorkLimit;
         try self.charge(count * @sizeOf(Value));
         return allocator.alloc(Value, count);
     }
 
     fn read(self: *Decoder, allocator: std.mem.Allocator) ReadError!reflection.Schema {
-        const root = try Table.from(self.bytes, .{ .framed_root = .{
+        const root = try Table.from(self.bytes, .{ .options = .{
             .format = self.options.format,
             .identifier = reflection.file_identifier.*,
         } });
@@ -336,7 +413,12 @@ const Decoder = struct {
         return self.table(allocator, reflection.Schema, root);
     }
 
-    fn table(self: *Decoder, allocator: std.mem.Allocator, comptime Record: type, view: Table) ReadError!Record {
+    fn table(
+        self: *Decoder,
+        allocator: std.mem.Allocator,
+        comptime Record: type,
+        view: Table,
+    ) ReadError!Record {
         if (self.depth >= self.options.max_depth) return error.DepthLimit;
         try self.visit(view.layout.table_size + view.layout.vtable_size);
         self.depth += 1;
@@ -350,17 +432,34 @@ const Decoder = struct {
                     if (@typeInfo(Value) == .optional) break :reference_field_blk null;
                     return error.InvalidBfbs;
                 };
-                break :reference_field_blk try self.reference(allocator, Value, position, view.context());
+                break :reference_field_blk try self.reference(
+                    allocator,
+                    Value,
+                    position,
+                    view.context(),
+                );
             } else scalar_field_blk: {
-                const value = try view.readField(Scalar(Value), field_id, scalarDefault(Record, field_id));
-                break :scalar_field_blk if (Value == reflection.AdvancedFeatures) @bitCast(value) else value;
+                const value = try view.readField(
+                    Scalar(Value),
+                    field_id,
+                    scalarDefault(Record, field_id),
+                );
+                break :scalar_field_blk if (Value == reflection.AdvancedFeatures)
+                    @bitCast(value)
+                else
+                    value;
             };
         }
         return result;
     }
 
     // Cached Object visits must retain the work and depth of their entire subtree.
-    fn measuredTable(self: *Decoder, allocator: std.mem.Allocator, comptime Record: type, view: Table) ReadError!struct {
+    fn measuredTable(
+        self: *Decoder,
+        allocator: std.mem.Allocator,
+        comptime Record: type,
+        view: Table,
+    ) ReadError!struct {
         value: Record,
         work: usize,
         height: usize,
@@ -388,14 +487,35 @@ const Decoder = struct {
         context: validation.Context,
     ) ReadError!Value {
         return switch (@typeInfo(Value)) {
-            .optional => |optional| try self.reference(allocator, optional.child, position, context),
+            .optional => |optional| try self.reference(
+                allocator,
+                optional.child,
+                position,
+                context,
+            ),
             .pointer => |pointer_info| switch (pointer_info.size) {
-                .one => try self.pointer(allocator, pointer_info.child, try self.child(position, context)),
+                .one => try self.pointer(
+                    allocator,
+                    pointer_info.child,
+                    try self.child(position, context),
+                ),
                 .slice => if (pointer_info.child == u8) string_value_blk: {
-                    const layout = try validation.sequenceAt(1, 1, 1, self.bytes, context, position);
-                    try self.visit(wire.sequence_length_size + layout.element_count + wire.string_terminator_size);
+                    const layout = try validation.sequenceAt(
+                        1,
+                        1,
+                        1,
+                        self.bytes,
+                        context,
+                        position,
+                    );
+                    const string_size = layout.element_count + wire.string_terminator_size;
+                    try self.visit(wire.sequence_length_size + string_size);
                     try self.charge(layout.element_count);
-                    break :string_value_blk try allocator.dupe(u8, try validation.stringAt(self.bytes, context, position));
+                    const terminated = self.bytes[layout.payload_start..][0..string_size];
+                    break :string_value_blk try allocator.dupe(
+                        u8,
+                        try validation.stringPayload(terminated),
+                    );
                 } else try self.vector(allocator, pointer_info.child, position, context),
                 else => @compileError("reflection references require single pointers or slices"),
             },
@@ -403,7 +523,12 @@ const Decoder = struct {
         };
     }
 
-    fn pointer(self: *Decoder, allocator: std.mem.Allocator, comptime Record: type, view: Table) ReadError!*const Record {
+    fn pointer(
+        self: *Decoder,
+        allocator: std.mem.Allocator,
+        comptime Record: type,
+        view: Table,
+    ) ReadError!*const Record {
         if (Record == reflection.Object) if (self.objects.get(view.layout.table_start)) |cached| {
             if (cached.height > self.options.max_depth - self.depth) return error.DepthLimit;
             self.deepest = @max(self.deepest, self.depth + cached.height);
@@ -437,7 +562,10 @@ const Decoder = struct {
             .size = wire.sequence_length_size + layout.element_count * wire.field_offset_size,
         };
         if (Element == reflection.Object) for (values, 0..) |*value, index| {
-            const view = try self.child(layout.payload_start + index * wire.field_offset_size, context);
+            const view = try self.child(
+                layout.payload_start + index * wire.field_offset_size,
+                context,
+            );
             try self.objects.put(allocator, view.layout.table_start, .{ .value = value });
         };
         for (values, 0..) |*value, index| {

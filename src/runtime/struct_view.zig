@@ -4,7 +4,12 @@
 const validation = @import("validation.zig");
 const mutation = @import("mutation.zig");
 const errors = @import("errors.zig");
-const Access = @import("table_view.zig").Access;
+const table_view = @import("table_view.zig");
+
+const AccessError = errors.AccessError;
+const MutationError = errors.MutationError;
+
+const Access = table_view.Access;
 
 /// Borrow a named inline struct without copying; nested views preserve access capability.
 /// The complete frame must outlive every view. No allocation or cleanup is required.
@@ -26,7 +31,7 @@ pub fn StructView(comptime Layout: type, comptime access: Access) type {
 
         /// Local range/alignment checks only; read/verification decode members.
         /// Table access checks containment before opening this inline view.
-        pub fn from(bytes: Bytes, struct_start: usize) errors.AccessError!Self {
+        pub fn from(bytes: Bytes, struct_start: usize) AccessError!Self {
             const result: Self = .{ .bytes = bytes, .struct_start = struct_start };
             try result.checkRange();
             return result;
@@ -45,16 +50,12 @@ pub fn StructView(comptime Layout: type, comptime access: Access) type {
         pub fn get(
             self: Self,
             comptime field: Layout.Field,
-        ) errors.AccessError!MemberView(field) {
+        ) AccessError!MemberView(field) {
             try self.checkRange();
             const MemberType = Layout.Member(field);
             const member_start = self.struct_start + MemberType.offset;
             return switch (MemberType.kind) {
-                .scalar => |ScalarType| validation.readScalar(
-                    ScalarType,
-                    self.bytes,
-                    member_start,
-                ),
+                .scalar => |ScalarType| validation.readScalar(ScalarType, self.bytes, member_start),
                 .structure => |ChildLayout| StructView(
                     ChildLayout,
                     access,
@@ -66,20 +67,16 @@ pub fn StructView(comptime Layout: type, comptime access: Access) type {
             };
         }
 
-        /// Materializes all members into a native value, including nested ones.
-        pub fn read(self: Self) errors.AccessError!Layout.Value {
+        /// Copy all members, including nested ones, into a native value that borrows no bytes.
+        pub fn read(self: Self) AccessError!Layout.Value {
             try self.checkRange();
-            return Layout.decode(
-                self.bytes[self.struct_start..][0..Layout.wire_size],
-            );
+            return Layout.decode(self.bytes[self.struct_start..][0..Layout.wire_size]);
         }
 
         /// Validate all scalar leaves without constructing the native value; padding is ignored.
-        pub fn verify(self: Self) errors.AccessError!void {
+        pub fn verify(self: Self) AccessError!void {
             try self.checkRange();
-            try Layout.verify(
-                self.bytes[self.struct_start..][0..Layout.wire_size],
-            );
+            try Layout.verify(self.bytes[self.struct_start..][0..Layout.wire_size]);
         }
 
         /// Struct members always exist. Failure never partially updates bytes.
@@ -87,7 +84,7 @@ pub fn StructView(comptime Layout: type, comptime access: Access) type {
             self: Self,
             comptime field: Layout.Field,
             value: Layout.Member(field).Value,
-        ) errors.MutationError!void {
+        ) MutationError!void {
             comptime requireMutable();
             try self.checkRange();
             const MemberType = Layout.Member(field);
@@ -112,17 +109,12 @@ pub fn StructView(comptime Layout: type, comptime access: Access) type {
         pub fn replace(
             self: Self,
             value: Layout.Value,
-        ) errors.MutationError!void {
+        ) MutationError!void {
             comptime requireMutable();
-            try mutation.inlineValue(
-                Layout,
-                self.bytes,
-                self.struct_start,
-                value,
-            );
+            try mutation.inlineValue(Layout, self.bytes, self.struct_start, value);
         }
 
-        fn checkRange(self: Self) errors.AccessError!void {
+        fn checkRange(self: Self) AccessError!void {
             try validation.inlineRange(
                 self.bytes,
                 self.struct_start,
@@ -139,6 +131,7 @@ pub fn StructView(comptime Layout: type, comptime access: Access) type {
 
 /// Fixed arrays share the parent's storage; their count comes from the schema.
 /// No vector prefix or reference context is synthesized for these inline bytes.
+/// The complete frame must outlive the view; storage reuse invalidates its borrows.
 pub fn ArrayView(comptime Layout: type, comptime access: Access) type {
     if (Layout.layout_kind != .array)
         @compileError("ArrayView requires an array layout");
@@ -164,13 +157,8 @@ pub fn ArrayView(comptime Layout: type, comptime access: Access) type {
         array_start: usize,
 
         /// Borrow an inline array after checking its complete wire extent and alignment.
-        pub fn from(bytes: Bytes, array_start: usize) errors.AccessError!Self {
-            try validation.inlineRange(
-                bytes,
-                array_start,
-                Layout.wire_size,
-                Layout.wire_alignment,
-            );
+        pub fn from(bytes: Bytes, array_start: usize) AccessError!Self {
+            try validation.inlineRange(bytes, array_start, Layout.wire_size, Layout.wire_alignment);
             return .{ .bytes = bytes, .array_start = array_start };
         }
 
@@ -178,7 +166,7 @@ pub fn ArrayView(comptime Layout: type, comptime access: Access) type {
         pub fn get(
             self: Self,
             element_index: usize,
-        ) errors.AccessError!ElementView {
+        ) AccessError!ElementView {
             const element_start = try self.elementStart(element_index);
             return switch (Element.kind) {
                 .scalar => |ScalarType| validation.readScalar(
@@ -194,12 +182,13 @@ pub fn ArrayView(comptime Layout: type, comptime access: Access) type {
             };
         }
 
-        /// Replace one existing element; requires mutable access and leaves bytes unchanged on failure.
+        /// Replace one existing element; requires mutable access.
+        /// Failures leave the bytes unchanged.
         pub fn update(
             self: Self,
             element_index: usize,
             value: Element.Value,
-        ) errors.MutationError!void {
+        ) MutationError!void {
             if (access != .mutable) @compileError("mutation requires a mutable array");
             const element_start = try self.elementStart(element_index);
             switch (Element.kind) {
@@ -222,7 +211,7 @@ pub fn ArrayView(comptime Layout: type, comptime access: Access) type {
         fn elementStart(
             self: Self,
             element_index: usize,
-        ) errors.AccessError!usize {
+        ) AccessError!usize {
             // Check the complete inline extent before multiplying an index.
             try validation.inlineRange(
                 self.bytes,
@@ -231,7 +220,7 @@ pub fn ArrayView(comptime Layout: type, comptime access: Access) type {
                 Layout.wire_alignment,
             );
             if (element_index >= element_count)
-                return errors.AccessError.OutOfBounds;
+                return AccessError.OutOfBounds;
             return self.array_start + element_index * Element.wire_size;
         }
     };

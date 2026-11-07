@@ -41,7 +41,10 @@ const Options = struct {
         var argument_index: usize = 1;
         while (argument_index < arguments.len) : (argument_index += 1) {
             const argument = arguments[argument_index];
-            if (std.meta.stringToEnum(enum { @"-I", @"--depfile", @"--deptarget" }, argument)) |flag| {
+            if (std.meta.stringToEnum(
+                enum { @"-I", @"--depfile", @"--deptarget" },
+                argument,
+            )) |flag| {
                 argument_index += 1;
                 if (argument_index == arguments.len) return null;
                 const value = arguments[argument_index];
@@ -78,7 +81,11 @@ const Sources = struct {
     include_paths: []const []const u8,
     loaded: std.StringArrayHashMapUnmanaged([]const u8) = .empty,
 
-    fn read(self: *Sources, allocator: std.mem.Allocator, path: []const u8) !compiler.parser.Source {
+    fn read(
+        self: *Sources,
+        allocator: std.mem.Allocator,
+        path: []const u8,
+    ) !compiler.parser.Source {
         const name = try std.fs.path.resolve(allocator, &.{ self.working_directory, path });
         if (self.loaded.get(name)) |text| return .{ .name = name, .text = text };
         const text = try std.Io.Dir.cwd().readFileAlloc(self.file_io, name, allocator, .unlimited);
@@ -107,8 +114,8 @@ const Sources = struct {
     }
 };
 
-/// Parse and encode completely before touching the depfile or stdout. Metadata
-/// uses the caller's arena; JSON streams through bounded output buffering.
+/// Complete parsing and Zig/BFBS generation before writing the depfile or stdout.
+/// Metadata uses the caller's arena; JSON streams through bounded output buffering.
 fn printSource(allocator: std.mem.Allocator, file_io: std.Io, options: Options) !void {
     var sources: Sources = .{
         .file_io = file_io,
@@ -132,13 +139,18 @@ fn printSource(allocator: std.mem.Allocator, file_io: std.Io, options: Options) 
     // Finish both allocating backends before replacing a depfile or writing stdout.
     const generated = if (options.format == .zig) try codegen.generate(allocator, schema) else null;
     defer if (generated) |bytes| allocator.free(bytes);
-    const encoded = if (options.format == .bfbs) try compiler.bfbs.encode(allocator, schema) else null;
+    const encoded = if (options.format == .bfbs) try compiler.bfbs.encode(
+        allocator,
+        schema,
+    ) else null;
     defer if (encoded) |bytes| allocator.free(bytes);
     if (options.depfile) |path| {
-        const target: []const u8 = options.deptarget orelse try std.fmt.allocPrint(
-            allocator,
+        const target: []const u8 = options.deptarget orelse try allocator.print(
             "{s}.{s}",
-            .{ std.fs.path.stem(options.input_path), if (options.format == .zig) "zig" else "bfbs" },
+            .{
+                std.fs.path.stem(options.input_path),
+                if (options.format == .zig) "zig" else "bfbs",
+            },
         );
         try writeDepfile(file_io, path, target, sources.loaded.keys()[1..]);
     }
@@ -152,7 +164,10 @@ fn printSource(allocator: std.mem.Allocator, file_io: std.Io, options: Options) 
 fn printJson(file_io: std.Io, schema: compiler.reflection.Schema) !void {
     var buffer: [8192]u8 = undefined;
     var output = std.Io.File.Writer.init(.stdout(), file_io, &buffer);
-    var json: std.json.Stringify = .{ .writer = &output.interface, .options = .{ .whitespace = .indent_2 } };
+    var json: std.json.Stringify = .{
+        .writer = &output.interface,
+        .options = .{ .whitespace = .indent_2 },
+    };
     try writeJson(schema, &json);
     try output.interface.writeByte('\n');
     try output.interface.flush();
@@ -199,7 +214,12 @@ fn writeJson(value: anytype, json: *std.json.Stringify) std.json.Stringify.Error
 
 /// Replace a Make-style depfile only after every path was written successfully.
 /// Paths exclude the root input, which build consumers track separately.
-fn writeDepfile(file_io: std.Io, path: []const u8, target: []const u8, dependencies: []const []const u8) !void {
+fn writeDepfile(
+    file_io: std.Io,
+    path: []const u8,
+    target: []const u8,
+    dependencies: []const []const u8,
+) !void {
     var file = try std.Io.Dir.cwd().createFileAtomic(file_io, path, .{ .replace = true });
     defer file.deinit(file_io);
     var buffer: [4096]u8 = undefined;
@@ -241,7 +261,12 @@ pub fn main(init: std.process.Init) !u8 {
         return 1;
     };
     if (std.mem.endsWith(u8, options.input_path, ".bfbs")) {
-        const bytes = try std.Io.Dir.cwd().readFileAlloc(init.io, options.input_path, allocator, .unlimited);
+        const bytes = try std.Io.Dir.cwd().readFileAlloc(
+            init.io,
+            options.input_path,
+            allocator,
+            .unlimited,
+        );
         const schema = try compiler.bfbs.decode(allocator, bytes);
         if (options.format == .zig) {
             const source = try codegen.generate(allocator, schema);
@@ -257,27 +282,37 @@ pub fn main(init: std.process.Init) !u8 {
     return 0;
 }
 
+const include_dependency_arguments = [_][]const u8{
+    "--json",    "main.fbs", "-I",        "first", "-I",          "second",
+    "--depfile", "old.d",    "--depfile", "new.d", "--deptarget", "result.json",
+};
+const invalid_cli_arguments = [_][]const []const u8{
+    &.{},
+    &.{"--json"},
+    &.{ "--json", "--deptarget", "out", "main.fbs" },
+    &.{ "--json", "main.fbs", "-I" },
+    &.{ "--json", "main.fbs", "other.fbs" },
+    &.{ "--bfbs", "main.bfbs" },
+    &.{ "--json", "-I", ".", "main.bfbs" },
+    &.{ "json", "main.fbs" },
+    &.{ "-json", "main.fbs" },
+    &.{ "---json", "main.fbs" },
+    &.{ "--JSON", "main.fbs" },
+    &.{ "--json=1", "main.fbs" },
+    &.{ "--", "main.fbs" },
+};
+
 test "CLI options share include and dependency settings across formats" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const options = (try Options.parse(arena.allocator(), &.{
-        "--json",    "main.fbs", "-I",        "first", "-I",          "second",
-        "--depfile", "old.d",    "--depfile", "new.d", "--deptarget", "result.json",
-    })).?;
+    const options = (try Options.parse(arena.allocator(), &include_dependency_arguments)).?;
     try std.testing.expectEqual(Format.json, options.format);
     try std.testing.expectEqualStrings("main.fbs", options.input_path);
     try std.testing.expectEqualStrings("first", options.include_paths[0]);
     try std.testing.expectEqualStrings("second", options.include_paths[1]);
     try std.testing.expectEqualStrings("new.d", options.depfile.?);
     try std.testing.expectEqualStrings("result.json", options.deptarget.?);
-    const invalid = [_][]const []const u8{
-        &.{},                                   &.{"--json"},                            &.{ "--json", "--deptarget", "out", "main.fbs" },
-        &.{ "--json", "main.fbs", "-I" },       &.{ "--json", "main.fbs", "other.fbs" }, &.{ "--bfbs", "main.bfbs" },
-        &.{ "--json", "-I", ".", "main.bfbs" }, &.{ "json", "main.fbs" },                &.{ "-json", "main.fbs" },
-        &.{ "---json", "main.fbs" },            &.{ "--JSON", "main.fbs" },              &.{ "--json=1", "main.fbs" },
-        &.{ "--", "main.fbs" },
-    };
-    for (invalid) |arguments|
+    for (invalid_cli_arguments) |arguments|
         try std.testing.expect((try Options.parse(arena.allocator(), arguments)) == null);
 }
 
@@ -301,7 +336,12 @@ test "native reflection JSON preserves numbers flags and nonfinite defaults" {
     var output: std.Io.Writer.Allocating = .init(allocator);
     var json: std.json.Stringify = .{ .writer = &output.writer };
     try writeJson(schema, &json);
-    const document = try std.json.parseFromSliceLeaky(std.json.Value, allocator, output.written(), .{});
+    const document = try std.json.parseFromSliceLeaky(
+        std.json.Value,
+        allocator,
+        output.written(),
+        .{},
+    );
     try std.testing.expectEqual(@as(i64, 5), document.object.get("advanced_features").?.integer);
     try std.testing.expect(!document.object.contains("services"));
     const fields = document.object.get("root_table").?.object.get("fields").?.array.items;
@@ -309,9 +349,15 @@ test "native reflection JSON preserves numbers flags and nonfinite defaults" {
     for (fields) |field| {
         const name = field.object.get("name").?.string;
         if (std.mem.eql(u8, name, "precise")) {
-            try std.testing.expectEqual(@as(i64, 9007199254740993), field.object.get("default_integer").?.integer);
+            try std.testing.expectEqual(
+                @as(i64, 9007199254740993),
+                field.object.get("default_integer").?.integer,
+            );
         } else if (std.mem.eql(u8, name, "maximum")) {
-            try std.testing.expectEqual(@as(i64, -1), field.object.get("default_integer").?.integer);
+            try std.testing.expectEqual(
+                @as(i64, -1),
+                field.object.get("default_integer").?.integer,
+            );
         } else if (std.mem.eql(u8, name, "positive")) {
             try std.testing.expectEqualStrings("inf", field.object.get("default_real").?.string);
         } else if (std.mem.eql(u8, name, "negative")) {
@@ -332,8 +378,14 @@ test "native include search respects explicit paths and normalized identities" {
         .sub_path = "main.fbs",
         .data = "include \"choice.fbs\"; include \"./choice.fbs\"; table Root { value:Choice; } root_type Root;",
     });
-    try temporary.dir.writeFile(file_io, .{ .sub_path = "choice.fbs", .data = "table Choice { selected:int = 1; }" });
-    try temporary.dir.writeFile(file_io, .{ .sub_path = "inc/choice.fbs", .data = "table Choice { selected:int = 3; }" });
+    try temporary.dir.writeFile(
+        file_io,
+        .{ .sub_path = "choice.fbs", .data = "table Choice { selected:int = 1; }" },
+    );
+    try temporary.dir.writeFile(
+        file_io,
+        .{ .sub_path = "inc/choice.fbs", .data = "table Choice { selected:int = 3; }" },
+    );
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -364,19 +416,36 @@ test "native depfiles retain space escaping and preserve previous output on fail
     const path = try std.fs.path.join(allocator, &.{ directory, "schema.d" });
     try writeDepfile(file_io, path, "target name#$", &.{ "first path.fbs", "other#$.fbs" });
     const expected = "target\\ name#$: first\\ path.fbs other#$.fbs\n";
-    try std.testing.expectEqualStrings(expected, try temporary.dir.readFileAlloc(file_io, "schema.d", allocator, .unlimited));
-    try std.testing.expectError(error.InvalidDependencyPath, writeDepfile(file_io, path, "bad\nname", &.{}));
-    try std.testing.expectEqualStrings(expected, try temporary.dir.readFileAlloc(file_io, "schema.d", allocator, .unlimited));
+    try std.testing.expectEqualStrings(
+        expected,
+        try temporary.dir.readFileAlloc(file_io, "schema.d", allocator, .unlimited),
+    );
+    try std.testing.expectError(
+        error.InvalidDependencyPath,
+        writeDepfile(file_io, path, "bad\nname", &.{}),
+    );
+    try std.testing.expectEqualStrings(
+        expected,
+        try temporary.dir.readFileAlloc(file_io, "schema.d", allocator, .unlimited),
+    );
 }
 
 test "Zig generation accepts FBS includes depfiles and existing BFBS" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
-    const fbs = (try Options.parse(allocator, &.{ "--zig", "-I", "inc", "--depfile", "result.d", "input.fbs" })).?;
+    const fbs = (try Options.parse(
+        allocator,
+        &.{ "--zig", "-I", "inc", "--depfile", "result.d", "input.fbs" },
+    )).?;
     try std.testing.expectEqual(Format.zig, fbs.format);
     try std.testing.expectEqualStrings("inc", fbs.include_paths[0]);
     try std.testing.expectEqualStrings("result.d", fbs.depfile.?);
-    try std.testing.expectEqual(Format.zig, (try Options.parse(allocator, &.{ "--zig", "input.bfbs" })).?.format);
-    try std.testing.expect((try Options.parse(allocator, &.{ "--zig", "-I", "inc", "input.bfbs" })) == null);
+    try std.testing.expectEqual(
+        Format.zig,
+        (try Options.parse(allocator, &.{ "--zig", "input.bfbs" })).?.format,
+    );
+    try std.testing.expect(
+        (try Options.parse(allocator, &.{ "--zig", "-I", "inc", "input.bfbs" })) == null,
+    );
 }

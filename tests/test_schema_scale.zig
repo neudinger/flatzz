@@ -1,6 +1,7 @@
 //! A larger schema regression for compile-time metadata and specialization.
-const standard_library = @import("std");
+const std = @import("std");
 const runtime = @import("runtime");
+
 const fields = .{
     .value_000 = runtime.ScalarField(u32, 0, 0),
     .value_001 = runtime.ScalarField(u32, 1, 0),
@@ -84,13 +85,14 @@ test "64 field metadata builds reads updates and verifies within comptime limits
     const bytes = try builder.finish(try Definition.Schema.create(
         &builder,
         values,
+        .{},
     ), .ordinary);
     try runtime.Verifier.verify(Definition, bytes, .{});
     const decoded = try Definition.Schema.read(
         try runtime.Table.from(bytes, .root),
     );
     inline for (field_names) |field_name| {
-        try standard_library.testing.expectEqual(
+        try std.testing.expectEqual(
             @field(values, field_name),
             @field(
                 decoded,
@@ -98,7 +100,7 @@ test "64 field metadata builds reads updates and verifies within comptime limits
             ),
         );
     }
-    try standard_library.testing.expect(
+    try std.testing.expect(
         try Definition.Schema.update(
             try runtime.MutableTable.from(bytes, .root),
             .value_063,
@@ -106,7 +108,7 @@ test "64 field metadata builds reads updates and verifies within comptime limits
         ),
     );
     try runtime.Verifier.verify(Definition, bytes, .{});
-    try standard_library.testing.expectEqual(
+    try std.testing.expectEqual(
         @as(u32, 99),
         (try Definition.Schema.read(
             try runtime.Table.from(bytes, .root),

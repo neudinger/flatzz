@@ -1,8 +1,65 @@
-const standard_library = @import("std");
+const std = @import("std");
 const runtime = @import("runtime");
-const Reading = @import("reading").Reading;
+const reading = @import("reading");
 const fixtures = @import("test_schema.zig");
-const testing = standard_library.testing;
+
+const Reading = reading.Reading;
+const testing = std.testing;
+
+const integer_scalar_types = [_]type{ u8, i8, u16, i16, u32, i32, u64, i64 };
+
+// Independent wire bytes catch paired encoder/decoder regressions after
+// @bitCast changes, including sign bits and noncanonical NaN payloads.
+const scalar_wire_cases = .{
+    .{
+        i16,
+        u16,
+        0x8000,
+        [_]u8{ 0, 0x80 },
+    },
+    .{
+        i64,
+        u64,
+        0x8000000000000000,
+        [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0x80 },
+    },
+    .{
+        f32,
+        u32,
+        0x80000000,
+        [_]u8{ 0, 0, 0, 0x80 },
+    },
+    .{
+        f32,
+        u32,
+        0x7f800000,
+        [_]u8{ 0, 0, 0x80, 0x7f },
+    },
+    .{
+        f32,
+        u32,
+        0x7fc01234,
+        [_]u8{ 0x34, 0x12, 0xc0, 0x7f },
+    },
+    .{
+        f64,
+        u64,
+        0x8000000000000000,
+        [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0x80 },
+    },
+    .{
+        f64,
+        u64,
+        0x7ff0000000000000,
+        [_]u8{ 0, 0, 0, 0, 0, 0, 0xf0, 0x7f },
+    },
+    .{
+        f64,
+        u64,
+        0x7ff8123456789abc,
+        [_]u8{ 0xbc, 0x9a, 0x78, 0x56, 0x34, 0x12, 0xf8, 0x7f },
+    },
+};
 
 fn scalarRoundTrip(comptime ScalarType: type, value: ScalarType) !void {
     const scalar_size = @sizeOf(runtime.wire.Bits(ScalarType));
@@ -22,19 +79,19 @@ fn scalarRoundTrip(comptime ScalarType: type, value: ScalarType) !void {
     try testing.expectEqualSlices(u8, &before, &bytes);
     try testing.expectError(
         error.OutOfBounds,
-        runtime.read(ScalarType, &bytes, standard_library.math.maxInt(usize)),
+        runtime.read(ScalarType, &bytes, std.math.maxInt(usize)),
     );
 }
 
 test "wire scalars preserve integer boundaries and floating point bits on unaligned input" {
-    inline for (.{ u8, i8, u16, i16, u32, i32, u64, i64 }) |ScalarType| {
+    inline for (integer_scalar_types) |ScalarType| {
         try scalarRoundTrip(
             ScalarType,
-            standard_library.math.minInt(ScalarType),
+            std.math.minInt(ScalarType),
         );
         try scalarRoundTrip(
             ScalarType,
-            standard_library.math.maxInt(ScalarType),
+            std.math.maxInt(ScalarType),
         );
     }
     inline for (.{ f32, f64 }) |ScalarType| {
@@ -43,68 +100,16 @@ test "wire scalars preserve integer boundaries and floating point bits on unalig
             @as(WireType, 1) << (@bitSizeOf(WireType) - 1),
         );
         try scalarRoundTrip(ScalarType, negative_zero);
-        try scalarRoundTrip(ScalarType, standard_library.math.inf(ScalarType));
+        try scalarRoundTrip(ScalarType, std.math.inf(ScalarType));
         try scalarRoundTrip(
             ScalarType,
-            @bitCast(@as(WireType, standard_library.math.maxInt(WireType))),
+            @bitCast(@as(WireType, std.math.maxInt(WireType))),
         );
     }
     var bytes: [runtime.field_offset_size]u8 = undefined;
     try runtime.write(u32, &bytes, 0, 0x01020304);
     try testing.expectEqualSlices(u8, &.{ 4, 3, 2, 1 }, &bytes);
-    // Independent wire bytes catch paired encoder/decoder regressions after
-    // @bitCast changes, including sign bits and noncanonical NaN payloads.
-    const wire_fixtures = .{
-        .{
-            i16,
-            u16,
-            0x8000,
-            [_]u8{ 0, 0x80 },
-        },
-        .{
-            i64,
-            u64,
-            0x8000000000000000,
-            [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0x80 },
-        },
-        .{
-            f32,
-            u32,
-            0x80000000,
-            [_]u8{ 0, 0, 0, 0x80 },
-        },
-        .{
-            f32,
-            u32,
-            0x7f800000,
-            [_]u8{ 0, 0, 0x80, 0x7f },
-        },
-        .{
-            f32,
-            u32,
-            0x7fc01234,
-            [_]u8{ 0x34, 0x12, 0xc0, 0x7f },
-        },
-        .{
-            f64,
-            u64,
-            0x8000000000000000,
-            [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0x80 },
-        },
-        .{
-            f64,
-            u64,
-            0x7ff0000000000000,
-            [_]u8{ 0, 0, 0, 0, 0, 0, 0xf0, 0x7f },
-        },
-        .{
-            f64,
-            u64,
-            0x7ff8123456789abc,
-            [_]u8{ 0xbc, 0x9a, 0x78, 0x56, 0x34, 0x12, 0xf8, 0x7f },
-        },
-    };
-    inline for (wire_fixtures) |fixture| {
+    inline for (scalar_wire_cases) |fixture| {
         const ScalarType = fixture[0];
         const WireType = fixture[1];
         const expected_bits: WireType = fixture[2];
@@ -159,37 +164,37 @@ const signed_fixture_size = trailing_vtable_start + single_vtable_size;
 
 fn signedVtableFixture() [signed_fixture_size]u8 {
     var bytes: [signed_fixture_size]u8 = @splat(0);
-    standard_library.mem.writeInt(
+    std.mem.writeInt(
         u32,
         bytes[root_start..][0..runtime.root_offset_size],
         signed_table_start,
         .little,
     );
-    standard_library.mem.writeInt(
+    std.mem.writeInt(
         i32,
         bytes[signed_table_start..][0..runtime.table_header_size],
         -@as(i32, trailing_vtable_start - signed_table_start),
         .little,
     );
-    standard_library.mem.writeInt(
+    std.mem.writeInt(
         u32,
         bytes[scalar_start..][0..@sizeOf(u32)],
         42,
         .little,
     );
-    standard_library.mem.writeInt(
+    std.mem.writeInt(
         u16,
         bytes[trailing_vtable_start..][0..runtime.vtable_entry_size],
         single_vtable_size,
         .little,
     );
-    standard_library.mem.writeInt(
+    std.mem.writeInt(
         u16,
         bytes[trailing_vtable_start + runtime.vtable_entry_size ..][0..runtime.vtable_entry_size],
         runtime.table_header_size + @sizeOf(u32),
         .little,
     );
-    standard_library.mem.writeInt(
+    std.mem.writeInt(
         u16,
         bytes[trailing_vtable_start + runtime.vtable_header_size ..][0..runtime.vtable_entry_size],
         runtime.table_header_size,
@@ -201,14 +206,23 @@ fn signedVtableFixture() [signed_fixture_size]u8 {
 test "signed vtables and table at position do not require root discovery" {
     var bytes = signedVtableFixture();
     const table = try runtime.Table.from(&bytes, .root);
-    try testing.expectEqual(@as(u32, 42), try table.readField(u32, 0, 0));
-    try testing.expectEqual(@as(u32, 99), try table.readField(u32, 1, 99));
+    const root_sources = [_]runtime.TableSource{ .root, .{ .options = .{} } };
+    for (root_sources) |root_source| {
+        const opened = try runtime.Table.from(&bytes, root_source);
+        try testing.expectEqual(@as(u32, 42), try opened.readField(u32, 0, 0));
+        try testing.expectEqual(@as(u32, 99), try opened.readField(u32, 1, 99));
+        const writable = try runtime.MutableTable.from(&bytes, root_source);
+        try testing.expectEqual(@as(u32, 42), try writable.readField(u32, 0, 0));
+    }
     // Invalidating only the root offset does not invalidate this table's metadata.
     try runtime.write(u32, &bytes, root_start, 0);
-    try testing.expectError(
-        error.InvalidBuffer,
-        runtime.Table.from(&bytes, .root),
-    );
+    for (root_sources) |root_source| {
+        try testing.expectError(error.InvalidBuffer, runtime.Table.from(&bytes, root_source));
+        try testing.expectError(
+            error.InvalidBuffer,
+            runtime.MutableTable.from(&bytes, root_source),
+        );
+    }
     // This position was decoded at runtime, so the source cannot be comptime.
     const source: runtime.TableSource = .{ .position = table.layout.table_start };
     const independent = try runtime.Table.from(&bytes, source);
@@ -218,7 +232,7 @@ test "signed vtables and table at position do not require root discovery" {
     try testing.expect(try mutable.mutateField(u32, 0, 43));
     try testing.expectEqual(@as(u32, 43), try independent.readField(u32, 0, 0));
     // Keep the position aligned so this exercises bounds, not alignment checks.
-    const outside_start = standard_library.mem.alignForward(
+    const outside_start = std.mem.alignForward(
         usize,
         bytes.len,
         runtime.table_header_size,
@@ -283,7 +297,7 @@ test "trimmed vtables absent slots and malformed field ranges" {
         i32,
         &bytes,
         signed_table_start,
-        standard_library.math.minInt(i32),
+        std.math.minInt(i32),
     );
     try testing.expectError(error.OutOfBounds, runtime.Table.from(
         &bytes,
@@ -292,10 +306,10 @@ test "trimmed vtables absent slots and malformed field ranges" {
 }
 
 test "scalar mutation uses cached lookup preserves presence and failure atomicity" {
-    var storage: Reading.Storage(0, 0, .{}, 0) = .{};
-    const bytes = try Reading.write(
-        &storage.buffer,
+    var storage: runtime.Storage(Reading.Schema, .{}, .{}) = .{};
+    const bytes = try Reading.serialize(
         .{ .temperature = 0 },
+        &storage.buffer,
         .{ .force_defaults = true },
     );
     const table = try runtime.MutableTable.from(bytes, .root);
@@ -309,7 +323,7 @@ test "scalar mutation uses cached lookup preserves presence and failure atomicit
         Reading.update(bytes, .temperature, null),
     );
     try testing.expectEqualSlices(u8, &before, &storage.buffer);
-    const absent = try Reading.write(&storage.buffer, .{}, .{});
+    const absent = try Reading.serialize(.{}, &storage.buffer, .{});
     try testing.expect(!try Reading.update(absent, .sequence, 0));
     try testing.expect(!try Reading.update(absent, .temperature, null));
 }
@@ -368,12 +382,10 @@ test "recursive schema heterogeneous tables shared children and arbitrary byte v
 }
 
 test "verification visits later vector elements whereas ordinary access stays lazy" {
-    var storage: Reading.Storage(0, 0, .{ .count = 2, .bytes = 6 }, 0) = .{};
-    const bytes = try Reading.write(
-        &storage.buffer,
-        .{ .tags = &.{ "one", "two" } },
-        .{},
-    );
+    var storage: runtime.Storage(Reading.Schema, .{
+        .tags = .{ .count = 2, .bytes = 6 },
+    }, .{}) = .{};
+    const bytes = try Reading.serialize(.{ .tags = &.{ "one", "two" } }, &storage.buffer, .{});
     const tags = (try Reading.read(bytes)).tags.?;
     try runtime.write(
         u32,
@@ -462,6 +474,44 @@ test "older schema ignores unknown fields during verification" {
     );
 }
 
+test "table contexts compactly distinguish untouched omitted and present fields" {
+    const Context = runtime.TableBuilder(16);
+    try testing.expectEqual(@as(usize, 64), @sizeOf(@FieldType(Context, "field_offsets")));
+    if (@sizeOf(usize) == 8)
+        try testing.expectEqual(@as(usize, 88), @sizeOf(Context));
+
+    var storage: [fixtures.storage_capacity]u8 align(runtime.storage_alignment) = @splat(0xa5);
+    var builder = runtime.Builder.init(&storage);
+    const empty = try builder.createString("");
+    var context = try Context.init(&builder);
+    try testing.expectError(error.MissingRequiredField, context.requireField(0));
+    try context.addScalar(u32, 0, 0, 0);
+    try context.addScalar(?u16, 1, null, null);
+    try context.addOffset(2, null);
+    try context.addStruct(reading.Location.Layout, 3, null);
+    const before_storage = storage;
+    const before_builder = builder;
+    const before_fields = context.field_offsets;
+    inline for (.{ 0, 1, 2, 3 }) |field_id| {
+        try testing.expectError(error.MissingRequiredField, context.requireField(field_id));
+        try testing.expectError(error.DuplicateField, context.addOffset(field_id, empty));
+    }
+    try testing.expectEqualSlices(u8, &before_storage, &storage);
+    try testing.expectEqualDeep(before_builder, builder);
+    try testing.expectEqualDeep(before_fields, context.field_offsets);
+    try context.addScalar(u32, 4, 42, 0);
+    try context.addOffset(5, empty);
+    try context.requireField(4);
+    try context.requireField(5);
+    try testing.expectError(error.MissingRequiredField, context.requireField(6));
+    const bytes = try builder.finish(try context.endTable(), .ordinary);
+    const table = try runtime.Table.from(bytes, .root);
+    inline for (.{ 0, 1, 2, 3, 6, 15 }) |field_id|
+        try testing.expect(try table.fieldPosition(u32, field_id) == null);
+    try testing.expectEqual(@as(u32, 42), try table.readField(u32, 4, 0));
+    try testing.expectEqualStrings("", (try table.readString(5)).?);
+}
+
 test "builder state transitions stale contexts duplicate fields and invalid handles" {
     var storage: [fixtures.storage_capacity]u8 align(runtime.storage_alignment) = @splat(
         0,
@@ -535,10 +585,71 @@ test "offset vector construction validates all handles before writing" {
     const cursor = builder.write_cursor;
     try testing.expectError(
         error.InvalidOffset,
-        builder.createOffsetVector(&.{ child_handle, @fromBackingInt(@intCast(0)) }),
+        builder.createReferenceVector(
+            &[_]runtime.Builder.Offset{ child_handle, @fromBackingInt(@intCast(0)) },
+            .{},
+        ),
     );
     try testing.expectEqual(cursor, builder.write_cursor);
     try testing.expectEqualSlices(u8, &before, &storage);
+}
+
+test "reference vectors accept handle slices and native callbacks including empty input" {
+    const CallbackOptions = struct {
+        union_type: ?type = null,
+        create: ?*const @TypeOf(runtime.Builder.createString) = null,
+    };
+    const labels = [_][]const u8{ "first", "second" };
+    for ([_]usize{ 0, labels.len }) |count| {
+        const values = labels[0..count];
+        var expected_storage: [128]u8 align(runtime.storage_alignment) = undefined;
+        var expected = runtime.Builder.init(&expected_storage);
+        _ = try expected.createStringVector(values);
+        const expected_bytes = expected.buffer[expected.write_cursor..];
+
+        var storage: [128]u8 align(runtime.storage_alignment) = undefined;
+        var builder = runtime.Builder.init(&storage);
+        inline for (.{
+            .{},
+            .{ .union_type = null, .create = null },
+            CallbackOptions{},
+        }) |options| {
+            builder.reset();
+            var handles: [labels.len]runtime.Builder.Offset = undefined;
+            for (values, handles[0..count]) |value, *handle| {
+                handle.* = try builder.createString(value);
+            }
+            const explicit: runtime.Builder.Offset = try builder.createReferenceVector(
+                handles[0..count],
+                options,
+            );
+            try testing.expectEqual(@as(u32, @intCast(expected.used())), @backingInt(explicit));
+            try testing.expectEqualSlices(
+                u8,
+                expected_bytes,
+                builder.buffer[builder.write_cursor..],
+            );
+        }
+
+        inline for (.{
+            .{ .create = runtime.Builder.createString },
+            .{ .create = &runtime.Builder.createString },
+            CallbackOptions{ .create = &runtime.Builder.createString },
+        }) |options| {
+            builder.reset();
+            const native: runtime.Builder.Offset = try builder.createReferenceVector(
+                values,
+                options,
+            );
+            try testing.expectEqual(@as(u32, @intCast(expected.used())), @backingInt(native));
+            try testing.expectEqualSlices(
+                u8,
+                expected_bytes,
+                builder.buffer[builder.write_cursor..],
+            );
+            try testing.expectEqual(@as(usize, 0), builder.scratch_cursor);
+        }
+    }
 }
 
 test "all truncations and bounded corruptions remain checked and failed mutations atomic" {
@@ -563,7 +674,10 @@ test "all truncations and bounded corruptions remain checked and failed mutation
                 .{ .max_work = fixtures.storage_capacity * 16 },
             ) catch {};
             const before = storage;
-            const mutable = runtime.MutableTable.from(bytes, .root) catch continue;
+            const mutable = runtime.MutableTable.from(
+                bytes,
+                .root,
+            ) catch continue;
             _ = mutable.mutateField(
                 u16,
                 fixtures.Graph.fields.revision.wire_id,
@@ -588,10 +702,14 @@ test "schema descriptors preserve physical ID gaps independent of native order" 
     try testing.expectEqual(@as(usize, 8), Sparse.Schema.field_count);
     var storage: [fixtures.storage_capacity]u8 align(runtime.storage_alignment) = undefined;
     var builder = runtime.Builder.init(&storage);
-    const bytes = try builder.finish(try Sparse.Schema.create(&builder, .{
-        .later = -1.5,
-        .earlier = 123,
-    }), .ordinary);
+    const bytes = try builder.finish(try Sparse.Schema.create(
+        &builder,
+        .{
+            .later = -1.5,
+            .earlier = 123,
+        },
+        .{},
+    ), .ordinary);
     try runtime.Verifier.verify(Sparse, bytes, .{});
     const table = try runtime.Table.from(bytes, .root);
     const values = try Sparse.Schema.read(table);
@@ -641,7 +759,7 @@ test "scalar sequence encoding preserves overlapping native input" {
     @memcpy(native[0..element_count], &values);
     runtime.wire.encodeSlice(
         u32,
-        standard_library.mem.sliceAsBytes(native[1..]),
+        std.mem.sliceAsBytes(native[1..]),
         native[0..element_count],
     );
     for (values, 0..) |value, element_index| {
@@ -649,7 +767,7 @@ test "scalar sequence encoding preserves overlapping native input" {
             value,
             try runtime.read(
                 u32,
-                standard_library.mem.sliceAsBytes(&native),
+                std.mem.sliceAsBytes(&native),
                 (element_index + 1) * element_size,
             ),
         );
@@ -657,7 +775,7 @@ test "scalar sequence encoding preserves overlapping native input" {
     @memcpy(native[1..], &values);
     runtime.wire.encodeSlice(
         u32,
-        standard_library.mem.sliceAsBytes(native[0..element_count]),
+        std.mem.sliceAsBytes(native[0..element_count]),
         native[1..],
     );
     for (values, 0..) |value, element_index| {
@@ -665,7 +783,7 @@ test "scalar sequence encoding preserves overlapping native input" {
             value,
             try runtime.read(
                 u32,
-                standard_library.mem.sliceAsBytes(&native),
+                std.mem.sliceAsBytes(&native),
                 element_index * element_size,
             ),
         );

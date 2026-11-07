@@ -5,8 +5,8 @@ Run from this directory with Zig 0.17.0. Zig fetches the pinned Zast package for
 | Command | Action |
 | --- | --- |
 | `zig build` | Install both apps, generated Reading, and the schema tool |
-| `zig build run` | Generate Reading from FBS and run the runtime-only app |
-| `zig build run-builder` | Run the Builder example |
+| `zig build run` | Generate Reading; serialize native values and unions using only the runtime |
+| `zig build run-builder` | Run construction, mutation, and unions with Builder |
 | `zig build check` | Compile examples, tests, and contracts |
 | `zig build test` | Test native runtime, FBS parsing, generated Zig, and contracts |
 | `zig build fmt` | Check Zig formatting |

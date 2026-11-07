@@ -25,6 +25,24 @@ table Packet {
     statuses:[Signed];
     block:Block;
 }
+
+union Payload { Node, Point, Text:string }
+table UnionPacket { payload:Payload; }
+table UnionList { payloads:[Payload]; }
+table TablePacket { child:Node; }
+table TableList { children:[Node]; }
+table NativePacket {
+    legacy_child:Node (deprecated);
+    legacy_children:[Node] (deprecated);
+    legacy_payload:Payload (deprecated);
+    legacy_payloads:[Payload] (deprecated);
+    value:int;
+}
+table Empty {}
+
+union RecursivePayload { UnionNode }
+table UnionNode { next:RecursivePayload; }
+
 root_type Packet;
 file_identifier "GENR";
 file_extension "gen";

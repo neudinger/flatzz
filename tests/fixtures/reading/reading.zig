@@ -99,42 +99,12 @@ pub const Reading = struct {
     pub const Schema = runtime.Schema(@This(), fields);
     pub const Field = Schema.Field;
     pub const View = Schema.View;
-    pub const write = Schema.writeRoot;
+    pub const serialize = Schema.serialize;
     pub const read = Schema.readRoot;
     pub const update = Schema.updateRoot;
+    pub const borrowMutable = Schema.borrowMutable;
     pub const verify = Schema.verifyRoot;
     pub const WriteOptions = runtime.WriteOptions;
-    pub fn Storage(comptime label_capacity: usize, comptime samples_capacity: usize, comptime tags_capacity: struct {
-        count: usize = 0,
-        bytes: usize = 0,
-    }, comptime history_capacity: usize) type {
-        return runtime.Storage(Schema, .{
-            .label = label_capacity,
-            .samples = samples_capacity,
-            .tags = tags_capacity,
-            .history = history_capacity,
-        }, .{});
-    }
-    pub fn mutableSamples(bytes: []u8) runtime.AccessError!Schema.MutableView(.samples) {
-        const table = try runtime.MutableTable.from(bytes, .root);
-        return Schema.borrowMutable(table, .samples);
-    }
-    pub fn mutableTags(bytes: []u8) runtime.AccessError!Schema.MutableView(.tags) {
-        const table = try runtime.MutableTable.from(bytes, .root);
-        return Schema.borrowMutable(table, .tags);
-    }
-    pub fn mutableLocation(bytes: []u8) runtime.AccessError!Schema.MutableView(.location) {
-        const table = try runtime.MutableTable.from(bytes, .root);
-        return Schema.borrowMutable(table, .location);
-    }
-    pub fn mutableHistory(bytes: []u8) runtime.AccessError!Schema.MutableView(.history) {
-        const table = try runtime.MutableTable.from(bytes, .root);
-        return Schema.borrowMutable(table, .history);
-    }
-    pub fn mutableCalibration(bytes: []u8) runtime.AccessError!Schema.MutableView(.calibration) {
-        const table = try runtime.MutableTable.from(bytes, .root);
-        return Schema.borrowMutable(table, .calibration);
-    }
 };
 pub const ReadingMessage = struct {
     current: types.ReadingPayload.Value = .none,
@@ -152,28 +122,12 @@ pub const ReadingMessage = struct {
     pub const Schema = runtime.Schema(@This(), fields);
     pub const Field = Schema.Field;
     pub const View = Schema.View;
-    pub const write = Schema.writeRoot;
+    pub const serialize = Schema.serialize;
     pub const read = Schema.readRoot;
     pub const update = Schema.updateRoot;
+    pub const borrowMutable = Schema.borrowMutable;
     pub const verify = Schema.verifyRoot;
     pub const WriteOptions = runtime.WriteOptions;
-    pub fn Storage(comptime current_capacity: usize, comptime history_capacity: struct {
-        count: usize = 0,
-        bytes: usize = 0,
-    }) type {
-        return runtime.Storage(Schema, .{
-            .current = current_capacity,
-            .history = history_capacity,
-        }, .{});
-    }
-    pub fn mutableCurrent(bytes: []u8) runtime.AccessError!Schema.MutableView(.current) {
-        const table = try runtime.MutableTable.from(bytes, .root);
-        return Schema.borrowMutable(table, .current);
-    }
-    pub fn mutableHistory(bytes: []u8) runtime.AccessError!Schema.MutableView(.history) {
-        const table = try runtime.MutableTable.from(bytes, .root);
-        return Schema.borrowMutable(table, .history);
-    }
 };
 pub const Temperature = struct {
     value: f32 = fields.value.default,
@@ -183,12 +137,10 @@ pub const Temperature = struct {
     pub const Schema = runtime.Schema(@This(), fields);
     pub const Field = Schema.Field;
     pub const View = Schema.View;
-    pub const write = Schema.writeRoot;
+    pub const serialize = Schema.serialize;
     pub const read = Schema.readRoot;
     pub const update = Schema.updateRoot;
+    pub const borrowMutable = Schema.borrowMutable;
     pub const verify = Schema.verifyRoot;
     pub const WriteOptions = runtime.WriteOptions;
-    pub fn Storage() type {
-        return runtime.Storage(Schema, .{}, .{});
-    }
 };
