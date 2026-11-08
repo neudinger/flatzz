@@ -1,4 +1,4 @@
-//! Local checks only: opening one object does not verify its reachable graph.
+//! Checked local buffer access; opening one object does not verify its reachable graph.
 //! Positions are relative to the complete frame, including any size prefix.
 //! Helpers allocate nothing; returned payload slices borrow the supplied bytes.
 const std = @import("std");
@@ -277,11 +277,12 @@ pub fn sequenceAt(
     // Divide before multiplying: counts are untrusted, also on 32-bit targets.
     if (element_count > (bytes.len - payload_start) / element_size)
         return AccessError.OutOfBounds;
-    const payload_end = payload_start + element_count * element_size;
+    const payload_size = element_count * element_size;
+    const payload_end = payload_start + payload_size;
     try checkRange(bytes.len, payload_end, trailer_size);
     try context.checkObject(.{
         .start = sequence_start,
-        .size = wire.sequence_length_size + element_count * element_size + trailer_size,
+        .size = wire.sequence_length_size + payload_size + trailer_size,
     });
     return .{ .payload_start = payload_start, .element_count = element_count };
 }

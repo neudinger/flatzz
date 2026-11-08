@@ -4,6 +4,7 @@ const reading = @import("reading");
 const fixtures = @import("test_array_schema.zig");
 const structs = @import("test_struct_schema.zig");
 
+const buffer_access = runtime.buffer_access;
 const Reading = reading.Reading;
 const Location = reading.Location;
 const testing = std.testing;
@@ -94,7 +95,7 @@ test "struct vector stride and inline arrays work with every frame" {
         // Schema offsets point straight at elements, with no count prefix.
         try testing.expectEqual(
             @as(f64, 1.5),
-            try runtime.read(f64, bytes, packet.matrix.?.struct_start + 8),
+            try buffer_access.readScalar(f64, bytes, packet.matrix.?.struct_start + 8),
         );
         try testing.expectEqual(@as(f64, 3.75), try values.get(2));
     }
@@ -250,7 +251,7 @@ test "struct vectors and arrays reject truncated misaligned and forged views" {
             return error.AcceptedTruncatedArray
         else |_| {}
     }
-    try runtime.write(
+    try buffer_access.writeScalar(
         u32,
         bytes,
         entries.payload_start - runtime.sequence_length_size,

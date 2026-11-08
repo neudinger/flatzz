@@ -1,7 +1,7 @@
 //! Borrowed inline values; nested views retain the complete frame and access.
 //! Go Struct{Bytes, Pos} and C++ GetStruct are the reference access patterns.
 //! https://github.com/google/flatbuffers/blob/b8431fbcd7a5c71817f314e18b332c0648554efa/go/struct.go
-const validation = @import("validation.zig");
+const buffer_access = @import("buffer_access.zig");
 const mutation = @import("mutation.zig");
 const errors = @import("errors.zig");
 const table_view = @import("table_view.zig");
@@ -19,10 +19,7 @@ pub fn StructView(comptime Layout: type, comptime access: Access) type {
         @compileError("StructView requires a struct layout");
     return struct {
         const Self = @This();
-        const Bytes = switch (access) {
-            .read_only => []const u8,
-            .mutable => []u8,
-        };
+        const Bytes = table_view.ByteSlice(access);
 
         /// Complete input frame retained for nested member views.
         bytes: Bytes,
@@ -55,7 +52,11 @@ pub fn StructView(comptime Layout: type, comptime access: Access) type {
             const MemberType = Layout.Member(field);
             const member_start = self.struct_start + MemberType.offset;
             return switch (MemberType.kind) {
-                .scalar => |ScalarType| validation.readScalar(ScalarType, self.bytes, member_start),
+                .scalar => |ScalarType| buffer_access.readScalar(
+                    ScalarType,
+                    self.bytes,
+                    member_start,
+                ),
                 .structure => |ChildLayout| StructView(
                     ChildLayout,
                     access,
@@ -90,7 +91,7 @@ pub fn StructView(comptime Layout: type, comptime access: Access) type {
             const MemberType = Layout.Member(field);
             const member_start = self.struct_start + MemberType.offset;
             switch (MemberType.kind) {
-                .scalar => |ScalarType| try validation.writeScalar(
+                .scalar => |ScalarType| try buffer_access.writeScalar(
                     ScalarType,
                     self.bytes,
                     member_start,
@@ -115,7 +116,7 @@ pub fn StructView(comptime Layout: type, comptime access: Access) type {
         }
 
         fn checkRange(self: Self) AccessError!void {
-            try validation.inlineRange(
+            try buffer_access.inlineRange(
                 self.bytes,
                 self.struct_start,
                 Layout.wire_size,
@@ -138,10 +139,7 @@ pub fn ArrayView(comptime Layout: type, comptime access: Access) type {
     return struct {
         const Self = @This();
         const Element = Layout.Element;
-        const Bytes = switch (access) {
-            .read_only => []const u8,
-            .mutable => []u8,
-        };
+        const Bytes = table_view.ByteSlice(access);
         /// Fixed schema count; no prefix is read from the frame.
         pub const element_count = Layout.element_count;
         /// Copied scalar or borrowed struct result, retaining this view's capability.
@@ -158,7 +156,12 @@ pub fn ArrayView(comptime Layout: type, comptime access: Access) type {
 
         /// Borrow an inline array after checking its complete wire extent and alignment.
         pub fn from(bytes: Bytes, array_start: usize) AccessError!Self {
-            try validation.inlineRange(bytes, array_start, Layout.wire_size, Layout.wire_alignment);
+            try buffer_access.inlineRange(
+                bytes,
+                array_start,
+                Layout.wire_size,
+                Layout.wire_alignment,
+            );
             return .{ .bytes = bytes, .array_start = array_start };
         }
 
@@ -169,7 +172,7 @@ pub fn ArrayView(comptime Layout: type, comptime access: Access) type {
         ) AccessError!ElementView {
             const element_start = try self.elementStart(element_index);
             return switch (Element.kind) {
-                .scalar => |ScalarType| validation.readScalar(
+                .scalar => |ScalarType| buffer_access.readScalar(
                     ScalarType,
                     self.bytes,
                     element_start,
@@ -213,7 +216,7 @@ pub fn ArrayView(comptime Layout: type, comptime access: Access) type {
             element_index: usize,
         ) AccessError!usize {
             // Check the complete inline extent before multiplying an index.
-            try validation.inlineRange(
+            try buffer_access.inlineRange(
                 self.bytes,
                 self.array_start,
                 Layout.wire_size,

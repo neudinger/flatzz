@@ -1,6 +1,7 @@
 const std = @import("std");
 const runtime = @import("runtime");
 
+const buffer_access = runtime.buffer_access;
 const testing = std.testing;
 
 const prefixed_wire_cases = .{
@@ -148,7 +149,7 @@ test "identified frames preserve wide scalar alignment access and mutation" {
     );
     try testing.expect(try mutable.mutateField(u64, 0, number + 1));
     try testing.expectEqual(number + 1, try table.readField(u64, 0, 0));
-    try runtime.validation.checkIdentifier(bytes, "READ".*);
+    try runtime.buffer_access.checkIdentifier(bytes, "READ".*);
 }
 
 test "identifier capacity failure preserves storage and permits ordinary retry" {
@@ -205,7 +206,7 @@ test "size-prefixed roots match independent wire layouts" {
         try testing.expectEqual(bytes.len, table.bytes.len);
         try testing.expectEqual(
             bytes.len - runtime.wire.size_prefix_size,
-            try runtime.read(u32, bytes, 0),
+            try buffer_access.readScalar(u32, bytes, 0),
         );
     }
 }
@@ -221,12 +222,12 @@ test "prefixed parsing rejects truncations bad lengths and wrong identifiers" {
         );
     }
     var malformed = prefixed_empty;
-    try runtime.write(u32, &malformed, 0, std.math.maxInt(u32));
+    try buffer_access.writeScalar(u32, &malformed, 0, std.math.maxInt(u32));
     try testing.expectError(
         error.OutOfBounds,
         runtime.Table.from(&malformed, source),
     );
-    try runtime.write(u32, &malformed, 0, 0);
+    try buffer_access.writeScalar(u32, &malformed, 0, 0);
     try testing.expectError(
         error.OutOfBounds,
         runtime.Table.from(&malformed, .{ .options = .{
@@ -269,7 +270,7 @@ test "prefixed streams consume one frame and reject references into the next" {
     // A valid empty table in the next message is outside the first frame.
     const root_offset_start = runtime.wire.size_prefix_size;
     const foreign_table = prefixed_empty.len + second.layout.table_start;
-    try runtime.write(
+    try buffer_access.writeScalar(
         u32,
         &messages,
         root_offset_start,
@@ -350,6 +351,8 @@ test "prefixed child access preserves alignment bounds and headers" {
     const samples = (try child.readVector(runtime.ScalarCodec(u64), 2)).?;
     try testing.expectEqual(@as(u64, 20), try samples.get(1));
     try runtime.Verifier.verify(Root, bytes, .{ .frame = options });
+    try Root.Schema.verify(table, .{});
+    try Child.Schema.verify(child, .{ .max_depth = 1 });
     var stream_storage: [512]u8 = undefined;
     const stream = stream_storage[0 .. bytes.len * 2];
     @memcpy(stream[0..bytes.len], bytes);
@@ -357,10 +360,14 @@ test "prefixed child access preserves alignment bounds and headers" {
     var stream_options = options;
     stream_options.boundary = .first;
     try runtime.Verifier.verify(Root, stream, .{ .frame = stream_options });
+    const first_frame = try runtime.Table.from(stream, .{ .options = stream_options });
+    try Root.Schema.verify(first_frame, .{});
+    const first_child = (try first_frame.readTable(0)).?;
+    try Child.Schema.verify(first_child, .{});
     const reference_start = (try child.fieldPosition(u32, 2)).?;
     // Point into an otherwise valid vector in the following frame.
     const foreign_sequence = bytes.len + samples.payload_start - runtime.sequence_length_size;
-    try runtime.write(
+    try buffer_access.writeScalar(
         u32,
         stream,
         reference_start,
@@ -370,6 +377,8 @@ test "prefixed child access preserves alignment bounds and headers" {
         error.OutOfBounds,
         runtime.Verifier.verify(Root, stream, .{ .frame = stream_options }),
     );
+    try testing.expectError(error.OutOfBounds, Root.Schema.verify(first_frame, .{}));
+    try testing.expectError(error.OutOfBounds, Child.Schema.verify(first_child, .{}));
     const mutable = try runtime.MutableTable.from(
         bytes,
         .{ .options = options },
@@ -382,7 +391,7 @@ test "prefixed child access preserves alignment bounds and headers" {
     );
     try runtime.Verifier.verify(Root, bytes, .{ .frame = options });
     const marker_start = runtime.wire.size_prefix_size + runtime.wire.file_identifier_start;
-    try runtime.write(
+    try buffer_access.writeScalar(
         i32,
         bytes,
         child.layout.table_start,
@@ -394,6 +403,7 @@ test "prefixed child access preserves alignment bounds and headers" {
         error.InvalidBuffer,
         runtime.Verifier.verify(Root, bytes, .{ .frame = options }),
     );
+    try testing.expectError(error.InvalidBuffer, Root.Schema.verify(table, .{}));
 }
 
 test "prefixed finish capacity failure is atomic and permits ordinary retry" {

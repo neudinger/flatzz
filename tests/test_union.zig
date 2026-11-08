@@ -2,6 +2,7 @@ const std = @import("std");
 const runtime = @import("runtime");
 const fixtures = @import("test_union_schema.zig");
 
+const buffer_access = runtime.buffer_access;
 const testing = std.testing;
 const Storage = [fixtures.storage_capacity]u8;
 
@@ -215,6 +216,37 @@ test "schema addFields rejects invalid union handles before adding fields" {
     try runtime.Verifier.verify(OptionalPacket, bytes, .{});
 }
 
+test "invalid union handles precede later missing required fields without writes" {
+    const Required = runtime.Schema(struct {
+        current: fixtures.Payload.Value = .none,
+        label: ?[]const u8 = null,
+    }, .{
+        .current = runtime.UnionField(
+            fixtures.Payload,
+            .{ .tag = 0, .value = 1 },
+            .{ .required = true },
+        ),
+        .label = runtime.ReferenceField(2, .string, .{ .required = true }),
+    });
+    var storage: Storage align(runtime.storage_alignment) = @splat(0xa5);
+    var builder = runtime.Builder.init(&storage);
+    const text = try builder.createString("");
+    var context = try Required.Context.init(&builder);
+    const invalid: runtime.Builder.Offset = @fromBackingInt(@as(u32, 0));
+    const before_storage = storage;
+    const before_builder = builder;
+    const before_context = context;
+    try testing.expectError(error.InvalidOffset, Required.addFields(&context, .{
+        .current = .{ .text = invalid },
+    }));
+    try testing.expectEqualSlices(u8, &before_storage, &storage);
+    try testing.expectEqualDeep(before_builder, builder);
+    try testing.expectEqualDeep(before_context, context);
+    try Required.addFields(&context, .{ .current = .{ .text = text }, .label = text });
+    const bytes = try builder.finish(try Required.endTable(&context), .ordinary);
+    try Required.verify(bytes, .{});
+}
+
 test "unknown union alternatives fail explicitly until metadata adds the tag" {
     const FuturePayload = runtime.Union(enum(u8) { none, text = 250 }, .{
         .none = .none,
@@ -254,7 +286,7 @@ test "union vector malformed tags nulls and bounds are checked locally" {
         const vector = (try table.readUnionVector(fixtures.Payload, .{ .tag = 2, .value = 3 })).?;
         switch (damage) {
             .unknown => bytes[vector.tags_start] = 250,
-            .missing => try runtime.write(u32, bytes, vector.values_start, 0),
+            .missing => try buffer_access.writeScalar(u32, bytes, vector.values_start, 0),
             .unexpected => bytes[vector.tags_start] = 0,
         }
         const expected = if (damage == .unknown) error.UnknownUnionTag else error.InvalidUnion;
@@ -286,7 +318,7 @@ test "union vector payloads cannot overlap either metadata array" {
     const bytes = try builder.finish(try OptionalPacket.Schema.endTable(&context), .ordinary);
     const table = try runtime.Table.from(bytes, .root);
     const vector = (try table.readUnionVector(fixtures.Payload, .{ .tag = 2, .value = 3 })).?;
-    try runtime.write(
+    try buffer_access.writeScalar(
         u32,
         bytes,
         vector.values_start,
@@ -299,7 +331,7 @@ test "union vector payloads cannot overlap either metadata array" {
     );
     // The two vectors themselves must not overlap, except shared empty vectors.
     const value_slot = (try table.fieldPosition(u32, 3)).?;
-    try runtime.write(
+    try buffer_access.writeScalar(
         u32,
         bytes,
         value_slot,
@@ -528,7 +560,7 @@ test "standalone union structs decode members and charge work before scanning" {
     const view = (try Packet.Schema.read(table)).current.closed;
     try testing.expectEqual(.ready, try view.get(.state));
     const reference = (try table.fieldPosition(u32, 1)).?;
-    const target = reference + try runtime.read(u32, bytes, reference);
+    const target = reference + try buffer_access.readScalar(u32, bytes, reference);
     bytes[target] = 250;
     const table_work = table.layout.table_size + table.layout.vtable_size +
         Packet.Schema.field_count;

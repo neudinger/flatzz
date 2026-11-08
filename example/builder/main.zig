@@ -8,7 +8,6 @@ const reading = @import("reading");
 
 // flatzz runtime module
 const Builder = runtime.Builder;
-const Verifier = runtime.Verifier;
 const Table = runtime.Table;
 const MutableTable = runtime.MutableTable;
 
@@ -59,22 +58,25 @@ pub fn main(init: std.process.Init) !void {
     const before = try Reading.read(bytes);
     // read() copies the native value; the borrowed view would observe updates.
     const location_before = try (before.location orelse @panic("No location available")).read();
+    // Byte inputs open the root internally.
     if (!try Reading.update(bytes, .sequence, 42)) return error.MissingField;
     if (!try Reading.update(bytes, .value, 1.5)) return error.MissingField;
     if (!try Reading.update(bytes, .label, "ready")) return error.MissingField;
     if (!try Reading.update(bytes, .active, true)) return error.MissingField;
-    if (!try Reading.update(bytes, .status, .ok)) return error.MissingField;
-    if (!try Reading.update(bytes, .samples, &.{ 1.5, 2.5, 3.5 })) return error.MissingField;
-    if (!try Reading.update(bytes, .temperature, 25.5)) return error.MissingField;
-    if (!try Reading.update(bytes, .tags, &.{ "out", "old" })) return error.MissingField;
+    // Reuse a checked table for the remaining updates and borrowed views.
+    const table = try MutableTable.from(bytes, .root);
+    if (!try Reading.update(table, .status, .ok)) return error.MissingField;
+    if (!try Reading.update(table, .samples, &.{ 1.5, 2.5, 3.5 })) return error.MissingField;
+    if (!try Reading.update(table, .temperature, 25.5)) return error.MissingField;
+    if (!try Reading.update(table, .tags, &.{ "out", "old" })) return error.MissingField;
     // Whole inline struct replacement through the generated-style schema API.
-    if (!try Reading.update(bytes, .location, .{
+    if (!try Reading.update(table, .location, .{
         .coordinates = .{ .latitude = 49, .longitude = 3 },
         .altitude = 40,
     })) return error.MissingField;
-    // Borrow nested struct members without allocating or copying the buffer.
-    const table = try MutableTable.from(bytes, .root);
-    const location_view = try Reading.borrowMutable(table, .location) orelse
+    // Borrow a nested struct directly from bytes without allocation or copying.
+    // The vector and array borrows below reuse the checked table.
+    const location_view = try Reading.borrowMutable(bytes, .location) orelse
         return error.MissingField;
     const coordinates_view = try location_view.get(.coordinates);
     try coordinates_view.update(.latitude, 49.5);
@@ -174,16 +176,15 @@ fn showUnions(writer: *std.Io.Writer) !void {
     });
     const root = try ReadingMessage.Schema.endTable(&context);
     const bytes = try builder.finish(root, .ordinary);
-    try Verifier.verify(ReadingMessage, bytes, .{});
-    const message = try ReadingMessage.Schema.read(try Table.from(bytes, .root));
+    // Reuse checked root metadata for verification and reading.
+    const message_table = try Table.from(bytes, .root);
+    try ReadingMessage.verify(message_table, .{});
+    const message = try ReadingMessage.read(message_table);
     // Mutate an existing payload; replacing the alternative requires rebuilding.
     const mutable = try MutableTable.from(bytes, .root);
-    const current = try mutable.readUnion(
-        ReadingPayload,
-        ReadingMessage.Schema.fields.current.field_ids,
-    );
-    if (!try Temperature.Schema.update(current.temperature, .value, 26)) return error.MissingField;
-    try Verifier.verify(ReadingMessage, bytes, .{});
+    const current = try ReadingMessage.borrowMutable(mutable, .current);
+    if (!try Temperature.update(current.temperature, .value, 26)) return error.MissingField;
+    try ReadingMessage.verify(bytes, .{});
     const history = message.history.?;
     for (0..history.element_count) |element_index| {
         const payload = try history.get(element_index);
@@ -191,7 +192,7 @@ fn showUnions(writer: *std.Io.Writer) !void {
         switch (payload) {
             .none => try writer.writeAll("no value\n"),
             .temperature => |table| try writer.print("{d}\n", .{
-                (try Temperature.Schema.read(table)).value,
+                (try Temperature.read(table)).value,
             }),
             .location, .previous => |structure| try writer.print(
                 "altitude={d}\n",

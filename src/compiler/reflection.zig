@@ -76,6 +76,43 @@ pub const BaseType = enum(i8) {
     /// Upstream sentinel after the known type codes; not a field value type.
     MaxBaseType = 19,
     _,
+
+    /// Whether this code represents a scalar, including union discriminators and booleans.
+    pub fn isScalar(base: BaseType) bool {
+        return switch (base) {
+            .UType,
+            .Bool,
+            .Byte,
+            .UByte,
+            .Short,
+            .UShort,
+            .Int,
+            .UInt,
+            .Long,
+            .ULong,
+            .Float,
+            .Double,
+            => true,
+            else => false,
+        };
+    }
+    /// Whether scalar integer values use unsigned bits; booleans and union tags do.
+    pub fn isUnsigned(base: BaseType) bool {
+        return switch (base) {
+            .UType, .Bool, .UByte, .UShort, .UInt, .ULong => true,
+            else => false,
+        };
+    }
+    /// Reflection width: None occupies one byte, Vector64 eight; other non-scalars
+    /// and unknown codes retain the four-byte fallback.
+    pub fn byteSize(base: BaseType) u32 {
+        return switch (base) {
+            .None, .UType, .Bool, .Byte, .UByte => 1,
+            .Short, .UShort => 2,
+            .Long, .ULong, .Double, .Vector64 => 8,
+            else => 4,
+        };
+    }
 };
 
 // Bit positions correspond to masks 1, 2, 4, and 8.

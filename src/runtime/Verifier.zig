@@ -6,7 +6,7 @@
 //! C++ Verifier and flatcc generated traversal supply the architectural model.
 //! https://github.com/google/flatbuffers/blob/b8431fbcd7a5c71817f314e18b332c0648554efa/include/flatbuffers/verifier.h
 const wire = @import("wire.zig");
-const validation = @import("validation.zig");
+const buffer_access = @import("buffer_access.zig");
 const sequence = @import("sequence.zig");
 const framing = @import("framing.zig");
 const unions = @import("unions.zig");
@@ -19,9 +19,10 @@ const Self = @This();
 
 /// Framing and traversal budgets, checked before recursive work or scans.
 pub const Options = struct {
-    /// Root framing only; .first bounds traversal and retains one complete frame.
+    /// Byte-input roots and stateful verifyRoot only; .first bounds one complete frame.
+    /// Checked Table inputs retain the framing selected when they were opened.
     frame: framing.Options = .{},
-    /// Limit recursive table traversal before entering the next table; zero rejects the root.
+    /// Limit active table depth; zero rejects the starting table, including nested inputs.
     max_depth: usize = 64,
     /// Tables, vectors and strings each consume one visit, including sharing.
     max_objects: usize = 1_000_000,
@@ -41,23 +42,31 @@ object_count: usize = 0,
 /// Work budget already consumed; maintained at or below `options.max_work`.
 work_count: usize = 0,
 
-/// Borrow bytes and start with empty counters; validation begins at `verifyRoot`.
+/// Borrow bytes and start with empty counters; traverse with verifyRoot or verifyTable.
 /// No allocation or deinit is required. Bytes must remain valid and unchanged.
 pub fn init(bytes: []const u8, options: Options) Self {
     return .{ .bytes = bytes, .options = options };
 }
 
+/// Verify a root from bytes or the reachable graph of a checked Table with fresh counters.
+/// Byte inputs use options.frame; Table inputs retain their complete selected frame
+/// and reuse local metadata without revalidation. Nested tables start at depth zero
+/// and do not verify their parents. No allocation or deinit is required.
 /// Success describes the known schema at this instant. Storage reuse or edits
 /// through any alias invalidate it; checked access remains the public API.
 /// SchemaType must expose `Schema.verifyFields`; malformed data, missing required
 /// fields, and configured depth/object/work limits return the corresponding error.
 pub fn verify(
     comptime SchemaType: type,
-    bytes: []const u8,
+    source: anytype,
     options: Options,
 ) VerifyError!void {
-    var verifier = init(bytes, options);
-    try verifier.verifyRoot(SchemaType);
+    const table: Table = if (@TypeOf(source) == Table)
+        source
+    else
+        try Table.from(source, .{ .options = options.frame });
+    var verifier = init(table.bytes, options);
+    try verifier.verifyTable(SchemaType, table);
 }
 
 /// Parse the selected frame and traverse its root using the existing counters.
@@ -108,11 +117,11 @@ pub fn verifyTable(
 
 fn verifyString(
     self: *Self,
-    context: validation.Context,
+    context: buffer_access.Context,
     reference_start: usize,
 ) VerifyError!void {
     try self.visitObject();
-    const layout = try validation.sequenceAt(
+    const layout = try buffer_access.sequenceAt(
         @sizeOf(u8),
         @sizeOf(u8),
         wire.string_terminator_size,
@@ -122,7 +131,7 @@ fn verifyString(
     );
     const string_size = layout.element_count + wire.string_terminator_size;
     try self.charge(wire.sequence_length_size + string_size);
-    _ = try validation.stringPayload(self.bytes[layout.payload_start..][0..string_size]);
+    _ = try buffer_access.stringPayload(self.bytes[layout.payload_start..][0..string_size]);
 }
 
 fn verifyUnion(
@@ -137,7 +146,7 @@ fn verifyUnion(
             .none => unreachable,
             .table => |Child| try self.verifyTable(Child, .{
                 .bytes = self.bytes,
-                .layout = try validation.referencedTable(
+                .layout = try buffer_access.referencedTable(
                     self.bytes,
                     location.context,
                     location.reference_start.?,
@@ -211,7 +220,7 @@ pub fn verifyField(
                 .table => |ChildSchema| {
                     const child: Table = .{
                         .bytes = self.bytes,
-                        .layout = try validation.referencedTable(
+                        .layout = try buffer_access.referencedTable(
                             self.bytes,
                             table.context(),
                             field_start,
@@ -229,7 +238,6 @@ pub fn verifyField(
                         wire.sequence_length_size + vector.element_count * ElementCodec.slot_size,
                     );
                     for (0..vector.element_count) |element_index| {
-                        const element_start = try vector.elementStart(element_index);
                         switch (ElementCodec.kind) {
                             .scalar => _ = try vector.get(element_index),
                             .structure => {
@@ -241,7 +249,7 @@ pub fn verifyField(
                             },
                             .string => try self.verifyString(
                                 vector.elementContext(),
-                                element_start,
+                                try vector.elementStart(element_index),
                             ),
                             .table => try self.verifyTable(
                                 ElementCodec.Schema,

@@ -19,12 +19,14 @@ const collision_schemas = [_][]const u8{
     "table Reading { Field:int; }",
     "table Reading { View:int; }",
     "table Reading { serialize:int; }",
+    "table Reading { serializeAlloc:int; }",
     "table Reading { read:int; }",
     "table Reading { update:int; }",
     "table Reading { verify:int; }",
     "struct Location { Field:int; }",
     "struct Location { View:int; }",
     "struct Location { serialize:int; }",
+    "struct Location { serializeAlloc:int; }",
     "struct Location { read:int; }",
     "struct Location { update:int; }",
     "struct Location { verify:int; }",
@@ -37,6 +39,9 @@ test "fresh Reading output builds verifies reads and mutates using only flatzz" 
     const Reading = generated.Reading;
     try std.testing.expect(!@hasDecl(Reading, "write"));
     try std.testing.expect(!@hasDecl(Reading.Schema, "writeRoot"));
+    try std.testing.expect(!@hasDecl(Reading.Schema, "updateRoot"));
+    try std.testing.expect(!@hasDecl(Reading.Schema, "readRoot"));
+    try std.testing.expect(!@hasDecl(Reading.Schema, "verifyRoot"));
     try std.testing.expect(!@hasDecl(Reading, "Storage"));
     try std.testing.expect(!@hasDecl(generated.ReadingMessage, "Storage"));
     try std.testing.expect(!@hasDecl(generated.Temperature, "Storage"));
@@ -68,23 +73,33 @@ test "fresh Reading output builds verifies reads and mutates using only flatzz" 
     try writer.writeAll(bytes);
     try std.testing.expectEqualSlices(u8, bytes, writer.buffered());
     try Reading.verify(bytes, .{});
-    const view = try Reading.read(bytes);
+    const checked = try flatzz.Table.from(bytes, .root);
+    try Reading.verify(checked, .{});
+    const view = try Reading.read(checked);
     try std.testing.expectEqual(@as(u8, 1), @backingInt(view.status));
     try std.testing.expectEqual(@as(?f32, 0), view.temperature);
     try std.testing.expectEqual(@as(f32, 3), (try view.calibration.?.read()).gains[2]);
-    try std.testing.expect(try Reading.update(bytes, .sequence, 42));
     const table = try flatzz.MutableTable.from(bytes, .root);
-    const samples = (try Reading.borrowMutable(table, .samples)).?;
+    try std.testing.expect(try Reading.update(bytes, .sequence, 42));
+    const samples = (try Reading.borrowMutable(bytes, .samples)).?;
     const tags = (try Reading.borrowMutable(table, .tags)).?;
     try std.testing.expectEqual(@as(f32, 2), try samples.get(1));
     try std.testing.expectEqualStrings("cd", try tags.get(1));
     const calibration = (try Reading.borrowMutable(table, .calibration)).?;
     try (try calibration.get(.gains)).update(2, 4);
     try std.testing.expectEqual(@as(f32, 4), (try view.calibration.?.read()).gains[2]);
-    try (try Reading.borrowMutable(table, .location)).?.update(.altitude, 9);
+    try (try Reading.borrowMutable(bytes, .location)).?.update(.altitude, 9);
     try std.testing.expectEqual(
         @as(f32, 9),
         (try (try Reading.read(bytes)).location.?.read()).altitude,
+    );
+    var copied: [storage.buffer.len]u8 = @splat(0);
+    @memcpy(copied[0..bytes.len], bytes);
+    const copied_location = (try Reading.borrowMutable(&copied, .location)).?;
+    try copied_location.update(.altitude, 11);
+    try std.testing.expectEqual(
+        @as(f32, 11),
+        (try (try Reading.read(&copied)).location.?.read()).altitude,
     );
     try (try (try Reading.borrowMutable(table, .history)).?.get(0)).update(.altitude, 8);
     try std.testing.expectEqual(
@@ -94,7 +109,7 @@ test "fresh Reading output builds verifies reads and mutates using only flatzz" 
     try Reading.verify(bytes, .{});
 }
 
-test "serialize is generated for every native table schema" {
+test "serialization is generated for every native table schema" {
     inline for (.{
         generated.Reading, generated.Temperature,    cases.NativePacket,
         cases.Empty,       generated.ReadingMessage, cases.Node,
@@ -103,6 +118,7 @@ test "serialize is generated for every native table schema" {
         cases.UnionNode,
     }) |Native| {
         try std.testing.expect(@hasDecl(Native, "serialize"));
+        try std.testing.expect(@hasDecl(Native, "serializeAlloc"));
         try std.testing.expect(@hasDecl(Native, "read"));
         try std.testing.expect(@hasDecl(Native, "update"));
         try std.testing.expect(@hasDecl(Native, "borrowMutable"));
@@ -116,9 +132,15 @@ test "serialize is generated for every native table schema" {
     var storage: [128]u8 align(flatzz.storage_alignment) = undefined;
     const value: cases.NativePacket = .{ .value = 42 };
     const bytes = try value.serialize(&storage, .{});
+    const owned = try value.serializeAlloc(std.testing.allocator, .{});
+    defer owned.deinit(std.testing.allocator);
+    try std.testing.expectEqualSlices(u8, bytes, owned.bytes);
     try cases.NativePacket.verify(bytes, .{});
     try std.testing.expectEqual(@as(i32, 42), (try cases.NativePacket.read(bytes)).value);
     const empty: cases.Empty = .{};
+    const empty_owned = try empty.serializeAlloc(std.testing.allocator, .{});
+    defer empty_owned.deinit(std.testing.allocator);
+    try cases.Empty.verify(empty_owned.bytes, .{});
     try cases.Empty.verify(try empty.serialize(&storage, .{}), .{});
 }
 
@@ -137,15 +159,18 @@ test "generated native child tables and table vectors serialize recursively" {
     };
     var storage: [4096]u8 align(flatzz.storage_alignment) = undefined;
     const bytes = try value.serialize(&storage, .{});
+    const owned = try value.serializeAlloc(std.testing.allocator, .{});
+    defer owned.deinit(std.testing.allocator);
+    try std.testing.expectEqualSlices(u8, bytes, owned.bytes);
     try cases.Packet.verify(bytes, .{});
     const view = try cases.Packet.read(bytes);
-    try std.testing.expectEqualStrings("branch", (try cases.Node.Schema.read(view.child.?)).name.?);
-    const nested = (try cases.Node.Schema.read(view.child.?)).next.?;
-    try std.testing.expectEqualStrings("leaf", (try cases.Node.Schema.read(nested)).name.?);
+    try std.testing.expectEqualStrings("branch", (try cases.Node.read(view.child.?)).name.?);
+    const nested = (try cases.Node.read(view.child.?)).next.?;
+    try std.testing.expectEqualStrings("leaf", (try cases.Node.read(nested)).name.?);
     try std.testing.expectEqual(@as(usize, 2), view.nodes.?.element_count);
     try std.testing.expectEqualStrings(
         "branch",
-        (try cases.Node.Schema.read(try view.nodes.?.get(1))).name.?,
+        (try cases.Node.read(try view.nodes.?.get(1))).name.?,
     );
     try std.testing.expectEqual(cases.Signed.high, try view.statuses.?.get(1));
     try std.testing.expectEqual(cases.Wide.max, (try view.block.?.read()).values[1]);
@@ -171,11 +196,14 @@ test "generated native union payloads and recursive union graphs serialize" {
     };
     var storage: [2048]u8 align(flatzz.storage_alignment) = undefined;
     const bytes = try value.serialize(&storage, .{});
+    const owned = try value.serializeAlloc(std.testing.allocator, .{});
+    defer owned.deinit(std.testing.allocator);
+    try std.testing.expectEqualSlices(u8, bytes, owned.bytes);
     try generated.ReadingMessage.verify(bytes, .{});
     const view = try generated.ReadingMessage.read(bytes);
     try std.testing.expectEqual(
         temperature.value,
-        (try generated.Temperature.Schema.read(view.current.temperature)).value,
+        (try generated.Temperature.read(view.current.temperature)).value,
     );
     try std.testing.expectEqual(@as(usize, 4), view.history.?.element_count);
     try std.testing.expect(try view.history.?.get(0) == .none);
@@ -186,6 +214,9 @@ test "generated native union payloads and recursive union graphs serialize" {
     const branch: cases.UnionNode = .{ .next = .{ .union_node = &leaf } };
     const root: cases.UnionNode = .{ .next = .{ .union_node = &branch } };
     const recursive = try root.serialize(&storage, .{});
+    const recursive_owned = try root.serializeAlloc(std.testing.allocator, .{});
+    defer recursive_owned.deinit(std.testing.allocator);
+    try std.testing.expectEqualSlices(u8, recursive, recursive_owned.bytes);
     try cases.UnionNode.verify(recursive, .{});
     const first = (try cases.UnionNode.read(recursive)).next.union_node;
     const second = (try cases.UnionNode.Schema.read(first)).next.union_node;
@@ -219,17 +250,18 @@ test "fresh union output uses paired IDs and struct string table payloads" {
     const message = try ReadingMessage.read(bytes);
     try std.testing.expectEqual(
         @as(f32, 25),
-        (try Temperature.Schema.read(message.current.temperature)).value,
+        (try Temperature.read(message.current.temperature)).value,
     );
     try std.testing.expectEqualStrings("text", (try message.history.?.get(2)).text);
     const table = try flatzz.MutableTable.from(bytes, .root);
     const current = try ReadingMessage.borrowMutable(table, .current);
-    try std.testing.expect(try Temperature.Schema.update(current.temperature, .value, 26));
+    try Temperature.verify(message.current.temperature, .{});
+    try std.testing.expect(try Temperature.update(current.temperature, .value, 26));
     const history = (try ReadingMessage.borrowMutable(table, .history)).?;
     try (try history.get(1)).location.update(.altitude, 4);
     try std.testing.expectEqual(
         @as(f32, 26),
-        (try Temperature.Schema.read(message.current.temperature)).value,
+        (try Temperature.read(message.current.temperature)).value,
     );
     const location = (try message.history.?.get(1)).location;
     try std.testing.expectEqual(@as(f32, 4), try location.get(.altitude));
@@ -259,6 +291,46 @@ test "unsupported wire features and invalid references produce no source" {
         else
             error.InvalidSchema;
         try std.testing.expectError(expected, codegen.generate(std.testing.allocator, schema));
+    }
+}
+
+test "union metadata rejects missing malformed and unsupported payloads before emission" {
+    const tag_type: reflection.Type = .{ .base_type = .UType };
+    const none_type: reflection.Type = .{ .base_type = .None };
+    const scalar_type: reflection.Type = .{ .base_type = .Int };
+    const object_type: reflection.Type = .{ .base_type = .Obj, .index = 0 };
+    const invalid = [_]struct {
+        alternative: reflection.EnumVal,
+        failure: anyerror,
+    }{
+        .{ .alternative = .{ .name = "NONE" }, .failure = error.InvalidSchema },
+        .{
+            .alternative = .{ .name = "NONE", .value = 1, .union_type = &none_type },
+            .failure = error.InvalidSchema,
+        },
+        .{
+            .alternative = .{ .name = "Absent", .union_type = &none_type },
+            .failure = error.InvalidSchema,
+        },
+        .{
+            .alternative = .{ .name = "Number", .value = 1, .union_type = &scalar_type },
+            .failure = error.UnsupportedFeature,
+        },
+        .{
+            .alternative = .{ .name = "Child", .value = 1, .union_type = &object_type },
+            .failure = error.InvalidSchema,
+        },
+    };
+    for (invalid) |item| {
+        try std.testing.expectError(item.failure, codegen.generate(std.testing.allocator, .{
+            .objects = &.{},
+            .enums = &.{.{
+                .name = "Payload",
+                .is_union = true,
+                .underlying_type = &tag_type,
+                .values = &.{item.alternative},
+            }},
+        }));
     }
 }
 
@@ -314,10 +386,21 @@ test "generated recursive references required fields enum vectors and struct arr
         .{ .identifier = cases.file_identifier.* },
     );
     try cases.Packet.verify(bytes, .{ .frame = .{ .identifier = cases.file_identifier.* } });
-    const view = try cases.Packet.read(bytes);
-    try std.testing.expectEqualStrings("child", (try cases.Node.Schema.read(view.child.?)).name.?);
+    const view = try cases.Packet.read(try flatzz.Table.from(bytes, .{ .options = .{
+        .identifier = cases.file_identifier.*,
+    } }));
+    try std.testing.expectEqualStrings("child", (try cases.Node.read(view.child.?)).name.?);
     try std.testing.expectEqual(cases.Signed.high, try view.statuses.?.get(1));
     try std.testing.expectEqual(cases.Wide.max, (try view.block.?.read()).values[1]);
+    const table = try flatzz.MutableTable.from(bytes, .{ .options = .{
+        .identifier = cases.file_identifier.*,
+    } });
+    try std.testing.expect(try cases.Packet.update(table, .required_text, "modified"));
+    const mutable_child = (try cases.Packet.borrowMutable(table, .child)).?;
+    try std.testing.expect(try cases.Node.update(mutable_child, .name, "after"));
+    try std.testing.expectEqualStrings("modified", (try cases.Packet.read(bytes)).required_text.?);
+    try std.testing.expectEqualStrings("after", (try cases.Node.read(view.child.?)).name.?);
+    try cases.Packet.verify(bytes, .{ .frame = .{ .identifier = cases.file_identifier.* } });
     builder = flatzz.Builder.init(&storage);
     var missing = try cases.Node.Schema.Context.init(&builder);
     try std.testing.expectError(

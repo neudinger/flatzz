@@ -1,6 +1,6 @@
 //! Frame positions retain the prefix: alignment is relative to slice index zero.
 const wire = @import("wire.zig");
-const validation = @import("validation.zig");
+const buffer_access = @import("buffer_access.zig");
 const errors = @import("errors.zig");
 
 const AccessError = errors.AccessError;
@@ -47,24 +47,25 @@ pub const Layout = struct {
 /// No allocation or copying occurs; the returned record contains only positions.
 pub fn parse(bytes: []const u8, options: Options) AccessError!Layout {
     var layout: Layout = .{ .frame_size = bytes.len };
-    switch (options.format) {
-        .ordinary => {},
-        .size_prefixed => {
-            const declared_size: usize = try validation.readScalar(u32, bytes, 0);
-            // Subtraction-based range checking proves the addition cannot wrap.
-            try validation.checkRange(bytes.len, wire.size_prefix_size, declared_size);
-            layout.frame_size = wire.size_prefix_size + declared_size;
-            layout.root_offset_start = wire.size_prefix_size;
-            layout.header_size += wire.size_prefix_size;
-            if (options.boundary == .exact and layout.frame_size != bytes.len)
-                return AccessError.InvalidBuffer;
-        },
+    if (options.format == .size_prefixed) {
+        const declared_size: usize = try buffer_access.readScalar(u32, bytes, 0);
+        // Subtraction-based range checking proves the addition cannot wrap.
+        try buffer_access.checkRange(bytes.len, wire.size_prefix_size, declared_size);
+        layout.frame_size = wire.size_prefix_size + declared_size;
+        layout.root_offset_start = wire.size_prefix_size;
+        layout.header_size += wire.size_prefix_size;
+        if (options.boundary == .exact and layout.frame_size != bytes.len)
+            return AccessError.InvalidBuffer;
     }
-    try validation.checkRange(layout.frame_size, layout.root_offset_start, wire.root_offset_size);
+    try buffer_access.checkRange(
+        layout.frame_size,
+        layout.root_offset_start,
+        wire.root_offset_size,
+    );
     if (options.identifier) |identifier| {
         // Identifier lookup has no alignment checks; object access retains
         // the full frame instead of rebasing its positions onto this subslice.
-        try validation.checkIdentifier(
+        try buffer_access.checkIdentifier(
             bytes[layout.root_offset_start..layout.frame_size],
             identifier,
         );

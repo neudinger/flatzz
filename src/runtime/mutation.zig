@@ -3,7 +3,7 @@
 //! The caller retains the complete mutable frame and checks schema presence/counts.
 const std = @import("std");
 const wire = @import("wire.zig");
-const validation = @import("validation.zig");
+const buffer_access = @import("buffer_access.zig");
 const sequence = @import("sequence.zig");
 const errors = @import("errors.zig");
 
@@ -22,7 +22,7 @@ pub fn scalar(
         .optional => value orelse return MutationError.CannotClearField,
         else => value,
     };
-    try validation.writeScalar(wire.Scalar(ValueType), bytes, field_start, replacement);
+    try buffer_access.writeScalar(wire.Scalar(ValueType), bytes, field_start, replacement);
 }
 
 /// Preflight the whole inline value before encoding any members or padding.
@@ -33,10 +33,10 @@ pub fn inlineValue(
     value_start: usize,
     value: Layout.Value,
 ) MutationError!void {
-    try validation.inlineRange(bytes, value_start, Layout.wire_size, Layout.wire_alignment);
+    try buffer_access.inlineRange(bytes, value_start, Layout.wire_size, Layout.wire_alignment);
     // Zig may pass aggregates by reference. Reject borrowing the target so
     // clearing padding cannot overwrite yet-to-be-encoded members.
-    if (validation.overlaps(
+    if (buffer_access.overlaps(
         bytes,
         std.mem.asBytes(&value),
     )) return MutationError.AliasedInput;
@@ -53,13 +53,13 @@ pub fn structVector(
     values: []const Layout.Value,
 ) MutationError!void {
     // Divide first: no count or payload-size multiplication may overflow.
-    try validation.checkRange(bytes.len, payload_start, 0);
+    try buffer_access.checkRange(bytes.len, payload_start, 0);
     if (values.len > (bytes.len - payload_start) / Layout.wire_size)
         return MutationError.OutOfBounds;
     // No payload alignment is required when replacing a present empty vector.
     if (values.len != 0 and payload_start % Layout.wire_alignment != 0)
         return MutationError.InvalidBuffer;
-    if (validation.overlaps(
+    if (buffer_access.overlaps(
         bytes,
         std.mem.sliceAsBytes(values),
     )) return MutationError.AliasedInput;
@@ -93,7 +93,7 @@ pub fn stringVector(
 ) MutationError!void {
     // Validate the complete update before writing, including aliasing.
     // Writing a target must not corrupt the replacement slice descriptors.
-    if (validation.overlaps(
+    if (buffer_access.overlaps(
         bytes,
         std.mem.sliceAsBytes(replacement),
     )) return MutationError.AliasedInput;
@@ -105,7 +105,7 @@ pub fn stringVector(
             value_bytes,
         )) return MutationError.InvalidUtf8;
         // Earlier writes must not change input bytes needed by later replacements.
-        if (validation.overlaps(bytes, value_bytes))
+        if (buffer_access.overlaps(bytes, value_bytes))
             return MutationError.AliasedInput;
         const target_start = @intFromPtr(target.ptr) - @intFromPtr(bytes.ptr);
         const target_end = target_start + target.len + wire.string_terminator_size;
@@ -130,7 +130,7 @@ pub fn stringVector(
                 const previous_object =
                     bytes[previous_start - wire.sequence_length_size .. previous_end];
                 // Distinct objects cannot overlap: one write could corrupt the other's header.
-                if (validation.overlaps(
+                if (buffer_access.overlaps(
                     target_object,
                     previous_object,
                 )) return MutationError.InvalidBuffer;

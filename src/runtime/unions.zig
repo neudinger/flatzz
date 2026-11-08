@@ -24,7 +24,7 @@
 //! The builder and its storage must remain valid until the enclosing table is finished.
 const std = @import("std");
 const wire = @import("wire.zig");
-const validation = @import("validation.zig");
+const buffer_access = @import("buffer_access.zig");
 const sequence = @import("sequence.zig");
 const table_view = @import("table_view.zig");
 const struct_view = @import("struct_view.zig");
@@ -62,7 +62,7 @@ pub const Location = struct {
     /// Payload offset slot relative to the complete frame; null means an absent field slot.
     reference_start: ?usize,
     /// Parent ranges that payloads may not reinterpret as objects.
-    context: validation.Context,
+    context: buffer_access.Context,
 };
 
 /// Native values contain table pointers, inline struct values, or UTF-8 strings.
@@ -166,7 +166,7 @@ pub fn Union(
                 if (selected != .none) return AccessError.InvalidUnion;
                 return selected;
             };
-            const relative_offset = try validation.readScalar(u32, bytes, reference_start);
+            const relative_offset = try buffer_access.readScalar(u32, bytes, reference_start);
             if ((selected == .none) != (relative_offset == 0))
                 return AccessError.InvalidUnion;
             return selected;
@@ -176,10 +176,7 @@ pub fn Union(
         /// Table fields are not traversed; full verification belongs to the schema verifier.
         pub fn read(
             comptime access: Access,
-            bytes: switch (access) {
-                .read_only => []const u8,
-                .mutable => []u8,
-            },
+            bytes: table_view.ByteSlice(access),
             location: Location,
         ) AccessError!View(access) {
             const selected = try check(bytes, location);
@@ -191,19 +188,22 @@ pub fn Union(
                         .none => unreachable,
                         .table => TableView(access){
                             .bytes = bytes,
-                            .layout = try validation.referencedTable(
+                            .layout = try buffer_access.referencedTable(
                                 bytes,
                                 location.context,
                                 reference_start,
                             ),
                         },
-                        .string => try validation.stringAt(
+                        .string => try buffer_access.stringAt(
                             bytes,
                             location.context,
                             reference_start,
                         ),
                         .structure => |Layout| borrowed_struct_blk: {
-                            const target = try validation.referenceTarget(bytes, reference_start);
+                            const target = try buffer_access.referenceTarget(
+                                bytes,
+                                reference_start,
+                            );
                             try location.context.checkObject(.{
                                 .start = target,
                                 .size = Layout.wire_size,
@@ -258,10 +258,7 @@ pub fn VectorView(
         const Self = @This();
         /// Borrowed alternative returned by `get`, with the selected capability.
         pub const Value = UnionType.View(access);
-        const Bytes = switch (access) {
-            .read_only => []const u8,
-            .mutable => []u8,
-        };
+        const Bytes = table_view.ByteSlice(access);
         /// Complete frame retained for shared referenced payloads.
         bytes: Bytes,
         /// Byte offset of the first discriminator, after its vector prefix.
@@ -271,17 +268,17 @@ pub fn VectorView(
         /// Equal element count of both paired vectors.
         element_count: usize,
         /// Parent ranges protected while following payload references.
-        context: validation.Context,
+        context: buffer_access.Context,
 
         /// Open both vectors from their offset slots and reject unequal counts or overlap.
         /// A shared empty vector is permitted; element tags/payloads remain lazily checked.
         pub fn fromReferences(
             bytes: Bytes,
-            context: validation.Context,
+            context: buffer_access.Context,
             tags_reference: usize,
             values_reference: usize,
         ) AccessError!Self {
-            const tags = try validation.sequenceAt(
+            const tags = try buffer_access.sequenceAt(
                 @sizeOf(wire.UnionTag),
                 @sizeOf(wire.UnionTag),
                 0,
@@ -289,7 +286,7 @@ pub fn VectorView(
                 context,
                 tags_reference,
             );
-            const values = try validation.sequenceAt(
+            const values = try buffer_access.sequenceAt(
                 wire.field_offset_size,
                 wire.field_offset_size,
                 0,
@@ -308,7 +305,7 @@ pub fn VectorView(
             };
             // Sharing one empty vector is harmless. Any other metadata/payload
             // overlap would let offsets reinterpret discriminator bytes.
-            if (validation.rangesOverlap(result.tagsRange(), result.valuesRange()) and
+            if (buffer_access.rangesOverlap(result.tagsRange(), result.valuesRange()) and
                 !(result.element_count == 0 and
                     result.tags_start == result.values_start))
                 return AccessError.InvalidUnion;
@@ -348,20 +345,20 @@ pub fn VectorView(
             context.vector = self.valuesRange();
             context.protected = self.tagsRange();
             return .{
-                .tag = try validation.readScalar(wire.UnionTag, self.bytes, tags_slot),
+                .tag = try buffer_access.readScalar(wire.UnionTag, self.bytes, tags_slot),
                 .reference_start = values_slot,
                 .context = context,
             };
         }
 
-        fn tagsRange(self: Self) validation.Range {
+        fn tagsRange(self: Self) buffer_access.Range {
             return .{
                 .start = self.tags_start - wire.sequence_length_size,
                 .size = wire.sequence_length_size + self.element_count,
             };
         }
 
-        fn valuesRange(self: Self) validation.Range {
+        fn valuesRange(self: Self) buffer_access.Range {
             return .{
                 .start = self.values_start - wire.sequence_length_size,
                 .size = wire.sequence_length_size +

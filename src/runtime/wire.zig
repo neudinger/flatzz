@@ -1,6 +1,6 @@
 //! Scalar wire representations and physical FlatBuffers sizes, independent of Zig ABI.
-//! Fixed-width encode/decode operate on caller-selected ranges. Use the public
-//! `flatzz.read`/`flatzz.write` helpers when byte-range checks are required.
+//! Fixed-width encode/decode operate on caller-selected ranges.
+//! Use `flatzz.buffer_access.readScalar` and `flatzz.buffer_access.writeScalar` for checked access.
 const std = @import("std");
 const errors = @import("errors.zig");
 

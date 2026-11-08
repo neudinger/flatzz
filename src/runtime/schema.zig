@@ -12,10 +12,10 @@
 //! var storage: runtime.Storage(Definition, .{}, .{}) = .{};
 //! const value: Values = .{ .count = 42 };
 //! const bytes = try Definition.serialize(value, &storage.buffer, .{ .force_defaults = true });
-//! const before = try Definition.readRoot(bytes);
-//! const changed = try Definition.updateRoot(bytes, .count, 7);
-//! const after = try Definition.readRoot(bytes);
-//! try Definition.verifyRoot(bytes, .{});
+//! const before = try Definition.read(bytes);
+//! const changed = try Definition.update(bytes, .count, 7);
+//! const after = try Definition.read(bytes);
+//! try Definition.verify(bytes, .{});
 //! try std.testing.expectEqual(@as(u32, 42), before.count);
 //! try std.testing.expect(changed);
 //! try std.testing.expectEqual(@as(u32, 7), after.count);
@@ -26,14 +26,15 @@
 const std = @import("std");
 const wire = @import("wire.zig");
 const sequence = @import("sequence.zig");
-const validation = @import("validation.zig");
 const table_view = @import("table_view.zig");
 const Builder = @import("Builder.zig");
 const table_builder = @import("table_builder.zig");
 const Verifier = @import("Verifier.zig");
 const errors = @import("errors.zig");
-const struct_view = @import("struct_view.zig");
+const storage = @import("storage.zig");
+const field_access = @import("schema/field_access.zig");
 const unions = @import("unions.zig");
+const native_graph = @import("schema/native_graph.zig");
 
 const AccessError = errors.AccessError;
 const MutationError = errors.MutationError;
@@ -43,7 +44,6 @@ const VerifyError = errors.VerifyError;
 const TableBuilder = table_builder.TableBuilder;
 const Table = table_view.TableView(.read_only);
 const MutableTable = table_view.TableView(.mutable);
-const StructView = struct_view.StructView;
 
 /// Wire interpretation carried by a field descriptor; native types alone are insufficient.
 pub const Kind = union(enum) {
@@ -119,10 +119,7 @@ fn UnionDescriptor(
         else
             UnionType.Value;
         /// Borrowed read result; payload access retains the input frame.
-        pub const View = if (vector)
-            ?unions.VectorView(UnionType, .read_only)
-        else
-            UnionType.View(.read_only);
+        pub const View = field_access.View(kind, .read_only);
         /// Selects single-union versus paired-vector handling.
         pub const kind: Kind = if (vector)
             .{ .union_vector = UnionType }
@@ -148,6 +145,15 @@ pub fn wireIds(comptime FieldType: type) []const usize {
     };
 }
 
+/// Test required presence for a native value or completed construction handle.
+/// Single unions use none for absence; other fields use null. Empty values are present.
+pub fn isPresent(comptime FieldType: type, value: anytype) bool {
+    return switch (FieldType.kind) {
+        .union_value => std.meta.activeTag(value) != .none,
+        else => value != null,
+    };
+}
+
 /// An inline table field with a nullable native value representing presence.
 pub fn StructField(
     comptime Layout: type,
@@ -163,7 +169,7 @@ pub fn StructField(
         /// Native struct value; null represents an absent table field.
         pub const Value = ?Layout.Value;
         /// Borrowed inline struct; null represents absence.
-        pub const View = ?StructView(Layout, .read_only);
+        pub const View = field_access.View(kind, .read_only);
         /// Inline wire layout used by accessors, builders, and verification.
         pub const kind: Kind = .{ .structure = Layout };
         /// Physical vtable field ID, independent of the native field order.
@@ -188,7 +194,7 @@ pub fn ScalarField(
         /// Native scalar type, including optional presence when requested.
         pub const Value = ValueType;
         /// Copied scalar read result, independent of the buffer lifetime.
-        pub const View = ValueType;
+        pub const View = field_access.View(kind, .read_only);
         /// Scalar interpretation, including optional native presence.
         pub const kind: Kind = .{ .scalar = ValueType };
         /// Physical vtable field ID, independent of the native field order.
@@ -232,9 +238,7 @@ pub fn ReferenceField(
         /// Nullable borrowed string, sequence, or child table.
         pub const View = switch (kind) {
             .scalar, .structure, .union_value, .union_vector => unreachable,
-            .string => ?[]const u8,
-            .vector => |ElementCodec| ?sequence.SequenceView(ElementCodec, .read_only),
-            .table => ?Table,
+            else => field_access.View(kind, .read_only),
         };
     };
 }
@@ -358,31 +362,49 @@ pub fn Schema(comptime Native: type, comptime descriptors: anytype) type {
             return builder.finish(try create(&builder, values, options), .ordinary);
         }
 
-        /// Read an ordinary root without requiring a file identifier; references borrow `bytes`.
-        /// Vector elements remain lazy; use verifyRoot for complete traversal.
-        pub fn readRoot(bytes: []const u8) AccessError!View {
-            return read(try Table.from(bytes, .root));
+        /// Serialize a runtime native graph into one allocator-owned aligned buffer.
+        /// Measure required presence and depth/work limits before allocating, then
+        /// pack once without a final output copy. UTF-8 and encoding errors free the
+        /// allocation. The result retains spare capacity; call result.deinit(allocator)
+        /// once with the same allocator, invalidating bytes and all borrowed views.
+        /// Inputs must remain valid throughout allocation and packing, including
+        /// across allocator calls. Fixed-buffer serialize performs no allocation.
+        pub fn serializeAlloc(
+            values: Native,
+            allocator: std.mem.Allocator,
+            options: WriteOptions,
+        ) (std.mem.Allocator.Error || BuildError)!storage.Serialized {
+            const size = try storage.measure(Self, values, .{
+                .max_depth = options.max_depth,
+                .max_work = options.max_work,
+            });
+            const buffer = try allocator.alignedAlloc(
+                u8,
+                .fromByteUnits(wire.storage_alignment),
+                size,
+            );
+            errdefer allocator.free(buffer);
+            var builder = Builder.init(buffer);
+            builder.force_defaults = options.force_defaults;
+            const bytes = try builder.finish(
+                try native_graph.Packer(Native, Self).pack(&builder, &values),
+                .ordinary,
+            );
+            return .{ .storage = buffer, .bytes = bytes };
         }
 
-        /// Updates a present root field with the same size and aliasing rules as
-        /// update. Missing fields return false; null cannot remove a present one.
-        pub fn updateRoot(
-            bytes: []u8,
-            comptime field: Field,
-            value: Descriptor(field).Value,
-        ) MutationError!bool {
-            return update(try MutableTable.from(bytes, .root), field, value);
-        }
-
-        /// Verifies every known field using the requested framing and limits.
+        /// Verify known fields reachable from bytes or a checked Table with fresh limits.
+        /// Bytes parse options.frame; tables retain their selected frame and local metadata.
+        /// A nested table verifies its reachable graph, starting at depth zero, not its parent.
+        /// Keep bytes unchanged during traversal; structural edits invalidate cached tables.
         /// The native value type need not expose a Schema declaration.
-        pub fn verifyRoot(
-            bytes: []const u8,
+        pub fn verify(
+            source: anytype,
             options: Verifier.Options,
         ) VerifyError!void {
             return Verifier.verify(struct {
                 pub const Schema = Self;
-            }, bytes, options);
+            }, source, options);
         }
 
         /// The descriptor-selected borrowed view for a structured field.
@@ -390,83 +412,75 @@ pub fn Schema(comptime Native: type, comptime descriptors: anytype) type {
         /// their .none variant. Scalars and strings use update instead.
         pub fn MutableView(comptime field: Field) type {
             return switch (Descriptor(field).kind) {
-                .structure => |Layout| ?StructView(Layout, .mutable),
-                .vector => |ElementCodec| ?sequence.SequenceView(ElementCodec, .mutable),
-                .table => ?MutableTable,
-                .union_value => |UnionType| UnionType.View(.mutable),
-                .union_vector => |UnionType| ?unions.VectorView(UnionType, .mutable),
                 .scalar, .string => @compileError(
                     "borrowMutable requires a structured field; use update for scalars and strings",
                 ),
+                else => field_access.View(Descriptor(field).kind, .mutable),
             };
         }
 
-        /// Borrows a field from an already checked mutable table without copying.
-        /// Generated tables expose this as `Reading.borrowMutable(table, .field)`.
-        /// Open the table once with the required framing and reuse it for fields.
+        /// Borrow a mutable field without copying its contents.
+        /// Accepts mutable bytes, including pointers to byte arrays, or a checked MutableTable.
+        /// Bytes open an ordinary root on each call. Pass a table to reuse checked metadata
+        /// or borrow from nested tables and custom frames.
+        /// Generated tables expose this as Reading.borrowMutable(target, .field).
+        /// Immutable bytes and read-only tables are rejected at compile time.
+        /// Scalars and strings use update instead of mutable borrowing.
         /// Struct and union payloads retain mutation capabilities; vector elements
-        /// retain their codec's access rules. Storage reuse invalidates all views.
+        /// retain their codec's access rules. Views borrow the input bytes; storage reuse
+        /// invalidates them, and structural edits invalidate cached table metadata.
         ///
-        /// Fragment inside a function with `runtime = @import("flatzz")`, a matching
-        /// `Schema`, and mutable root `bytes`. For a `.location` StructField whose
-        /// layout has an `.altitude` member:
+        /// Fragment inside a function with a matching Schema and mutable root bytes.
+        /// For a .location StructField whose layout has an .altitude member:
         /// ```zig
-        /// const table = try runtime.MutableTable.from(bytes, .root);
-        /// if (try Schema.borrowMutable(table, .location)) |location|
+        /// if (try Schema.borrowMutable(bytes, .location)) |location|
         ///     try location.update(.altitude, 12);
         /// ```
         /// Subsequent reads observe altitude = 12; an absent location stays absent.
         pub fn borrowMutable(
-            table: MutableTable,
+            target: anytype,
             comptime field: Field,
         ) AccessError!MutableView(field) {
-            const FieldType = Descriptor(field);
-            return switch (FieldType.kind) {
-                .structure => |Layout| table.readStruct(Layout, FieldType.wire_id),
-                .vector => |ElementCodec| table.readVector(ElementCodec, FieldType.wire_id),
-                .table => table.readTable(FieldType.wire_id),
-                .union_value => |UnionType| table.readUnion(UnionType, FieldType.field_ids),
-                .union_vector => |UnionType| table.readUnionVector(UnionType, FieldType.field_ids),
-                .scalar, .string => unreachable,
-            };
+            const table = try mutableTable(target);
+            return field_access.read(Descriptor(field), .mutable, table);
         }
 
-        /// Read every known field from a checked table; absent slots use defaults.
-        /// Reference contents remain borrowed and vector elements are checked lazily.
-        /// Required-field completeness belongs to `verifyRoot`, not this accessor.
-        pub fn read(table: Table) AccessError!View {
+        /// Read every known field; absent slots use defaults.
+        /// Accepts mutable or immutable byte slices, pointers to byte arrays, or a checked Table.
+        /// Bytes open an ordinary root on each call. Pass a table to reuse checked metadata
+        /// or read nested tables and custom frames. Structural edits invalidate cached tables.
+        /// Scalars are copied; reference contents borrow the input and vector elements stay lazy.
+        /// Required-field completeness belongs to `verify`, not this accessor.
+        pub fn read(source: anytype) AccessError!View {
+            const table: Table = if (@TypeOf(source) == Table)
+                source
+            else
+                try Table.from(source, .root);
             var result: View = undefined;
             inline for (field_names) |field_name| {
-                const FieldType = @field(descriptors, field_name);
-                @field(result, field_name) = switch (FieldType.kind) {
-                    .scalar => |ValueType| try table.readField(
-                        ValueType,
-                        FieldType.wire_id,
-                        FieldType.default,
-                    ),
-                    .string => try table.readString(FieldType.wire_id),
-                    .structure => |Layout| try table.readStruct(Layout, FieldType.wire_id),
-                    .vector => |ElementCodec| try table.readVector(ElementCodec, FieldType.wire_id),
-                    .table => try table.readTable(FieldType.wire_id),
-                    .union_value => |UnionType| try table.readUnion(UnionType, FieldType.field_ids),
-                    .union_vector => |UnionType| try table.readUnionVector(
-                        UnionType,
-                        FieldType.field_ids,
-                    ),
-                };
+                @field(result, field_name) = try field_access.read(
+                    @field(descriptors, field_name),
+                    .read_only,
+                    table,
+                );
             }
             return result;
         }
 
         /// Replace one present field without growing the buffer; return false for absence.
+        /// Accepts mutable bytes, including pointers to byte arrays, or a checked MutableTable.
+        /// Bytes open an ordinary root on each call. Pass a table to reuse checked metadata
+        /// or update nested tables and custom frames. Structural edits invalidate cached tables.
+        /// Generated tables expose this as Reading.update(target, .field, value).
         /// Null cannot clear a present value, and sequence lengths must match.
-        /// Read-only views, child table replacement, and whole-union replacement
-        /// are rejected at compile time. Errors leave the target bytes unchanged.
+        /// Immutable bytes, read-only views, child table replacement, and whole-union
+        /// replacement are rejected at compile time. Errors leave the target bytes unchanged.
         pub fn update(
-            table: MutableTable,
+            target: anytype,
             comptime field: Field,
             value: Descriptor(field).Value,
         ) MutationError!bool {
+            const table = try mutableTable(target);
             const FieldType = Descriptor(field);
             return switch (FieldType.kind) {
                 .scalar => |ValueType| table.mutateField(ValueType, FieldType.wire_id, value),
@@ -496,11 +510,7 @@ pub fn Schema(comptime Native: type, comptime descriptors: anytype) type {
             values: Native,
             options: WriteOptions,
         ) BuildError!Builder.Offset {
-            if (builder.state != .ready) return BuildError.InvalidState;
-            var traversal: NativeTraversal = .{ .options = options };
-            try validateNative(builder, &values, &traversal);
-            builder.force_defaults = options.force_defaults;
-            return packNative(builder, &values);
+            return native_graph.Packer(Native, Self).create(builder, &values, options);
         }
 
         /// Add named Fields after building their referenced children with this builder.
@@ -521,11 +531,7 @@ pub fn Schema(comptime Native: type, comptime descriptors: anytype) type {
                     else => {},
                 }
                 if (FieldType.required) {
-                    const present = switch (FieldType.kind) {
-                        .union_value => std.meta.activeTag(value) != .none,
-                        else => value != null,
-                    };
-                    if (!present) return BuildError.MissingRequiredField;
+                    if (!isPresent(FieldType, value)) return BuildError.MissingRequiredField;
                 }
             }
             inline for (field_names) |field_name| {
@@ -588,170 +594,22 @@ pub fn Schema(comptime Native: type, comptime descriptors: anytype) type {
                 try verifier.verifyField(@field(descriptors, field_name), table);
             }
         }
-
-        // Inspect the complete graph before writes, so an earlier child cannot
-        // corrupt a later child's native descriptors. Packing then visits it once
-        // more without repeating graph validation or traversal accounting.
-        fn validateNative(
-            builder: *const Builder,
-            values: *const Native,
-            traversal: *NativeTraversal,
-        ) BuildError!void {
-            if (traversal.depth >= traversal.options.max_depth) return BuildError.DepthLimit;
-            traversal.depth += 1;
-            defer traversal.depth -= 1;
-            try traversal.charge(field_names.len + 1, 1);
-            try checkNativeInput(builder, std.mem.asBytes(values));
-            inline for (field_names) |field_name| {
-                const FieldType = @field(descriptors, field_name);
-                const value = @field(values.*, field_name);
-                if (FieldType.required) {
-                    const present = switch (FieldType.kind) {
-                        .union_value => std.meta.activeTag(value) != .none,
-                        else => value != null,
-                    };
-                    if (!present) return BuildError.MissingRequiredField;
-                }
-                switch (FieldType.kind) {
-                    .scalar => {},
-                    .structure => |Layout| if (value != null) {
-                        try traversal.charge(1, Layout.wire_size);
-                    },
-                    .string => if (value) |text| try validateNativeSlice(builder, text, traversal),
-                    .table => |Child| if (value) |child| {
-                        try checkNativeInput(builder, std.mem.asBytes(child));
-                        try Child.Schema.validateNative(builder, child, traversal);
-                    },
-                    .vector => |Codec| if (value) |elements| {
-                        try validateNativeSlice(builder, elements, traversal);
-                        switch (Codec.kind) {
-                            .scalar, .structure => {},
-                            .string => for (elements) |text| {
-                                try validateNativeSlice(builder, text, traversal);
-                            },
-                            .table => for (elements) |child| {
-                                try checkNativeInput(builder, std.mem.asBytes(child));
-                                try Codec.Schema.Schema.validateNative(builder, child, traversal);
-                            },
-                        }
-                    },
-                    .union_value => |UnionType| try validateNativeUnion(
-                        UnionType,
-                        builder,
-                        value,
-                        traversal,
-                    ),
-                    .union_vector => |UnionType| if (value) |elements| {
-                        try validateNativeSlice(builder, elements, traversal);
-                        for (elements) |element|
-                            try validateNativeUnion(UnionType, builder, element, traversal);
-                    },
-                }
-            }
-        }
-
-        fn packNative(builder: *Builder, values: *const Native) BuildError!Builder.Offset {
-            var built: Fields = undefined;
-            inline for (field_names) |field_name| {
-                const FieldType = @field(descriptors, field_name);
-                const value = @field(values.*, field_name);
-                @field(built, field_name) = switch (FieldType.kind) {
-                    .scalar, .structure => value,
-                    .union_value => |UnionType| try packNativeUnion(UnionType, builder, value),
-                    .union_vector => |UnionType| if (value) |elements|
-                        try builder.createReferenceVector(elements, .{
-                            .union_type = UnionType,
-                            .create = packNativeUnion,
-                        })
-                    else
-                        null,
-                    .string => if (value) |text| try builder.createString(text) else null,
-                    .table => |Child| if (value) |child|
-                        try Child.Schema.packNative(builder, child)
-                    else
-                        null,
-                    .vector => |Codec| if (value) |elements| switch (Codec.kind) {
-                        .scalar => try builder.createVector(Codec.Value, elements),
-                        .string => try builder.createStringVector(elements),
-                        .structure => try builder.createStructVector(Codec.Layout, elements),
-                        .table => try builder.createReferenceVector(elements, .{
-                            .create = Codec.Schema.Schema.packNative,
-                        }),
-                    } else null,
-                };
-            }
-            var table = try Context.init(builder);
-            try addFields(&table, built);
-            return endTable(&table);
-        }
     };
 }
 
-// Each successful charge proves multiplication and addition fit usize. Budget
-// native descriptors before reading them, including zero-length sequences.
-const NativeTraversal = struct {
-    options: WriteOptions,
-    depth: usize = 0,
-    work: usize = 0,
-
-    fn charge(self: *NativeTraversal, count: usize, comptime width: usize) BuildError!void {
-        if (width != 0 and count > (self.options.max_work - self.work) / width)
-            return BuildError.WorkLimit;
-        self.work += count * width;
-    }
-};
-
-fn checkNativeInput(builder: *const Builder, bytes: []const u8) BuildError!void {
-    if (validation.overlaps(builder.buffer, bytes)) return BuildError.AliasedInput;
+fn mutableTable(target: anytype) AccessError!MutableTable {
+    return if (@TypeOf(target) == MutableTable) target else MutableTable.from(target, .root);
 }
 
-fn validateNativeSlice(
-    builder: *const Builder,
-    values: anytype,
-    traversal: *NativeTraversal,
+/// Charge native visits or payload bytes without overflowing the work counter.
+/// The caller maintains work <= max_work. Failed charges leave work unchanged;
+/// zero-width charges consume no work, including at an exhausted limit.
+pub fn chargeNativeWork(
+    work: *usize,
+    max_work: usize,
+    count: usize,
+    comptime width: usize,
 ) BuildError!void {
-    if (values.len > Builder.max_buffer_size) return BuildError.BufferTooLarge;
-    const Element = @typeInfo(@TypeOf(values)).pointer.child;
-    try traversal.charge(values.len, @sizeOf(Element));
-    try checkNativeInput(builder, std.mem.sliceAsBytes(values));
-}
-
-fn validateNativeUnion(
-    comptime UnionType: type,
-    builder: *const Builder,
-    value: UnionType.Value,
-    traversal: *NativeTraversal,
-) BuildError!void {
-    switch (value) {
-        .none => {},
-        inline else => |payload, selected| switch (@field(UnionType.variants, @tagName(selected))) {
-            .table => |Child| {
-                try checkNativeInput(builder, std.mem.asBytes(payload));
-                try Child.Schema.validateNative(builder, payload, traversal);
-            },
-            .structure => |Layout| try traversal.charge(1, Layout.wire_size),
-            .string => try validateNativeSlice(builder, payload, traversal),
-            .none => unreachable,
-        },
-    }
-}
-
-fn packNativeUnion(
-    comptime UnionType: type,
-    builder: *Builder,
-    value: UnionType.Value,
-) BuildError!UnionType.Handle {
-    return switch (value) {
-        .none => .none,
-        inline else => |payload, selected| @unionInit(
-            UnionType.Handle,
-            @tagName(selected),
-            switch (@field(UnionType.variants, @tagName(selected))) {
-                .table => |Child| try Child.Schema.packNative(builder, payload),
-                .structure => |Layout| try builder.createStruct(Layout, payload),
-                .string => try builder.createString(payload),
-                .none => unreachable,
-            },
-        ),
-    };
+    if (width != 0 and count > (max_work - work.*) / width) return BuildError.WorkLimit;
+    work.* += count * width;
 }

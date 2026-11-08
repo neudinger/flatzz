@@ -47,31 +47,75 @@ const frames = .{
 test "root helpers preserve defaults optional presence and verification limits" {
     var storage: runtime.Storage(Definition, .{}, .{}) = .{};
     const omitted = try Definition.serialize(.{}, &storage.buffer, .{});
-    try testing.expect(!(try Definition.readRoot(omitted)).enabled);
-    try testing.expect(!try Definition.updateRoot(omitted, .enabled, true));
-    try testing.expect((try Definition.readRoot(omitted)).optional == null);
-    try testing.expect(try Definition.borrowMutable(
-        try runtime.MutableTable.from(omitted, .root),
-        .items,
-    ) == null);
+    try testing.expect(!(try Definition.read(omitted)).enabled);
+    try testing.expect(!try Definition.update(omitted, .enabled, true));
+    try testing.expect((try Definition.read(omitted)).optional == null);
+    try testing.expect(try Definition.borrowMutable(omitted, .items) == null);
     const present = try Definition.serialize(
         .{ .optional = 0 },
         &storage.buffer,
         .{ .force_defaults = true },
     );
-    try testing.expectEqual(@as(?u32, 0), (try Definition.readRoot(present)).optional);
-    try testing.expect(try Definition.updateRoot(present, .enabled, true));
-    try testing.expect((try Definition.readRoot(present)).enabled);
+    const immutable: []const u8 = present;
+    try testing.expectEqual(@as(?u32, 0), (try Definition.read(immutable)).optional);
+    const present_table = try runtime.MutableTable.from(present, .root);
+    try testing.expect(try Definition.update(present_table, .enabled, true));
+    const checked = try runtime.Table.from(present, .root);
+    try testing.expect((try Definition.read(checked)).enabled);
+    const before = storage.buffer;
     try testing.expectError(
         error.CannotClearField,
-        Definition.updateRoot(present, .optional, null),
+        Definition.update(present, .optional, null),
     );
-    try Definition.verifyRoot(present, .{});
-    try testing.expectError(error.DepthLimit, Definition.verifyRoot(present, .{ .max_depth = 0 }));
-    try testing.expectError(error.WorkLimit, Definition.verifyRoot(present, .{ .max_work = 0 }));
-    try testing.expectError(error.OutOfBounds, Definition.readRoot(&.{}));
+    try testing.expectEqualSlices(u8, &before, &storage.buffer);
+    var copied: [storage.buffer.len]u8 = @splat(0);
+    @memcpy(copied[0..present.len], present);
+    try testing.expect(try Definition.update(&copied, .enabled, false));
+    try testing.expect(!(try Definition.read(&copied)).enabled);
+    const frozen = copied;
+    try testing.expect(!(try Definition.read(&frozen)).enabled);
+    try Definition.verify(present, .{});
+    try Definition.verify(&frozen, .{});
+    // Checked tables retain the framing selected when opened.
+    try Definition.verify(checked, .{ .frame = .{ .identifier = "NOPE".* } });
+    try testing.expectError(error.DepthLimit, Definition.verify(present, .{ .max_depth = 0 }));
+    try testing.expectError(error.WorkLimit, Definition.verify(present, .{ .max_work = 0 }));
+    try testing.expectError(error.OutOfBounds, Definition.verify(&.{}, .{}));
+    try testing.expectError(error.OutOfBounds, Definition.read(&.{}));
     var empty: [0]u8 = .{};
-    try testing.expectError(error.OutOfBounds, Definition.updateRoot(&empty, .enabled, true));
+    try testing.expectError(error.OutOfBounds, Definition.update(&empty, .enabled, true));
+    try testing.expectError(error.OutOfBounds, Definition.borrowMutable(&empty, .items));
+}
+
+test "custom descriptor kinds retain checked reads and mutable borrowing" {
+    const Descriptor = struct {
+        pub const Value = ?structs.Sample;
+        pub const View = ?runtime.StructView(structs.Sample.Layout, .read_only);
+        pub const kind: union(enum) {
+            scalar: type,
+            structure: type,
+            string,
+            vector: type,
+            table: type,
+            union_value: type,
+            union_vector: type,
+        } = .{ .structure = structs.Sample.Layout };
+        pub const wire_id = 0;
+        pub const required = false;
+    };
+    const Custom = runtime.Schema(struct { sample: ?structs.Sample = null }, .{
+        .sample = Descriptor,
+    });
+    var storage: [128]u8 align(runtime.storage_alignment) = undefined;
+    const bytes = try Custom.serialize(.{ .sample = structs.sample }, &storage, .{});
+    const view = try Custom.read(try runtime.Table.from(bytes, .root));
+    try testing.expectEqual(structs.sample.number, try view.sample.?.get(.number));
+    const sample = (try Custom.borrowMutable(
+        try runtime.MutableTable.from(bytes, .root),
+        .sample,
+    )).?;
+    try sample.update(.number, 42);
+    try testing.expectEqual(@as(u64, 42), try view.sample.?.get(.number));
 }
 
 test "typed construction fields retain values and accept completed handles by name" {
@@ -140,65 +184,82 @@ test "value serialization preserves root bytes borrowed storage and capacity err
     try testing.expectEqualSlices(u8, expected, bytes);
     try testing.expect(bytes.len < storage.buffer.len);
     try testing.expect(bytes.ptr == storage.buffer[storage.buffer.len - bytes.len ..].ptr);
-    try Definition.verifyRoot(bytes, .{});
-    const view = try Definition.readRoot(bytes);
+    try Definition.verify(bytes, .{});
+    const view = try Definition.read(bytes);
     try testing.expectEqualStrings("sensor-01", view.label.?);
     try testing.expectEqual(@as(u64, 3), try view.numbers.?.get(2));
     try testing.expectEqual(@as(usize, 0), view.tags.?.element_count);
     try testing.expect(view.items == null);
     try testing.expectEqual(@as(?u32, 0), view.optional);
     try testing.expect(!view.enabled);
-    try testing.expect(try Definition.updateRoot(bytes, .enabled, true));
-    try testing.expect((try Definition.readRoot(bytes)).enabled);
-    try Definition.verifyRoot(bytes, .{});
+    const table = try runtime.MutableTable.from(bytes, .root);
+    try testing.expect(try Definition.update(table, .enabled, true));
+    try testing.expect((try Definition.read(bytes)).enabled);
+    try Definition.verify(bytes, .{});
     var insufficient: [1]u8 align(runtime.storage_alignment) = undefined;
     try testing.expectError(error.NoSpaceLeft, Definition.serialize(value, &insufficient, .{}));
 }
 
-test "schema storage bounds sparse fields wide vectors strings and all frames" {
-    const tags = [_][]const u8{ "", "é", "abcd" };
+test "value derived storage bounds sparse fields wide vectors strings and all frames" {
     inline for (.{ 0, 1, 3, 17 }) |element_count| {
-        const numbers: [element_count]u64 = @splat(0x0102030405060708);
-        const items: [element_count]structs.Envelope = @splat(structs.envelope);
         inline for (.{ "", "a", "abcde" }) |label| {
+            const value: Values = comptime .{
+                .label = label,
+                .numbers = &@as([element_count]u64, @splat(0x0102030405060708)),
+                .tags = &.{ "", "é", "abcd" },
+                .items = &@as([element_count]structs.Envelope, @splat(structs.envelope)),
+                .optional = 0,
+            };
             inline for (frames) |frame| {
-                var storage: runtime.Storage(Definition, .{
+                const capacity = comptime runtime.storage.capacityFor(Definition, value, .{
+                    .finish = frame[0],
+                });
+                try testing.expectEqual(capacity, try runtime.storage.measure(
+                    Definition,
+                    value,
+                    .{ .finish = frame[0] },
+                ));
+                try testing.expect(capacity % runtime.storage_alignment == 0);
+                var storage: [capacity]u8 align(runtime.storage_alignment) = undefined;
+                var original: runtime.Storage(Definition, .{
                     .label = label.len,
                     .numbers = element_count,
-                    .tags = .{ .count = tags.len, .bytes = 6 },
+                    .tags = .{ .count = 3, .bytes = 6 },
                     .items = element_count,
                 }, .{ .finish = frame[0] }) = .{};
-                var builder = runtime.Builder.init(&storage.buffer);
-                const bytes = try builder.finish(try Definition.create(
-                    &builder,
-                    .{
-                        .label = label,
-                        .numbers = &numbers,
-                        .tags = &tags,
-                        .items = &items,
-                        .optional = 0,
-                    },
-                    .{ .force_defaults = true },
-                ), frame[0]);
-                try Definition.verifyRoot(bytes, .{ .frame = frame[1] });
-                const view = try Definition.read(
-                    try runtime.Table.from(bytes, .{ .options = frame[1] }),
-                );
-                try testing.expectEqualStrings(label, view.label.?);
-                try testing.expectEqual(element_count, view.numbers.?.element_count);
-                try testing.expectEqual(element_count, view.items.?.element_count);
-                for (tags, 0..) |tag, element_index|
-                    try testing.expectEqualStrings(tag, try view.tags.?.get(element_index));
-                const table = try runtime.MutableTable.from(bytes, .{ .options = frame[1] });
-                const borrowed = (try Definition.borrowMutable(table, .items)).?;
-                const scalar_vector = (try Definition.borrowMutable(table, .numbers)).?;
-                if (element_count != 0) {
-                    try testing.expectEqual(numbers[0], try scalar_vector.get(0));
-                    try (try borrowed.get(0)).update(.measure, 12.5);
-                    try testing.expectEqual(
-                        @as(f64, 12.5),
-                        try (try view.items.?.get(0)).get(.measure),
+                for ([_]bool{ false, true }) |force_defaults| {
+                    const options: runtime.WriteOptions = .{ .force_defaults = force_defaults };
+                    var builder = runtime.Builder.init(&storage);
+                    const bytes = try builder.finish(
+                        try Definition.create(&builder, value, options),
+                        frame[0],
                     );
+                    var reference = runtime.Builder.init(&original.buffer);
+                    const expected = try reference.finish(
+                        try Definition.create(&reference, value, options),
+                        frame[0],
+                    );
+                    try testing.expectEqualSlices(u8, expected, bytes);
+                    try Definition.verify(bytes, .{ .frame = frame[1] });
+                    const view = try Definition.read(
+                        try runtime.Table.from(bytes, .{ .options = frame[1] }),
+                    );
+                    try testing.expectEqualStrings(label, view.label.?);
+                    try testing.expectEqual(element_count, view.numbers.?.element_count);
+                    try testing.expectEqual(element_count, view.items.?.element_count);
+                    for (value.tags.?, 0..) |tag, element_index|
+                        try testing.expectEqualStrings(tag, try view.tags.?.get(element_index));
+                    const table = try runtime.MutableTable.from(bytes, .{ .options = frame[1] });
+                    const borrowed = (try Definition.borrowMutable(table, .items)).?;
+                    const scalar_vector = (try Definition.borrowMutable(table, .numbers)).?;
+                    if (element_count != 0) {
+                        try testing.expectEqual(value.numbers.?[0], try scalar_vector.get(0));
+                        try (try borrowed.get(0)).update(.measure, 12.5);
+                        try testing.expectEqual(
+                            @as(f64, 12.5),
+                            try (try view.items.?.get(0)).get(.measure),
+                        );
+                    }
                 }
             }
         }
@@ -213,13 +274,88 @@ test "zero budgets retain empty sequences and empty schemas" {
         .tags = &.{},
         .items = &.{},
     }, &storage.buffer, .{});
-    try Definition.verifyRoot(bytes, .{});
-    const view = try Definition.readRoot(bytes);
+    try Definition.verify(bytes, .{});
+    const view = try Definition.read(bytes);
     try testing.expectEqualStrings("", view.label.?);
     try testing.expectEqual(@as(usize, 0), view.tags.?.element_count);
     const Empty = runtime.Schema(struct {}, .{});
     var empty_storage: runtime.Storage(Empty, .{}, .{}) = .{};
-    try Empty.verifyRoot(try Empty.serialize(.{}, &empty_storage.buffer, .{}), .{});
+    try Empty.verify(try Empty.serialize(.{}, &empty_storage.buffer, .{}), .{});
+}
+
+test "value derived storage preserves absent empty and zero field values" {
+    inline for (.{ Values{}, Values{
+        .label = "",
+        .numbers = &.{},
+        .tags = &.{},
+        .items = &.{},
+    } }) |value| {
+        const capacity = comptime runtime.storage.capacityFor(Definition, value, .{});
+        var storage: [capacity]u8 align(runtime.storage_alignment) = undefined;
+        const bytes = try Definition.serialize(value, &storage, .{});
+        try Definition.verify(bytes, .{});
+        const view = try Definition.read(bytes);
+        try testing.expectEqual(value.label == null, view.label == null);
+        try testing.expectEqual(value.numbers == null, view.numbers == null);
+        try testing.expectEqual(value.tags == null, view.tags == null);
+        try testing.expectEqual(value.items == null, view.items == null);
+        if (view.label) |label| try testing.expectEqualStrings("", label);
+        if (view.numbers) |numbers| try testing.expectEqual(@as(usize, 0), numbers.element_count);
+        if (view.tags) |tags| try testing.expectEqual(@as(usize, 0), tags.element_count);
+        if (view.items) |items| try testing.expectEqual(@as(usize, 0), items.element_count);
+    }
+    inline for (.{ NativeNode{}, NativeNode{ .children = &.{}, .history = &.{} } }) |value| {
+        const capacity = comptime runtime.storage.capacityFor(NativeNode.Schema, value, .{});
+        var storage: [capacity]u8 align(runtime.storage_alignment) = undefined;
+        const bytes = try NativeNode.Schema.serialize(value, &storage, .{});
+        try NativeNode.Schema.verify(bytes, .{});
+        const view = try NativeNode.Schema.read(bytes);
+        try testing.expectEqual(value.children == null, view.children == null);
+        try testing.expectEqual(value.history == null, view.history == null);
+        if (view.children) |children|
+            try testing.expectEqual(@as(usize, 0), children.element_count);
+        if (view.history) |history| try testing.expectEqual(@as(usize, 0), history.element_count);
+    }
+    const inline_value: structs.Packet = .{ .envelope = structs.envelope, .extra = structs.sample };
+    const inline_capacity = comptime runtime.storage.capacityFor(
+        structs.Packet.Schema,
+        inline_value,
+        .{},
+    );
+    var inline_storage: [inline_capacity]u8 align(runtime.storage_alignment) = undefined;
+    try structs.Packet.Schema.verify(
+        try structs.Packet.Schema.serialize(inline_value, &inline_storage, .{}),
+        .{},
+    );
+    const Empty = runtime.Schema(struct {}, .{});
+    const capacity = comptime runtime.storage.capacityFor(Empty, .{}, .{
+        .max_depth = 1,
+        .max_work = 1,
+    });
+    var storage: [capacity]u8 align(runtime.storage_alignment) = undefined;
+    try Empty.verify(try Empty.serialize(.{}, &storage, .{}), .{});
+}
+
+test "value derived storage recursively sizes native child tables" {
+    const value: graph.Graph = comptime graph_value_blk: {
+        const leaf: graph.Node = .{ .name = "leaf" };
+        const parent: graph.Node = .{ .name = "parent", .next = &leaf };
+        break :graph_value_blk .{
+            .child = &parent,
+            .children = &.{ &leaf, &parent },
+            .payload = &graph.payload,
+        };
+    };
+    const capacity = comptime runtime.storage.capacityFor(graph.Graph.Schema, value, .{});
+    var storage: [capacity]u8 align(runtime.storage_alignment) = undefined;
+    const bytes = try graph.Graph.Schema.serialize(value, &storage, .{ .force_defaults = true });
+    try graph.Graph.Schema.verify(bytes, .{});
+    const view = try graph.Graph.Schema.read(bytes);
+    const parent = try graph.Node.Schema.read(view.child.?);
+    try testing.expectEqualStrings("parent", parent.name.?);
+    try testing.expectEqualStrings("leaf", (try graph.Node.Schema.read(parent.next.?)).name.?);
+    try testing.expectEqual(@as(usize, 2), view.children.?.element_count);
+    try testing.expectEqual(@as(u8, 0xff), try view.payload.?.get(1));
 }
 
 test "storage budgets include union pairs vectors and explicitly built children" {
@@ -235,7 +371,7 @@ test "storage budgets include union pairs vectors and explicitly built children"
             .history = .{ .count = 5, .bytes = 4 + unions.message.len + 1 + 3 },
         }, .{ .finish = frame[0] }) = .{};
         const bytes = try unions.build(&storage.buffer, frame[0]);
-        try unions.Packet.Schema.verifyRoot(bytes, .{ .frame = frame[1] });
+        try unions.Packet.Schema.verify(bytes, .{ .frame = frame[1] });
         const table = try runtime.MutableTable.from(bytes, .{ .options = frame[1] });
         const current = try unions.Packet.Schema.borrowMutable(table, .current);
         try testing.expect(try current.event.mutateField(u64, 0, 99));
@@ -267,9 +403,9 @@ test "explicit recursive table budgets and descriptor selected table borrowing" 
     try testing.expect(try graph.Node.Schema.update(child, .number, 123));
     const borrowed_children = (try graph.Graph.Schema.borrowMutable(table, .children)).?;
     try testing.expectEqual(@as(usize, 2), borrowed_children.element_count);
-    const view = try graph.Graph.Schema.readRoot(bytes);
+    const view = try graph.Graph.Schema.read(bytes);
     try testing.expectEqual(@as(u64, 123), (try graph.Node.Schema.read(view.child.?)).number);
-    try graph.Graph.Schema.verifyRoot(bytes, .{});
+    try graph.Graph.Schema.verify(bytes, .{});
 }
 
 // One recursive schema exercises nested table-vector and union-vector scratch.
@@ -293,48 +429,90 @@ const NativeNode = struct {
     });
 };
 
-test "native recursive vectors retain nested scratch and copy shared pointers" {
-    const leaf: NativeNode = .{ .label = "leaf" };
-    const parent: NativeNode = .{
-        .children = &.{ &leaf, &leaf },
-        .history = &.{
-            .{ .child = &leaf }, .{ .text = "inner" }, .{ .envelope = structs.envelope },
-        },
-    };
-    const root: NativeNode = .{
-        .children = &.{ &parent, &parent },
-        .payload = .{ .envelope = structs.envelope },
-        .history = &.{ .none, .{ .text = "root" } },
+test "value derived recursive vectors retain nested scratch and copy shared pointers" {
+    const root: NativeNode = comptime native_graph_blk: {
+        const leaf: NativeNode = .{ .label = "leaf" };
+        const parent: NativeNode = .{
+            .children = &.{ &leaf, &leaf },
+            .history = &.{
+                .{ .child = &leaf }, .{ .text = "inner" }, .{ .envelope = structs.envelope },
+            },
+        };
+        break :native_graph_blk .{
+            .children = &.{ &parent, &parent },
+            .payload = .{ .envelope = structs.envelope },
+            .history = &.{ .none, .{ .text = "root" } },
+        };
     };
     inline for (frames) |frame| {
-        var storage: [4096]u8 align(runtime.storage_alignment) = undefined;
-        var builder = runtime.Builder.init(&storage);
-        const handle = try NativeNode.Schema.create(&builder, root, .{});
-        try testing.expectEqual(@as(usize, 0), builder.scratch_cursor);
-        const bytes = try builder.finish(handle, frame[0]);
-        try NativeNode.Schema.verifyRoot(bytes, .{ .frame = frame[1] });
-        const view = try NativeNode.Schema.read(
-            try runtime.Table.from(bytes, .{ .options = frame[1] }),
-        );
-        const first = try view.children.?.get(0);
-        const second = try view.children.?.get(1);
-        try testing.expect(first.layout.table_start != second.layout.table_start);
-        const branch = try NativeNode.Schema.read(first);
-        const first_leaf = try branch.children.?.get(0);
-        const second_leaf = try branch.children.?.get(1);
-        try testing.expect(first_leaf.layout.table_start != second_leaf.layout.table_start);
-        const union_leaf = (try branch.history.?.get(0)).child;
-        try testing.expect(union_leaf.layout.table_start != first_leaf.layout.table_start);
-        try testing.expectEqualStrings("leaf", (try NativeNode.Schema.read(union_leaf)).label.?);
-        try testing.expectEqualStrings("inner", (try branch.history.?.get(1)).text);
-        try testing.expectEqualDeep(
-            structs.envelope,
-            try (try branch.history.?.get(2)).envelope.read(),
-        );
-        try testing.expectEqualDeep(structs.envelope, try view.payload.envelope.read());
-        try testing.expect(try view.history.?.get(0) == .none);
-        try testing.expectEqualStrings("root", (try view.history.?.get(1)).text);
+        const capacity = comptime runtime.storage.capacityFor(NativeNode.Schema, root, .{
+            .finish = frame[0],
+        });
+        var storage: [capacity]u8 align(runtime.storage_alignment) = undefined;
+        var original: [4096]u8 align(runtime.storage_alignment) = undefined;
+        for ([_]bool{ false, true }) |force_defaults| {
+            const options: runtime.WriteOptions = .{ .force_defaults = force_defaults };
+            var builder = runtime.Builder.init(&storage);
+            const handle = try NativeNode.Schema.create(&builder, root, options);
+            try testing.expectEqual(@as(usize, 0), builder.scratch_cursor);
+            const bytes = try builder.finish(handle, frame[0]);
+            var reference = runtime.Builder.init(&original);
+            const expected = try reference.finish(
+                try NativeNode.Schema.create(&reference, root, options),
+                frame[0],
+            );
+            try testing.expectEqualSlices(u8, expected, bytes);
+            try NativeNode.Schema.verify(bytes, .{ .frame = frame[1] });
+            const view = try NativeNode.Schema.read(
+                try runtime.Table.from(bytes, .{ .options = frame[1] }),
+            );
+            const first = try view.children.?.get(0);
+            const second = try view.children.?.get(1);
+            try testing.expect(first.layout.table_start != second.layout.table_start);
+            const branch = try NativeNode.Schema.read(first);
+            const first_leaf = try branch.children.?.get(0);
+            const second_leaf = try branch.children.?.get(1);
+            try testing.expect(first_leaf.layout.table_start != second_leaf.layout.table_start);
+            const union_leaf = (try branch.history.?.get(0)).child;
+            try testing.expect(union_leaf.layout.table_start != first_leaf.layout.table_start);
+            try testing.expectEqualStrings(
+                "leaf",
+                (try NativeNode.Schema.read(union_leaf)).label.?,
+            );
+            try testing.expectEqualStrings("inner", (try branch.history.?.get(1)).text);
+            try testing.expectEqualDeep(
+                structs.envelope,
+                try (try branch.history.?.get(2)).envelope.read(),
+            );
+            try testing.expectEqualDeep(structs.envelope, try view.payload.envelope.read());
+            try testing.expect(try view.history.?.get(0) == .none);
+            try testing.expectEqualStrings("root", (try view.history.?.get(1)).text);
+        }
     }
+}
+
+test "native work limits reject overflow without changing the counter" {
+    var work: usize = 7;
+    try runtime.schema.chargeNativeWork(&work, 15, 2, 4);
+    try testing.expectEqual(@as(usize, 15), work);
+    try testing.expectError(error.WorkLimit, runtime.schema.chargeNativeWork(&work, 15, 1, 1));
+    try testing.expectEqual(@as(usize, 15), work);
+
+    const maximum = std.math.maxInt(usize);
+    work = 0;
+    try testing.expectError(
+        error.WorkLimit,
+        runtime.schema.chargeNativeWork(&work, maximum, maximum, 2),
+    );
+    try testing.expectEqual(@as(usize, 0), work);
+    work = maximum - 3;
+    try testing.expectError(error.WorkLimit, runtime.schema.chargeNativeWork(&work, maximum, 2, 2));
+    try testing.expectEqual(maximum - 3, work);
+    try runtime.schema.chargeNativeWork(&work, maximum, 1, 3);
+    try testing.expectEqual(maximum, work);
+    try runtime.schema.chargeNativeWork(&work, maximum, 0, 2);
+    try runtime.schema.chargeNativeWork(&work, maximum, maximum, 0);
+    try testing.expectEqual(maximum, work);
 }
 
 test "native serialization bounds root depth work and cyclic inputs before writes" {
@@ -345,7 +523,7 @@ test "native serialization bounds root depth work and cyclic inputs before write
     try testing.expectEqualSlices(u8, &before, &storage);
     try testing.expectError(error.WorkLimit, Empty.serialize(.{}, &storage, .{ .max_work = 0 }));
     try testing.expectEqualSlices(u8, &before, &storage);
-    try Empty.verifyRoot(try Empty.serialize(.{}, &storage, .{
+    try Empty.verify(try Empty.serialize(.{}, &storage, .{
         .max_depth = 1,
         .max_work = 1,
     }), .{});
@@ -354,7 +532,7 @@ test "native serialization bounds root depth work and cyclic inputs before write
     });
     try testing.expectError(error.WorkLimit, Scalar.serialize(.{}, &storage, .{ .max_work = 1 }));
     const bytes = try Scalar.serialize(.{ .count = 42 }, &storage, .{ .max_work = 2 });
-    try testing.expectEqual(@as(u32, 42), (try Scalar.readRoot(bytes)).count);
+    try testing.expectEqual(@as(u32, 42), (try Scalar.read(bytes)).count);
     var cyclic: NativeNode = .{};
     cyclic.payload = .{ .child = &cyclic };
     const before_cycle = storage;
@@ -465,7 +643,7 @@ test "native vector capacity failures release scratch and permit builder reset" 
         .{ .force_defaults = builder.force_defaults },
     ), .ordinary);
     try testing.expect(builder.force_defaults);
-    try NativeNode.Schema.verifyRoot(bytes, .{});
+    try NativeNode.Schema.verify(bytes, .{});
 }
 
 test "native vectors reuse final output capacity without an extra handle buffer" {
@@ -493,8 +671,148 @@ test "native vectors reuse final output capacity without an extra handle buffer"
                     .force_defaults = force_defaults,
                 });
                 try testing.expectEqualSlices(u8, expected, bytes);
-                try NativeNode.Schema.verifyRoot(bytes, .{});
+                try NativeNode.Schema.verify(bytes, .{});
             }
         }
     }
+}
+
+test "allocating serialization owns one aligned buffer and preserves runtime vector bytes" {
+    var label = "sensor".*;
+    label[0] = 'S';
+    const numbers = [_]u64{ 0, 0x0102030405060708, 9 };
+    const items: [3]structs.Envelope = @splat(structs.envelope);
+    for (0..numbers.len + 1) |count| {
+        const tags = [_][]const u8{ label[0..count], "" };
+        const value: Values = .{
+            .label = label[0..count],
+            .numbers = numbers[0..count],
+            .tags = &tags,
+            .items = items[0..count],
+            .optional = 0,
+        };
+        for ([_]bool{ false, true }) |force_defaults| {
+            var counted = testing.FailingAllocator.init(testing.allocator, .{});
+            const allocator = counted.allocator();
+            {
+                const options: runtime.WriteOptions = .{ .force_defaults = force_defaults };
+                const result: runtime.Serialized = try Definition.serializeAlloc(
+                    value,
+                    allocator,
+                    options,
+                );
+                defer result.deinit(allocator);
+                try testing.expectEqual(@as(usize, 1), counted.allocations);
+                try testing.expectEqual(@as(usize, 0), counted.resize_index);
+                try testing.expect(
+                    @intFromPtr(result.storage.ptr) % runtime.storage_alignment == 0,
+                );
+                try testing.expect(result.storage.len % runtime.storage_alignment == 0);
+                try testing.expect(result.bytes.len <= result.storage.len);
+                const start = result.storage.len - result.bytes.len;
+                try testing.expect(result.bytes.ptr == result.storage[start..].ptr);
+                var storage: [1024]u8 align(runtime.storage_alignment) = undefined;
+                const expected = try Definition.serialize(value, &storage, options);
+                try testing.expectEqualSlices(u8, expected, result.bytes);
+                try Definition.verify(result.bytes, .{});
+                const view = try Definition.read(result.bytes);
+                try testing.expectEqualStrings(label[0..count], view.label.?);
+                try testing.expectEqual(count, view.numbers.?.element_count);
+                try testing.expectEqual(count, view.items.?.element_count);
+                try testing.expectEqualStrings("", try view.tags.?.get(1));
+                try testing.expectEqual(@as(?u32, 0), view.optional);
+            }
+            try testing.expectEqual(@as(usize, 1), counted.deallocations);
+            try testing.expectEqual(counted.allocated_bytes, counted.freed_bytes);
+        }
+    }
+    const inline_value: structs.Packet = .{ .envelope = structs.envelope, .extra = structs.sample };
+    const inline_result = try structs.Packet.Schema.serializeAlloc(
+        inline_value,
+        testing.allocator,
+        .{},
+    );
+    defer inline_result.deinit(testing.allocator);
+    try structs.Packet.Schema.verify(inline_result.bytes, .{});
+}
+
+fn serializeAllocatedGraph(allocator: std.mem.Allocator, label: []const u8) !void {
+    const leaf: NativeNode = .{ .label = label };
+    const parent: NativeNode = .{
+        .children = &.{ &leaf, &leaf },
+        .history = &.{ .{ .child = &leaf }, .{ .text = label }, .none },
+    };
+    const root: NativeNode = .{
+        .label = label,
+        .children = &.{ &parent, &parent },
+        .payload = .{ .child = &leaf },
+        .history = &.{ .{ .envelope = structs.envelope }, .{ .text = label }, .none },
+    };
+    const result = try NativeNode.Schema.serializeAlloc(root, allocator, .{});
+    defer result.deinit(allocator);
+    var storage: [4096]u8 align(runtime.storage_alignment) = undefined;
+    const expected = try NativeNode.Schema.serialize(root, &storage, .{});
+    try testing.expectEqualSlices(u8, expected, result.bytes);
+    try NativeNode.Schema.verify(result.bytes, .{});
+    const view = try NativeNode.Schema.read(result.bytes);
+    const first = try view.children.?.get(0);
+    const second = try view.children.?.get(1);
+    try testing.expect(first.layout.table_start != second.layout.table_start);
+    const branch = try NativeNode.Schema.read(first);
+    const first_leaf = try branch.children.?.get(0);
+    const second_leaf = try branch.children.?.get(1);
+    try testing.expect(first_leaf.layout.table_start != second_leaf.layout.table_start);
+    try testing.expectEqualStrings(label, (try NativeNode.Schema.read(view.payload.child)).label.?);
+    try testing.expectEqualStrings(label, (try branch.history.?.get(1)).text);
+    try testing.expectEqualDeep(structs.envelope, try (try view.history.?.get(0)).envelope.read());
+    try testing.expect(try view.history.?.get(2) == .none);
+}
+
+test "allocating serialization packs recursive native graphs and handles allocation failure" {
+    var counted = testing.FailingAllocator.init(testing.allocator, .{});
+    try serializeAllocatedGraph(counted.allocator(), "runtime graph");
+    try testing.expectEqual(@as(usize, 1), counted.allocations);
+    try testing.expectEqual(@as(usize, 1), counted.deallocations);
+    try testing.expectEqual(@as(usize, 0), counted.resize_index);
+    try testing.expectEqual(counted.allocated_bytes, counted.freed_bytes);
+    try testing.checkAllAllocationFailures(testing.allocator, serializeAllocatedGraph, .{"graph"});
+}
+
+test "allocating serialization bounds preflight and frees storage on packing errors" {
+    const Empty = runtime.Schema(struct {}, .{});
+    var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    const allocator = failing.allocator();
+    try testing.expectError(error.DepthLimit, Empty.serializeAlloc(.{}, allocator, .{
+        .max_depth = 0,
+    }));
+    try testing.expectError(error.WorkLimit, Empty.serializeAlloc(.{}, allocator, .{
+        .max_work = 0,
+    }));
+    try testing.expectError(
+        error.MissingRequiredField,
+        graph.Node.Schema.serializeAlloc(.{}, allocator, .{}),
+    );
+    var cyclic: NativeNode = .{};
+    cyclic.payload = .{ .child = &cyclic };
+    try testing.expectError(
+        error.DepthLimit,
+        NativeNode.Schema.serializeAlloc(cyclic, allocator, .{}),
+    );
+    try testing.expectError(error.WorkLimit, NativeNode.Schema.serializeAlloc(cyclic, allocator, .{
+        .max_work = 5,
+    }));
+    try testing.expect(!failing.has_induced_failure);
+    try testing.expectError(error.OutOfMemory, Empty.serializeAlloc(.{}, allocator, .{}));
+    try testing.expect(failing.has_induced_failure);
+    var counted = testing.FailingAllocator.init(testing.allocator, .{});
+    const invalid: NativeNode = .{
+        .history = &.{ .{ .text = "earlier child" }, .{ .text = "\xff" } },
+    };
+    try testing.expectError(
+        error.InvalidUtf8,
+        NativeNode.Schema.serializeAlloc(invalid, counted.allocator(), .{}),
+    );
+    try testing.expectEqual(@as(usize, 1), counted.allocations);
+    try testing.expectEqual(@as(usize, 1), counted.deallocations);
+    try testing.expectEqual(counted.allocated_bytes, counted.freed_bytes);
 }

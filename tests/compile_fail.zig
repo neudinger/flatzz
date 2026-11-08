@@ -132,6 +132,38 @@ pub const cases = [_]Case{
         .expected_error = "expected type '[]u8', found '[]const u8'",
     },
     .{
+        .name = "update_immutable_input",
+        .source =
+        \\const runtime = @import("runtime");
+        \\const Values = struct { number: u32 = 0 };
+        \\const Definition = runtime.Schema(Values, .{
+        \\    .number = runtime.ScalarField(u32, 0, 0),
+        \\});
+        \\test "schema updates require writable bytes" {
+        \\    const bytes: []const u8 = &.{};
+        \\    _ = try Definition.update(bytes, .number, 1);
+        \\}
+        \\
+        ,
+        .expected_error = "expected type '[]u8', found '[]const u8'",
+    },
+    .{
+        .name = "update_read_only_table",
+        .source =
+        \\const runtime = @import("runtime");
+        \\const Values = struct { number: u32 = 0 };
+        \\const Definition = runtime.Schema(Values, .{
+        \\    .number = runtime.ScalarField(u32, 0, 0),
+        \\});
+        \\test "schema updates reject read-only tables" {
+        \\    const table: runtime.Table = undefined;
+        \\    _ = try Definition.update(table, .number, 1);
+        \\}
+        \\
+        ,
+        .expected_error = "expected type '[]u8', found 'runtime.table_view.TableView(.read_only)'",
+    },
+    .{
         .name = "unsupported_scalar",
         .source =
         \\const runtime = @import("runtime");
@@ -637,6 +669,106 @@ pub const cases = [_]Case{
         .expected_error = "storage element count must fit in u32",
     },
     .{
+        .name = "native_storage_depth",
+        .source =
+        \\const runtime = @import("runtime");
+        \\comptime {
+        \\    const Definition = runtime.Schema(struct {}, .{});
+        \\    _ = runtime.storage.capacityFor(Definition, .{}, .{ .max_depth = 0 });
+        \\}
+        \\
+        ,
+        .expected_error = "native storage depth limit exceeded",
+    },
+    .{
+        .name = "native_storage_work",
+        .source =
+        \\const runtime = @import("runtime");
+        \\comptime {
+        \\    const Definition = runtime.Schema(struct {}, .{});
+        \\    _ = runtime.storage.capacityFor(Definition, .{}, .{ .max_work = 0 });
+        \\}
+        \\
+        ,
+        .expected_error = "native storage work limit exceeded",
+    },
+    .{
+        .name = "native_storage_cycle",
+        .source =
+        \\const runtime = @import("runtime");
+        \\const Node = struct {
+        \\    next: ?*const @This() = null,
+        \\    pub const Schema = runtime.Schema(@This(), .{
+        \\        .next = runtime.ReferenceField(0, .{ .table = @This() }, .{}),
+        \\    });
+        \\};
+        \\comptime {
+        \\    var node: Node = .{};
+        \\    node.next = &node;
+        \\    _ = runtime.storage.capacityFor(Node.Schema, node, .{ .max_depth = 2 });
+        \\}
+        \\
+        ,
+        .expected_error = "native storage depth limit exceeded",
+    },
+    .{
+        .name = "native_storage_runtime",
+        .source =
+        \\const runtime = @import("runtime");
+        \\const Value = struct { label: ?[]const u8 };
+        \\const Definition = runtime.Schema(Value, .{
+        \\    .label = runtime.ReferenceField(0, .string, .{}),
+        \\});
+        \\fn capacityForLabel(label: []const u8) usize {
+        \\    const value: Value = .{ .label = label };
+        \\    return runtime.storage.capacityFor(Definition, value, .{});
+        \\}
+        \\test "runtime const values cannot determine array capacity" {
+        \\    _ = capacityForLabel("sensor");
+        \\}
+        \\
+        ,
+        .expected_error = "argument to comptime parameter must be comptime-known",
+    },
+    .{
+        .name = "native_storage_mismatch",
+        .source =
+        \\const runtime = @import("runtime");
+        \\comptime {
+        \\    const Definition = runtime.Schema(struct { label: ?[]const u8 }, .{
+        \\        .label = runtime.ReferenceField(0, .string, .{}),
+        \\    });
+        \\    _ = runtime.storage.capacityFor(Definition, .{ .label = @as(u64, 1) }, .{});
+        \\}
+        \\
+        ,
+        .expected_error = "native storage value must match the schema",
+    },
+    .{
+        .name = "native_storage_overflow",
+        .source =
+        \\const std = @import("std");
+        \\const runtime = @import("runtime");
+        \\const Value = struct { numbers: ?[]const u64 };
+        \\comptime {
+        \\    const Definition = runtime.Schema(Value, .{
+        \\        .numbers = runtime.ReferenceField(
+        \\            0,
+        \\            .{ .vector = runtime.ScalarCodec(u64) },
+        \\            .{},
+        \\        ),
+        \\    });
+        \\    const count = runtime.Builder.max_buffer_size / @sizeOf(u64) + 1;
+        \\    const numbers = @as([*]const u64, @ptrFromInt(8))[0..count];
+        \\    _ = runtime.storage.capacityFor(Definition, Value{ .numbers = numbers }, .{
+        \\        .max_work = std.math.maxInt(usize),
+        \\    });
+        \\}
+        \\
+        ,
+        .expected_error = "storage capacity exceeds Builder.max_buffer_size",
+    },
+    .{
         .name = "borrow_scalar",
         .source =
         \\const runtime = @import("runtime");
@@ -667,6 +799,21 @@ pub const cases = [_]Case{
         .expected_error = "borrowMutable requires a structured field; use update for scalars and strings",
     },
     .{
+        .name = "borrow_immutable_input",
+        .source =
+        \\const runtime = @import("runtime");
+        \\test "mutable borrowing requires writable bytes" {
+        \\    const Definition = runtime.Schema(struct { values: ?[]const u32 }, .{
+        \\        .values = runtime.ReferenceField(0, .{ .vector = runtime.ScalarCodec(u32) }, .{}),
+        \\    });
+        \\    const bytes: []const u8 = &.{};
+        \\    _ = try Definition.borrowMutable(bytes, .values);
+        \\}
+        \\
+        ,
+        .expected_error = "expected type '[]u8', found '[]const u8'",
+    },
+    .{
         .name = "borrow_read_only",
         .source =
         \\const runtime = @import("runtime");
@@ -679,6 +826,32 @@ pub const cases = [_]Case{
         \\}
         \\
         ,
-        .expected_error = "expected type 'runtime.table_view.TableView(.mutable)', found 'runtime.table_view.TableView(.read_only)'",
+        .expected_error = "expected type '[]u8', found 'runtime.table_view.TableView(.read_only)'",
+    },
+    .{
+        .name = "child_schema_native_type",
+        .source =
+        \\const runtime = @import("runtime");
+        \\const SchemaValue = struct { value: u32 = 0 };
+        \\const Child = struct {
+        \\    value: u32 = 0,
+        \\    pub const Schema = runtime.Schema(SchemaValue, .{
+        \\        .value = runtime.ScalarField(u32, 0, 0),
+        \\    });
+        \\};
+        \\const Parent = struct {
+        \\    child: ?*const Child = null,
+        \\    pub const Schema = runtime.Schema(@This(), .{
+        \\        .child = runtime.ReferenceField(0, .{ .table = Child }, .{}),
+        \\    });
+        \\};
+        \\test "child schemas retain their declared native type" {
+        \\    var storage: [256]u8 align(runtime.storage_alignment) = undefined;
+        \\    const child: Child = .{ .value = 7 };
+        \\    _ = try Parent.Schema.serialize(.{ .child = &child }, &storage, .{});
+        \\}
+        \\
+        ,
+        .expected_error = "schema native type must match its referenced type",
     },
 };

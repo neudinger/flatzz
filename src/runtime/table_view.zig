@@ -2,7 +2,7 @@
 //! C++ Table / Go Table{Bytes, Pos}, with checked local metadata cached once.
 //! https://github.com/google/flatbuffers/blob/b8431fbcd7a5c71817f314e18b332c0648554efa/include/flatbuffers/table.h
 const wire = @import("wire.zig");
-const validation = @import("validation.zig");
+const buffer_access = @import("buffer_access.zig");
 const sequence = @import("sequence.zig");
 const mutation = @import("mutation.zig");
 const errors = @import("errors.zig");
@@ -23,6 +23,14 @@ pub const Access = enum {
     mutable,
 };
 
+/// Byte slice selected by a borrowed view's compile-time mutation capability.
+pub fn ByteSlice(comptime access: Access) type {
+    return switch (access) {
+        .read_only => []const u8,
+        .mutable => []u8,
+    };
+}
+
 /// Positions are runtime offsets relative to the complete frame, not child slices.
 pub const Source = union(enum) {
     /// Open an ordinary root without checking an identifier.
@@ -39,15 +47,12 @@ pub const Source = union(enum) {
 pub fn TableView(comptime access: Access) type {
     return struct {
         const Self = @This();
-        const Bytes = switch (access) {
-            .read_only => []const u8,
-            .mutable => []u8,
-        };
+        const Bytes = ByteSlice(access);
 
         /// Complete selected frame, including its header; child offsets share this base.
         bytes: Bytes,
         /// Checked local table/vtable layout; structural edits invalidate cached offsets.
-        layout: validation.TableLayout,
+        layout: buffer_access.TableLayout,
 
         /// Borrows one complete FlatBuffer frame, retaining any size prefix.
         /// With .first, bytes[result.bytes.len..] is the remaining input.
@@ -64,7 +69,7 @@ pub fn TableView(comptime access: Access) type {
             const frame_bytes = bytes[0..frame.frame_size];
             const table_start = switch (source) {
                 .position => |table_position| table_position,
-                .root, .options => try validation.referenceTarget(
+                .root, .options => try buffer_access.referenceTarget(
                     frame_bytes,
                     frame.root_offset_start,
                 ),
@@ -72,7 +77,7 @@ pub fn TableView(comptime access: Access) type {
             // Neither the table nor its vtable may overlap the selected header.
             if (table_start < frame.header_size)
                 return AccessError.InvalidBuffer;
-            var layout = try validation.tableAt(frame_bytes, table_start);
+            var layout = try buffer_access.tableAt(frame_bytes, table_start);
             if (layout.vtable_start < frame.header_size)
                 return AccessError.InvalidBuffer;
             layout.header_size = frame.header_size;
@@ -80,7 +85,7 @@ pub fn TableView(comptime access: Access) type {
         }
 
         /// Parent metadata ranges that child references must not reinterpret.
-        pub fn context(self: Self) validation.Context {
+        pub fn context(self: Self) buffer_access.Context {
             return .{
                 .table = self.layout,
                 .header_size = self.layout.header_size,
@@ -93,7 +98,7 @@ pub fn TableView(comptime access: Access) type {
             comptime ScalarType: type,
             comptime field_id: usize,
         ) AccessError!?usize {
-            return validation.fieldPosition(
+            return buffer_access.fieldPosition(
                 self.bytes,
                 self.layout,
                 field_id,
@@ -113,7 +118,7 @@ pub fn TableView(comptime access: Access) type {
             if (@typeInfo(ValueType) == .optional and default != null)
                 @compileError("optional scalars must default to null");
             const field_start = try self.fieldPosition(ScalarType, field_id) orelse return default;
-            return try validation.readScalar(ScalarType, self.bytes, field_start);
+            return try buffer_access.readScalar(ScalarType, self.bytes, field_start);
         }
 
         /// Borrow a present UTF-8 string without its prefix/terminator; return null for absence.
@@ -123,7 +128,7 @@ pub fn TableView(comptime access: Access) type {
             comptime field_id: usize,
         ) AccessError!?[]const u8 {
             const field_start = try self.fieldPosition(u32, field_id) orelse return null;
-            return try validation.stringAt(self.bytes, self.context(), field_start);
+            return try buffer_access.stringAt(self.bytes, self.context(), field_start);
         }
 
         /// Borrow a present vector with this table's access capability; return null for absence.
@@ -178,7 +183,7 @@ pub fn TableView(comptime access: Access) type {
             comptime Layout: type,
             comptime field_id: usize,
         ) AccessError!?StructView(Layout, access) {
-            const struct_start = try validation.fieldPosition(
+            const struct_start = try buffer_access.fieldPosition(
                 self.bytes,
                 self.layout,
                 field_id,
@@ -214,7 +219,11 @@ pub fn TableView(comptime access: Access) type {
             const field_start = try self.fieldPosition(u32, field_id) orelse return null;
             return .{
                 .bytes = self.bytes,
-                .layout = try validation.referencedTable(self.bytes, self.context(), field_start),
+                .layout = try buffer_access.referencedTable(
+                    self.bytes,
+                    self.context(),
+                    field_start,
+                ),
             };
         }
 

@@ -7,7 +7,7 @@ const wire = @import("wire.zig");
 const Builder = @import("Builder.zig");
 const errors = @import("errors.zig");
 const unions = @import("unions.zig");
-const validation = @import("validation.zig");
+const buffer_access = @import("buffer_access.zig");
 
 const BuildError = errors.BuildError;
 
@@ -67,6 +67,11 @@ pub fn TableBuilder(comptime field_count: usize) type {
             try self.checkActive();
             if (self.field_offsets[field_id] != 0)
                 return BuildError.DuplicateField;
+        }
+
+        fn offsetSpace(self: *const Self, offset_count: usize) usize {
+            return wire.paddingFor(self.builder.used(), wire.field_offset_size) +
+                offset_count * wire.field_offset_size;
         }
 
         /// Scalar defaults may be omitted. Optional null is always omitted and
@@ -133,10 +138,7 @@ pub fn TableBuilder(comptime field_count: usize) type {
                 return;
             };
             try self.builder.checkOffset(child_offset, self.table_end);
-            const required_bytes = wire.paddingFor(
-                self.builder.used(),
-                wire.field_offset_size,
-            ) + wire.field_offset_size;
+            const required_bytes = self.offsetSpace(1);
             try self.builder.ensureSpace(required_bytes);
             const relative_offset: u32 = @intCast(
                 self.builder.used() + required_bytes - @backingInt(child_offset),
@@ -161,10 +163,7 @@ pub fn TableBuilder(comptime field_count: usize) type {
             var required_bytes: usize = 0;
             if (handle) |present| {
                 try self.builder.checkOffset(present, self.table_end);
-                required_bytes = wire.paddingFor(
-                    self.builder.used(),
-                    wire.field_offset_size,
-                ) + wire.field_offset_size;
+                required_bytes = self.offsetSpace(1);
             }
             if (selected != .none or self.builder.force_defaults)
                 required_bytes += @sizeOf(wire.UnionTag);
@@ -187,10 +186,7 @@ pub fn TableBuilder(comptime field_count: usize) type {
             if (handles) |present| {
                 try self.builder.checkOffset(present.tag, self.table_end);
                 try self.builder.checkOffset(present.value, self.table_end);
-                try self.builder.ensureSpace(wire.paddingFor(
-                    self.builder.used(),
-                    wire.field_offset_size,
-                ) + wire.field_offset_size + wire.field_offset_size);
+                try self.builder.ensureSpace(self.offsetSpace(2));
             }
             self.addOffset(
                 field_ids.value,
@@ -236,7 +232,7 @@ pub fn TableBuilder(comptime field_count: usize) type {
                 if ((selected == .none) != (value_offset == 0))
                     return BuildError.InvalidUnion;
                 if (value_offset != 0) {
-                    _ = validation.referenceTarget(
+                    _ = buffer_access.referenceTarget(
                         self.builder.buffer,
                         self.builder.buffer.len - value_offset,
                     ) catch return BuildError.InvalidUnion;

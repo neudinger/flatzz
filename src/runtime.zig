@@ -21,6 +21,18 @@
 //! offsets. Union fields use `Union.Handle`; union vectors use `Builder.UnionVector`.
 //! Native union inputs instead use `Union.Value`.
 //! Finish the same builder; handles cannot be transferred to a fresh builder.
+//! For a comptime-known graph, `storage.capacityFor(Schema, value, .{})` derives
+//! an aligned capacity bound without runtime sizing. For runtime inputs, `Storage`
+//! accepts explicit maximum capacities so the same buffer can be reused.
+//! `serializeAlloc` measures runtime values and returns one owned allocation without
+//! a final output copy. Call `result.deinit(allocator)` once with the same allocator;
+//! its `.bytes` and borrowed views expire then. Native inputs must remain valid
+//! throughout the call, including allocator operations.
+//! Generated read accepts bytes or a checked Table.
+//! Generated update and borrowMutable accept mutable bytes or a checked MutableTable.
+//! Byte inputs open ordinary roots. Pass tables to reuse metadata or access nested/custom frames.
+//! Generated verify accepts bytes with framing options or a checked Table with its selected frame.
+//! It verifies the reachable graph with fresh depth, object and work limits.
 //!
 //! Complete example inside a test with `std` and `flatzz` imported:
 //! ```zig
@@ -33,35 +45,50 @@
 //!         .label = flatzz.ReferenceField(1, .string, .{}),
 //!     });
 //!     pub const serialize = Schema.serialize;
+//!     pub const serializeAlloc = Schema.serializeAlloc;
 //! };
 //! const value: Reading = .{ .value = 41, .label = "sensor" };
-//! var storage: flatzz.Storage(Reading.Schema, .{ .label = 6 }, .{}) = .{};
-//! const bytes = try value.serialize(&storage.buffer, .{});
-//! try Reading.Schema.verifyRoot(bytes, .{});
-//! try std.testing.expect(try Reading.Schema.updateRoot(bytes, .value, 42));
-//! const reading = try Reading.Schema.readRoot(bytes);
+//! const capacity = comptime flatzz.storage.capacityFor(Reading.Schema, value, .{});
+//! var storage: [capacity]u8 align(flatzz.storage_alignment) = undefined;
+//! const bytes = try value.serialize(&storage, .{});
+//! try Reading.Schema.verify(bytes, .{});
+//! try std.testing.expect(try Reading.Schema.update(bytes, .value, 42));
+//! const reading = try Reading.Schema.read(bytes);
 //! try std.testing.expectEqual(@as(u32, 42), reading.value);
 //! try std.testing.expectEqualStrings("sensor", reading.label.?);
 //! ```
 //! Expected result: a verified table containing `42` and `"sensor"`; no output.
-//! `bytes` and `reading.label` borrow `storage.buffer`. No `deinit` is needed.
+//! `bytes` and `reading.label` borrow `storage`. No `deinit` is needed.
 //!
-//! Alternative construction in a separate test, using the same `Reading` type:
+//! Explicit construction with capacity bounds, in a separate test using `Reading`:
 //! ```zig
-//! var storage: [128]u8 align(flatzz.storage_alignment) = undefined;
-//! var builder = flatzz.Builder.init(&storage);
+//! var storage: flatzz.Storage(Reading.Schema, .{ .label = 6 }, .{}) = .{};
+//! var builder = flatzz.Builder.init(&storage.buffer);
 //! const label = try builder.createString("sensor");
 //! const fields: Reading.Schema.Fields = .{ .value = 42, .label = label };
 //! var table = try Reading.Schema.Context.init(&builder);
 //! try Reading.Schema.addFields(&table, fields);
 //! const bytes = try builder.finish(try Reading.Schema.endTable(&table), .ordinary);
-//! try Reading.Schema.verifyRoot(bytes, .{});
-//! const view = try Reading.Schema.readRoot(bytes);
+//! try Reading.Schema.verify(bytes, .{});
+//! const view = try Reading.Schema.read(bytes);
 //! try std.testing.expectEqual(@as(u32, 42), view.value);
 //! try std.testing.expectEqualStrings("sensor", view.label.?);
 //! ```
 //! Expected result: the same values using completed handles from one builder.
-//! The result borrows `storage`; resetting the builder invalidates its contents.
+//! The result borrows `storage.buffer`; resetting the builder invalidates its contents.
+//!
+//! Allocating construction, in a separate test using the same `Reading` type:
+//! ```zig
+//! const allocator = std.testing.allocator;
+//! const value: Reading = .{ .value = 42, .label = "sensor" };
+//! const result = try value.serializeAlloc(allocator, .{});
+//! defer result.deinit(allocator);
+//! try Reading.Schema.verify(result.bytes, .{});
+//! const view = try Reading.Schema.read(result.bytes);
+//! try std.testing.expectEqualStrings("sensor", view.label.?);
+//! ```
+//! Expected result: a verified frame backed by one allocation; nothing is printed.
+//! The result owns its storage; `result.bytes` and `view.label` borrow it until deinit.
 
 const table_view = @import("runtime/table_view.zig");
 const sequence = @import("runtime/sequence.zig");
@@ -74,12 +101,12 @@ const errors = @import("runtime/errors.zig");
 /// Wire sizes, scalar encodings, alignment, and checked arithmetic.
 pub const wire = @import("runtime/wire.zig");
 /// Checked scalar, string, offset, and sequence access to complete buffers.
-pub const validation = @import("runtime/validation.zig");
+pub const buffer_access = @import("runtime/buffer_access.zig");
 /// Ordinary and size-prefixed frame boundaries and optional identifiers.
 pub const framing = @import("runtime/framing.zig");
 /// Compile-time field descriptors and generated access/build/verify adapters.
 pub const schema = @import("runtime/schema.zig");
-/// Compile-time capacity calculations for caller-owned builder storage.
+/// Capacity bounds and ownership for fixed and allocated serialization.
 pub const storage = @import("runtime/storage.zig");
 /// Backward builder using caller-owned aligned storage; handles expire on reset.
 pub const Builder = @import("runtime/Builder.zig");
@@ -105,6 +132,9 @@ pub const WriteOptions = schema.WriteOptions;
 /// Derive aligned caller-owned storage from schema facts and explicit capacities.
 /// String capacities count payload bytes; vectors use element counts or count/byte records.
 pub const Storage = storage.Storage;
+/// Owned serialized frame; call deinit once with the allocator used for serialization.
+/// Its bytes and every borrowed view expire on deinit; never free the bytes suffix alone.
+pub const Serialized = storage.Serialized;
 /// Describe a scalar field's native type, physical ID, and default value.
 pub const ScalarField = schema.ScalarField;
 /// Describe a string, vector, or table reference, optionally required.
@@ -150,12 +180,6 @@ pub const BuildError = errors.BuildError;
 /// Checked access errors plus recursive verifier resource-limit failures.
 pub const VerifyError = errors.VerifyError;
 
-/// Copy a bounds-checked little-endian scalar at an absolute byte position.
-/// Unaligned input is supported; unknown exhaustive-enum tags return InvalidBuffer.
-pub const read = validation.readScalar;
-/// Write a little-endian scalar after checking its byte range; no alignment is required.
-/// OutOfBounds leaves bytes unchanged. This does not create an absent schema field.
-pub const write = validation.writeScalar;
 /// Bytes occupied by the root relative offset.
 pub const root_offset_size = wire.root_offset_size;
 /// Bytes in an optional FlatBuffers file identifier.

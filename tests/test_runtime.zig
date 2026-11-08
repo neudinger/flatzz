@@ -3,6 +3,7 @@ const runtime = @import("runtime");
 const reading = @import("reading");
 const fixtures = @import("test_schema.zig");
 
+const buffer_access = runtime.buffer_access;
 const Reading = reading.Reading;
 const testing = std.testing;
 
@@ -64,8 +65,8 @@ const scalar_wire_cases = .{
 fn scalarRoundTrip(comptime ScalarType: type, value: ScalarType) !void {
     const scalar_size = @sizeOf(runtime.wire.Bits(ScalarType));
     var bytes: [scalar_size + 1]u8 = @splat(0xa5);
-    try runtime.write(ScalarType, &bytes, 1, value);
-    const result = try runtime.read(ScalarType, &bytes, 1);
+    try buffer_access.writeScalar(ScalarType, &bytes, 1, value);
+    const result = try buffer_access.readScalar(ScalarType, &bytes, 1);
     try testing.expectEqual(
         @as(runtime.wire.Bits(ScalarType), @bitCast(value)),
         @as(runtime.wire.Bits(ScalarType), @bitCast(result)),
@@ -74,12 +75,12 @@ fn scalarRoundTrip(comptime ScalarType: type, value: ScalarType) !void {
     const before = bytes;
     try testing.expectError(
         error.OutOfBounds,
-        runtime.write(ScalarType, &bytes, bytes.len, value),
+        buffer_access.writeScalar(ScalarType, &bytes, bytes.len, value),
     );
     try testing.expectEqualSlices(u8, &before, &bytes);
     try testing.expectError(
         error.OutOfBounds,
-        runtime.read(ScalarType, &bytes, std.math.maxInt(usize)),
+        buffer_access.readScalar(ScalarType, &bytes, std.math.maxInt(usize)),
     );
 }
 
@@ -107,7 +108,7 @@ test "wire scalars preserve integer boundaries and floating point bits on unalig
         );
     }
     var bytes: [runtime.field_offset_size]u8 = undefined;
-    try runtime.write(u32, &bytes, 0, 0x01020304);
+    try buffer_access.writeScalar(u32, &bytes, 0, 0x01020304);
     try testing.expectEqualSlices(u8, &.{ 4, 3, 2, 1 }, &bytes);
     inline for (scalar_wire_cases) |fixture| {
         const ScalarType = fixture[0];
@@ -115,13 +116,13 @@ test "wire scalars preserve integer boundaries and floating point bits on unalig
         const expected_bits: WireType = fixture[2];
         const expected_bytes: [@sizeOf(WireType)]u8 = fixture[3];
         var encoded: [@sizeOf(WireType)]u8 = undefined;
-        try runtime.write(ScalarType, &encoded, 0, @bitCast(expected_bits));
+        try buffer_access.writeScalar(ScalarType, &encoded, 0, @bitCast(expected_bits));
         try testing.expectEqualSlices(u8, &expected_bytes, &encoded);
         try testing.expectEqual(
             expected_bits,
             @as(
                 WireType,
-                @bitCast(try runtime.read(ScalarType, &expected_bytes, 0)),
+                @bitCast(try buffer_access.readScalar(ScalarType, &expected_bytes, 0)),
             ),
         );
     }
@@ -131,25 +132,25 @@ test "bool normalization and signed exhaustive and open enum tags" {
     const Closed = enum(i16) { negative = -2, positive = 7 };
     const Open = enum(i16) { negative = -2, _ };
     var bytes: [@sizeOf(i16)]u8 = undefined;
-    try runtime.write(u8, &bytes, 0, 0xff);
-    try testing.expect(try runtime.read(bool, &bytes, 0));
-    try runtime.write(bool, &bytes, 0, true);
+    try buffer_access.writeScalar(u8, &bytes, 0, 0xff);
+    try testing.expect(try buffer_access.readScalar(bool, &bytes, 0));
+    try buffer_access.writeScalar(bool, &bytes, 0, true);
     try testing.expectEqual(@as(u8, 1), bytes[0]);
-    try runtime.write(bool, &bytes, 0, false);
+    try buffer_access.writeScalar(bool, &bytes, 0, false);
     try testing.expectEqual(@as(u8, 0), bytes[0]);
-    try runtime.write(Closed, &bytes, 0, .negative);
+    try buffer_access.writeScalar(Closed, &bytes, 0, .negative);
     try testing.expectEqual(
         Closed.negative,
-        try runtime.read(Closed, &bytes, 0),
+        try buffer_access.readScalar(Closed, &bytes, 0),
     );
-    try runtime.write(Open, &bytes, 0, @fromBackingInt(@intCast(-123)));
+    try buffer_access.writeScalar(Open, &bytes, 0, @fromBackingInt(@intCast(-123)));
     try testing.expectEqual(
         @as(i16, -123),
-        @backingInt(try runtime.read(Open, &bytes, 0)),
+        @backingInt(try buffer_access.readScalar(Open, &bytes, 0)),
     );
     try testing.expectError(
         error.InvalidBuffer,
-        runtime.read(Closed, &bytes, 0),
+        buffer_access.readScalar(Closed, &bytes, 0),
     );
 }
 
@@ -215,7 +216,7 @@ test "signed vtables and table at position do not require root discovery" {
         try testing.expectEqual(@as(u32, 42), try writable.readField(u32, 0, 0));
     }
     // Invalidating only the root offset does not invalidate this table's metadata.
-    try runtime.write(u32, &bytes, root_start, 0);
+    try buffer_access.writeScalar(u32, &bytes, root_start, 0);
     for (root_sources) |root_source| {
         try testing.expectError(error.InvalidBuffer, runtime.Table.from(&bytes, root_source));
         try testing.expectError(
@@ -249,7 +250,7 @@ test "signed vtables and table at position do not require root discovery" {
 
 test "trimmed vtables absent slots and malformed field ranges" {
     var bytes = signedVtableFixture();
-    try runtime.write(
+    try buffer_access.writeScalar(
         u16,
         &bytes,
         trailing_vtable_start,
@@ -261,28 +262,28 @@ test "trimmed vtables absent slots and malformed field ranges" {
     );
     bytes = signedVtableFixture();
     const entry_start = trailing_vtable_start + runtime.vtable_header_size;
-    try runtime.write(u16, &bytes, entry_start, 0);
+    try buffer_access.writeScalar(u16, &bytes, entry_start, 0);
     try testing.expectEqual(
         @as(u32, 17),
         try (try runtime.Table.from(&bytes, .root)).readField(u32, 0, 17),
     );
-    try runtime.write(u16, &bytes, entry_start, runtime.table_header_size - 1);
+    try buffer_access.writeScalar(u16, &bytes, entry_start, runtime.table_header_size - 1);
     try testing.expectError(
         error.InvalidBuffer,
         (try runtime.Table.from(&bytes, .root)).readField(u32, 0, 17),
     );
-    try runtime.write(u16, &bytes, entry_start, runtime.table_header_size + 1);
+    try buffer_access.writeScalar(u16, &bytes, entry_start, runtime.table_header_size + 1);
     try testing.expectError(
         error.OutOfBounds,
         (try runtime.Table.from(&bytes, .root)).readField(u32, 0, 17),
     );
-    try runtime.write(u16, &bytes, entry_start, runtime.table_header_size + 1);
+    try buffer_access.writeScalar(u16, &bytes, entry_start, runtime.table_header_size + 1);
     try testing.expectError(
         error.InvalidBuffer,
         (try runtime.Table.from(&bytes, .root)).readField(u16, 0, 17),
     );
     bytes = signedVtableFixture();
-    try runtime.write(
+    try buffer_access.writeScalar(
         u16,
         &bytes,
         trailing_vtable_start,
@@ -293,7 +294,7 @@ test "trimmed vtables absent slots and malformed field ranges" {
         runtime.Table.from(&bytes, .root),
     );
     bytes = signedVtableFixture();
-    try runtime.write(
+    try buffer_access.writeScalar(
         i32,
         &bytes,
         signed_table_start,
@@ -320,12 +321,13 @@ test "scalar mutation uses cached lookup preserves presence and failure atomicit
     const before = storage.buffer;
     try testing.expectError(
         error.CannotClearField,
-        Reading.update(bytes, .temperature, null),
+        Reading.update(table, .temperature, null),
     );
     try testing.expectEqualSlices(u8, &before, &storage.buffer);
     const absent = try Reading.serialize(.{}, &storage.buffer, .{});
-    try testing.expect(!try Reading.update(absent, .sequence, 0));
-    try testing.expect(!try Reading.update(absent, .temperature, null));
+    const absent_table = try runtime.MutableTable.from(absent, .root);
+    try testing.expect(!try Reading.update(absent_table, .sequence, 0));
+    try testing.expect(!try Reading.update(absent_table, .temperature, null));
 }
 
 test "recursive schema heterogeneous tables shared children and arbitrary byte vectors" {
@@ -387,7 +389,7 @@ test "verification visits later vector elements whereas ordinary access stays la
     }, .{}) = .{};
     const bytes = try Reading.serialize(.{ .tags = &.{ "one", "two" } }, &storage.buffer, .{});
     const tags = (try Reading.read(bytes)).tags.?;
-    try runtime.write(
+    try buffer_access.writeScalar(
         u32,
         bytes,
         tags.payload_start + runtime.field_offset_size,
@@ -402,47 +404,54 @@ test "verification visits later vector elements whereas ordinary access stays la
 test "verification enforces required fields and explicit resource limits" {
     var storage: [fixtures.storage_capacity]u8 align(runtime.storage_alignment) = undefined;
     const bytes = try fixtures.build(&storage, .ordinary);
-    try testing.expectError(
-        error.DepthLimit,
-        runtime.Verifier.verify(fixtures.Graph, bytes, .{ .max_depth = 2 }),
-    );
-    try testing.expectError(
-        error.DepthLimit,
-        runtime.Verifier.verify(fixtures.Graph, bytes, .{ .max_depth = 0 }),
-    );
-    try testing.expectError(
-        error.ObjectLimit,
-        runtime.Verifier.verify(fixtures.Graph, bytes, .{ .max_objects = 1 }),
-    );
-    try testing.expectError(
-        error.WorkLimit,
-        runtime.Verifier.verify(fixtures.Graph, bytes, .{ .max_work = 1 }),
-    );
+    const table = try runtime.Table.from(bytes, .root);
+    inline for (.{ bytes, table }) |source| {
+        try testing.expectError(
+            error.DepthLimit,
+            runtime.Verifier.verify(fixtures.Graph, source, .{ .max_depth = 2 }),
+        );
+        try testing.expectError(
+            error.DepthLimit,
+            runtime.Verifier.verify(fixtures.Graph, source, .{ .max_depth = 0 }),
+        );
+        try testing.expectError(
+            error.ObjectLimit,
+            runtime.Verifier.verify(fixtures.Graph, source, .{ .max_objects = 1 }),
+        );
+        try testing.expectError(
+            error.WorkLimit,
+            runtime.Verifier.verify(fixtures.Graph, source, .{ .max_work = 1 }),
+        );
+    }
     var verifier = runtime.Verifier.init(bytes, .{});
     try verifier.verifyRoot(fixtures.Graph);
     try testing.expect(
         verifier.object_count > 5,
     ); // Repeated shared references consume visits.
-    try runtime.Verifier.verify(fixtures.Graph, bytes, .{
-        .max_depth = 3,
-        .max_objects = verifier.object_count,
-        .max_work = verifier.work_count,
-    });
-    try testing.expectError(
-        error.WorkLimit,
-        runtime.Verifier.verify(
-            fixtures.Graph,
-            bytes,
-            .{ .max_work = verifier.work_count - 1 },
-        ),
-    );
+    inline for (.{ bytes, table }) |source| {
+        try runtime.Verifier.verify(fixtures.Graph, source, .{
+            .max_depth = 3,
+            .max_objects = verifier.object_count,
+            .max_work = verifier.work_count,
+        });
+        try testing.expectError(
+            error.WorkLimit,
+            runtime.Verifier.verify(
+                fixtures.Graph,
+                source,
+                .{ .max_work = verifier.work_count - 1 },
+            ),
+        );
+    }
     var builder = runtime.Builder.init(&storage);
     var empty = try runtime.TableBuilder(0).init(&builder);
     const absent = try builder.finish(try empty.endTable(), .ordinary);
-    try testing.expectError(
-        error.MissingRequiredField,
-        runtime.Verifier.verify(fixtures.Graph, absent, .{}),
-    );
+    inline for (.{ absent, try runtime.Table.from(absent, .root) }) |source| {
+        try testing.expectError(
+            error.MissingRequiredField,
+            runtime.Verifier.verify(fixtures.Graph, source, .{}),
+        );
+    }
     // Ordinary access returns absence; only schema verification enforces required.
     try testing.expect(
         (try fixtures.Graph.Schema.read(
@@ -466,7 +475,7 @@ test "older schema ignores unknown fields during verification" {
         u32,
         fixtures.Graph.fields.child.wire_id,
     )).?;
-    try runtime.write(u32, bytes, child_slot, 0);
+    try buffer_access.writeScalar(u32, bytes, child_slot, 0);
     try runtime.Verifier.verify(Older, bytes, .{});
     try testing.expectError(
         error.InvalidBuffer,
@@ -739,7 +748,7 @@ test "sequence references cannot reinterpret enclosing table metadata" {
     const bytes = try builder.finish(try context.endTable(), .ordinary);
     const table = try runtime.Table.from(bytes, .root);
     const reference_start = (try table.fieldPosition(u32, 1)).?;
-    try runtime.write(u32, bytes, reference_start, runtime.field_offset_size);
+    try buffer_access.writeScalar(u32, bytes, reference_start, runtime.field_offset_size);
     const before = storage;
     try testing.expectError(error.InvalidBuffer, table.readString(1));
     try testing.expectError(
@@ -765,7 +774,7 @@ test "scalar sequence encoding preserves overlapping native input" {
     for (values, 0..) |value, element_index| {
         try testing.expectEqual(
             value,
-            try runtime.read(
+            try buffer_access.readScalar(
                 u32,
                 std.mem.sliceAsBytes(&native),
                 (element_index + 1) * element_size,
@@ -781,7 +790,7 @@ test "scalar sequence encoding preserves overlapping native input" {
     for (values, 0..) |value, element_index| {
         try testing.expectEqual(
             value,
-            try runtime.read(
+            try buffer_access.readScalar(
                 u32,
                 std.mem.sliceAsBytes(&native),
                 element_index * element_size,

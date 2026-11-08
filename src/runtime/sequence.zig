@@ -17,7 +17,7 @@
 //! Expected result: `second == 7`; nothing is printed. This manually assembled
 //! scalar payload has no vector count prefix; use `fromReference` for wire vectors.
 const wire = @import("wire.zig");
-const validation = @import("validation.zig");
+const buffer_access = @import("buffer_access.zig");
 const errors = @import("errors.zig");
 const table_view = @import("table_view.zig");
 const struct_view = @import("struct_view.zig");
@@ -66,10 +66,9 @@ pub fn StructCodec(comptime StructLayout: type) type {
         /// Borrow one range-checked inline element; vector containment is checked by the caller.
         pub fn read(
             bytes: []const u8,
-            context: validation.Context,
+            _: buffer_access.Context,
             element_start: usize,
         ) AccessError!Value {
-            _ = context;
             // The vector already contains the element; do not follow an offset
             // or reject its intentional overlap with the vector payload.
             return Value.from(bytes, element_start);
@@ -95,11 +94,10 @@ pub fn ScalarCodec(comptime ScalarType: type) type {
         /// Unknown exhaustive-enum tags return InvalidBuffer.
         pub fn read(
             bytes: []const u8,
-            context: validation.Context,
+            _: buffer_access.Context,
             element_start: usize,
         ) AccessError!Value {
-            _ = context;
-            return validation.readScalar(ScalarType, bytes, element_start);
+            return buffer_access.readScalar(ScalarType, bytes, element_start);
         }
     };
 }
@@ -118,10 +116,10 @@ pub const StringCodec = struct {
     /// Follow a checked slot and borrow its UTF-8 payload within the supplied context.
     pub fn read(
         bytes: []const u8,
-        context: validation.Context,
+        context: buffer_access.Context,
         element_start: usize,
     ) AccessError!Value {
-        return validation.stringAt(bytes, context, element_start);
+        return buffer_access.stringAt(bytes, context, element_start);
     }
 };
 
@@ -143,12 +141,12 @@ pub fn TableCodec(comptime ChildSchema: type) type {
         /// Follow one child offset and check local table metadata; does not traverse its fields.
         pub fn read(
             bytes: []const u8,
-            context: validation.Context,
+            context: buffer_access.Context,
             element_start: usize,
         ) AccessError!Value {
             return .{
                 .bytes = bytes,
-                .layout = try validation.referencedTable(bytes, context, element_start),
+                .layout = try buffer_access.referencedTable(bytes, context, element_start),
             };
         }
     };
@@ -171,10 +169,7 @@ pub fn SequenceView(
         const Self = @This();
         /// Compile-time slot decoder and wire layout used by this sequence.
         pub const Codec = ElementCodec;
-        const Bytes = switch (access) {
-            .read_only => []const u8,
-            .mutable => []u8,
-        };
+        const Bytes = table_view.ByteSlice(access);
         /// Element result; inline structs inherit this sequence's access capability.
         pub const ElementView = switch (ElementCodec.kind) {
             .structure => StructView(ElementCodec.Layout, access),
@@ -189,16 +184,16 @@ pub fn SequenceView(
         /// Element count, not a byte length.
         element_count: usize,
         /// Parent ranges protected while following element references.
-        context: validation.Context = .{},
+        context: buffer_access.Context = .{},
 
         /// Follow a vector offset and validate its prefix, extent, and alignment.
         /// Element references are checked lazily by `get`; no allocation occurs.
         pub fn fromReference(
             bytes: Bytes,
-            context: validation.Context,
+            context: buffer_access.Context,
             reference_start: usize,
         ) AccessError!Self {
-            const layout = try validation.sequenceAt(
+            const layout = try buffer_access.sequenceAt(
                 ElementCodec.slot_size,
                 ElementCodec.slot_alignment,
                 0,
@@ -241,7 +236,7 @@ pub fn SequenceView(
 
         /// Call after elementStart has checked the full payload. Include the
         /// count prefix so a child vtable cannot reinterpret vector metadata.
-        pub fn elementContext(self: Self) validation.Context {
+        pub fn elementContext(self: Self) buffer_access.Context {
             var context = self.context;
             const prefix_size = @min(self.payload_start, wire.sequence_length_size);
             context.vector = .{

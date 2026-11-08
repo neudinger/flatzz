@@ -25,7 +25,7 @@
 //! https://github.com/dvidelabs/flatcc/blob/e1272290b486fdd7fdc60f061036b7a18c468dc7/include/flatcc/flatcc_builder.h
 const std = @import("std");
 const wire = @import("wire.zig");
-const validation = @import("validation.zig");
+const buffer_access = @import("buffer_access.zig");
 const errors = @import("errors.zig");
 
 const Self = @This();
@@ -205,7 +205,7 @@ fn createSequence(
             values,
         )) return Error.InvalidUtf8,
         .vector => {},
-        .structure => if (validation.overlaps(
+        .structure => if (buffer_access.overlaps(
             self.buffer,
             std.mem.sliceAsBytes(values),
         )) return Error.AliasedInput,
@@ -236,7 +236,7 @@ pub fn createStringVector(
     if (values.len > (max_buffer_size - sequence_length_size) / field_offset_size)
         return Error.BufferTooLarge;
     // Child writes must not overwrite the descriptors used to build later children.
-    if (validation.overlaps(
+    if (buffer_access.overlaps(
         self.buffer,
         std.mem.sliceAsBytes(values),
     )) return Error.AliasedInput;
@@ -257,7 +257,7 @@ pub fn createStringVector(
         try self.ensureSpace(strings_size + size + padding);
         if (!std.unicode.utf8ValidateSlice(value)) return Error.InvalidUtf8;
         // Building one child must not overwrite another child's source bytes.
-        if (validation.overlaps(self.buffer, value)) return Error.AliasedInput;
+        if (buffer_access.overlaps(self.buffer, value)) return Error.AliasedInput;
         strings_size += size + padding;
     }
     const payload_size = values.len * field_offset_size;
@@ -401,7 +401,10 @@ pub fn createReferenceVector(
         layout = try self.referenceVectorLayout(union_values, values.len);
         if (union_values) try self.ensureSpace(layout.value_size + layout.tag_size);
     }
-    if (validation.overlaps(self.buffer, std.mem.sliceAsBytes(values))) return Error.AliasedInput;
+    if (buffer_access.overlaps(
+        self.buffer,
+        std.mem.sliceAsBytes(values),
+    )) return Error.AliasedInput;
 
     // Reserve native handles while building children, or check completed handles.
     const marker = self.scratch_cursor;
@@ -524,7 +527,7 @@ pub fn finish(
     const root_offset = @backingInt(root_handle);
     const table_start = self.buffer.len - root_offset;
     // A numerical handle alone does not prove it points to a completed table.
-    const layout = validation.tableAt(self.buffer, table_start) catch return Error.InvalidOffset;
+    const layout = buffer_access.tableAt(self.buffer, table_start) catch return Error.InvalidOffset;
     if (layout.vtable_start < self.write_cursor) return Error.InvalidOffset;
     const prefix_size = comptime switch (options) {
         .ordinary, .identifier => 0,
@@ -631,7 +634,7 @@ pub fn prependStruct(
     const required_bytes = padding + Layout.wire_size;
     try self.ensureSpace(required_bytes);
     // Native aggregates may be passed by reference, even with value syntax.
-    if (validation.overlaps(
+    if (buffer_access.overlaps(
         self.buffer,
         std.mem.asBytes(&value),
     )) return Error.AliasedInput;

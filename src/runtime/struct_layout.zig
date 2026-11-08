@@ -77,18 +77,7 @@ pub fn StructMember(
 ) type {
     if (Layout.layout_kind != .structure)
         @compileError("StructMember requires a struct layout");
-    return struct {
-        /// Native nested value accepted by encoding and returned by decoding.
-        pub const Value = Layout.Value;
-        /// Nested struct layout used for encoding and validation.
-        pub const kind: Kind = .{ .structure = Layout };
-        /// Byte offset relative to the containing struct.
-        pub const offset = member_offset;
-        /// Complete inline byte size, including layout padding.
-        pub const wire_size = Layout.wire_size;
-        /// Required wire alignment, in bytes.
-        pub const wire_alignment = Layout.wire_alignment;
-    };
+    return LayoutMember(Layout, member_offset);
 }
 
 /// Arrays are inline struct members, containing scalars or structs only.
@@ -99,12 +88,18 @@ pub fn ArrayMember(
     comptime element_count: usize,
     comptime member_offset: usize,
 ) type {
-    const Layout = ArrayLayout(element, element_count);
+    return LayoutMember(ArrayLayout(element, element_count), member_offset);
+}
+
+fn LayoutMember(comptime Layout: type, comptime member_offset: usize) type {
     return struct {
         /// Native nested value accepted by encoding and returned by decoding.
         pub const Value = Layout.Value;
-        /// Fixed-array layout used for encoding and validation.
-        pub const kind: Kind = .{ .array = Layout };
+        /// Nested struct or fixed-array layout used for encoding and validation.
+        pub const kind: Kind = if (Layout.layout_kind == .structure)
+            .{ .structure = Layout }
+        else
+            .{ .array = Layout };
         /// Byte offset relative to the containing struct.
         pub const offset = member_offset;
         /// Complete inline byte size, including layout padding.

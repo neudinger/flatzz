@@ -139,10 +139,10 @@ pub fn build(builder: *std.Build) void {
             .imports = &.{.{ .name = "flatzz_compiler", .module = compiler_module }},
         }) });
         const parser_tests = builder.addTest(.{ .root_module = builder.createModule(.{
-            .root_source_file = builder.path("src/compiler/parser.zig"),
+            .root_source_file = builder.path("tests/test_parser.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = &.{.{ .name = "flatzz", .module = runtime_module }},
+            .imports = &.{.{ .name = "flatzz_compiler", .module = compiler_module }},
         }) });
         break :suites_blk .{
             .check = [_]*Step{ &tests.step, &compiler_tests.step, &parser_tests.step },

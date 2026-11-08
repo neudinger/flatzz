@@ -3,6 +3,7 @@ const runtime = @import("runtime");
 const reading = @import("reading");
 const fixtures = @import("test_struct_schema.zig");
 
+const buffer_access = runtime.buffer_access;
 const Reading = reading.Reading;
 const Location = reading.Location;
 const testing = std.testing;
@@ -38,6 +39,20 @@ const envelope_bytes = [_]u8{
     0,    0,    0,    0,    0, 0, 0x29, 0xc0,
     0x34, 0x12, 0,    0,    0, 0, 0,    0,
 };
+
+test "struct members accept compatible custom layout kind enums" {
+    const Layout = struct {
+        pub const layout_kind: enum { structure } = .structure;
+        pub const Value = struct { number: u32 };
+        pub const wire_size = 4;
+        pub const wire_alignment = 4;
+    };
+    const Member = runtime.StructMember(Layout, 8);
+    try testing.expect(Member.kind.structure == Layout);
+    try testing.expectEqual(@as(usize, 8), Member.offset);
+    try testing.expectEqual(@as(usize, 4), Member.wire_size);
+    try testing.expectEqual(@as(usize, 4), Member.wire_alignment);
+}
 
 test "inline structs use schema layout and padding across all frame modes" {
     inline for (struct_frames) |frame| {
@@ -97,12 +112,12 @@ test "Reading storage includes nested structs and mutable views remain borrowed"
     try coordinates.update(.longitude, 4);
     try testing.expectEqual(@as(f32, 4), (try borrowed.read()).coordinates.longitude);
     try testing.expectEqualDeep(initial, snapshot);
-    try testing.expect(try Reading.update(bytes, .location, initial));
+    try testing.expect(try Reading.update(table, .location, initial));
     try testing.expectEqualDeep(initial, try borrowed.read());
     const before = storage.buffer;
     try testing.expectError(
         error.CannotClearField,
-        Reading.update(bytes, .location, null),
+        Reading.update(table, .location, null),
     );
     try testing.expectEqualSlices(u8, &before, &storage.buffer);
     try Reading.verify(bytes, .{});
@@ -118,7 +133,7 @@ test "absent inline fields and present zero structs remain distinct" {
         .coordinates = .{ .latitude = 0, .longitude = 0 },
         .altitude = 0,
     };
-    try testing.expect(!try Reading.update(absent, .location, zero));
+    try testing.expect(!try Reading.update(table, .location, zero));
     const present = try Reading.serialize(.{
         .location = zero,
     }, &storage.buffer, .{});
@@ -215,7 +230,7 @@ test "truncated misaligned and escaping struct fields reject without mutation" {
     const table = try runtime.MutableTable.from(bytes, .root);
     const entry_start = table.layout.vtable_start +
         runtime.vtable_header_size + runtime.vtable_entry_size;
-    const original_offset = try runtime.read(u16, bytes, entry_start);
+    const original_offset = try buffer_access.readScalar(u16, bytes, entry_start);
     const malformed_offsets = [_]u16{
         1, // Cannot overwrite the table's vtable displacement.
         original_offset + 1, // Breaks the eight-byte wire alignment.
@@ -223,7 +238,7 @@ test "truncated misaligned and escaping struct fields reject without mutation" {
     };
     for (malformed_offsets) |field_offset| {
         storage = snapshot;
-        try runtime.write(u16, bytes, entry_start, field_offset);
+        try buffer_access.writeScalar(u16, bytes, entry_start, field_offset);
         const before = storage;
         if (table.mutateStruct(fixtures.Envelope.Layout, 1, fixtures.envelope)) |_|
             return error.AcceptedMalformedStruct

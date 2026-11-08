@@ -2,6 +2,7 @@ const std = @import("std");
 const runtime = @import("runtime");
 const reading = @import("reading");
 
+const buffer_access = runtime.buffer_access;
 const Reading = reading.Reading;
 
 test "string vectors fit schema storage across lengths and alignments" {
@@ -64,7 +65,8 @@ test "absent, empty and older string vector fields remain distinct" {
             .{ .force_defaults = force_defaults },
         );
         try std.testing.expect((try Reading.read(absent)).tags == null);
-        try std.testing.expect(!try Reading.update(absent, .tags, &.{}));
+        const absent_table = try runtime.MutableTable.from(absent, .root);
+        try std.testing.expect(!try Reading.update(absent_table, .tags, &.{}));
         const empty = try Reading.serialize(
             .{ .tags = &.{} },
             &storage.buffer,
@@ -74,17 +76,19 @@ test "absent, empty and older string vector fields remain distinct" {
             @as(usize, 0),
             (try Reading.read(empty)).tags.?.element_count,
         );
-        try std.testing.expect(try Reading.update(empty, .tags, &.{}));
+        const empty_table = try runtime.MutableTable.from(empty, .root);
+        try std.testing.expect(try Reading.update(empty_table, .tags, &.{}));
         try std.testing.expectError(
             error.CannotClearField,
-            Reading.update(empty, .tags, null),
+            Reading.update(empty_table, .tags, null),
         );
     }
     var older = runtime.Builder.init(&storage.buffer);
     var older_table = try runtime.TableBuilder(0).init(&older);
     const bytes = try older.finish(try older_table.endTable(), .ordinary);
     try std.testing.expect((try Reading.read(bytes)).tags == null);
-    try std.testing.expect(!try Reading.update(bytes, .tags, &.{"a"}));
+    const table = try runtime.MutableTable.from(bytes, .root);
+    try std.testing.expect(!try Reading.update(table, .tags, &.{"a"}));
 }
 
 test "string vector updates validate every replacement before writing" {
@@ -97,32 +101,33 @@ test "string vector updates validate every replacement before writing" {
         &storage.buffer,
         .{},
     );
+    const table = try runtime.MutableTable.from(bytes, .root);
     const view = (try Reading.read(bytes)).tags.?;
     const before = storage.buffer;
     try std.testing.expectError(
         error.LengthMismatch,
-        Reading.update(bytes, .tags, &.{ "tan", "cyan", "", "abc" }),
+        Reading.update(table, .tags, &.{ "tan", "cyan", "", "abc" }),
     );
     try std.testing.expectError(
         error.InvalidUtf8,
-        Reading.update(bytes, .tags, &.{ "tan", "cyan", "", "\xff\xff" }),
+        Reading.update(table, .tags, &.{ "tan", "cyan", "", "\xff\xff" }),
     );
     try std.testing.expectError(
         error.LengthMismatch,
-        Reading.update(bytes, .tags, &.{ "tan", "cyan" }),
+        Reading.update(table, .tags, &.{ "tan", "cyan" }),
     );
     try std.testing.expectError(
         error.CannotClearField,
-        Reading.update(bytes, .tags, null),
+        Reading.update(table, .tags, null),
     );
     const borrowed = [_][]const u8{ try view.get(0), "cyan", "", "à" };
     try std.testing.expectError(
         error.AliasedInput,
-        Reading.update(bytes, .tags, &borrowed),
+        Reading.update(table, .tags, &borrowed),
     );
     try std.testing.expectEqualSlices(u8, &before, &storage.buffer);
     const replacement = [_][]const u8{ "tan", "cyan", "", "à" };
-    try std.testing.expect(try Reading.update(bytes, .tags, &replacement));
+    try std.testing.expect(try Reading.update(table, .tags, &replacement));
     for (replacement, 0..) |tag, index| try std.testing.expectEqualStrings(
         tag,
         try view.get(index),
@@ -149,6 +154,7 @@ test "string vector elements reject malformed offsets, lengths and UTF-8" {
         &storage.buffer,
         .{},
     );
+    const table = try runtime.MutableTable.from(bytes, .root);
     const view = (try Reading.read(bytes)).tags.?;
     const first = try view.get(0);
     const first_position = @intFromPtr(first.ptr) - @intFromPtr(bytes.ptr);
@@ -184,16 +190,16 @@ test "string vector elements reject malformed offsets, lengths and UTF-8" {
     const corrupt = storage.buffer;
     try std.testing.expectError(
         error.InvalidBuffer,
-        Reading.update(bytes, .tags, &.{ "xyz", "uvw", "rst" }),
+        Reading.update(table, .tags, &.{ "xyz", "uvw", "rst" }),
     );
     // Earlier replacement failures take precedence over the malformed later target.
     try std.testing.expectError(
         error.InvalidUtf8,
-        Reading.update(bytes, .tags, &.{ "\xffyz", "uvw", "rst" }),
+        Reading.update(table, .tags, &.{ "\xffyz", "uvw", "rst" }),
     );
     try std.testing.expectError(
         error.LengthMismatch,
-        Reading.update(bytes, .tags, &.{ "xy", "uvw", "rst" }),
+        Reading.update(table, .tags, &.{ "xy", "uvw", "rst" }),
     );
     try std.testing.expectEqualSlices(u8, &corrupt, &storage.buffer);
     storage.buffer = valid;
@@ -208,6 +214,7 @@ test "shared strings permit consistent updates and reject conflicting replacemen
     }, .{}) = .{};
     @memset(&storage.buffer, 0);
     const bytes = try Reading.serialize(.{ .tags = &.{ "one", "two" } }, &storage.buffer, .{});
+    const table = try runtime.MutableTable.from(bytes, .root);
     const view = (try Reading.read(bytes)).tags.?;
     const first = try view.get(0);
     const target = @intFromPtr(
@@ -219,11 +226,11 @@ test "shared strings permit consistent updates and reject conflicting replacemen
     const before = storage.buffer;
     try std.testing.expectError(
         error.ConflictingAlias,
-        Reading.update(bytes, .tags, &.{ "abc", "xyz" }),
+        Reading.update(table, .tags, &.{ "abc", "xyz" }),
     );
     try std.testing.expectEqualSlices(u8, &before, &storage.buffer);
     try std.testing.expect(
-        try Reading.update(bytes, .tags, &.{ "new", "new" }),
+        try Reading.update(table, .tags, &.{ "new", "new" }),
     );
     try std.testing.expectEqualStrings("new", try view.get(0));
     try std.testing.expectEqualStrings("new", try view.get(1));
@@ -283,6 +290,7 @@ test "partially overlapping string objects cannot be mutated" {
     }, .{}) = .{};
     @memset(&storage.buffer, 0);
     const bytes = try Reading.serialize(.{ .tags = &.{ &outer, "" } }, &storage.buffer, .{});
+    const table = try runtime.MutableTable.from(bytes, .root);
     const view = (try Reading.read(bytes)).tags.?;
     const target = try view.get(0);
     const position = @intFromPtr(target.ptr) - @intFromPtr(bytes.ptr);
@@ -307,7 +315,7 @@ test "partially overlapping string objects cannot be mutated" {
         else
             [_][]const u8{ &replacement, "abcd" };
         const before = storage.buffer;
-        try std.testing.expectError(error.InvalidBuffer, Reading.update(bytes, .tags, &values));
+        try std.testing.expectError(error.InvalidBuffer, Reading.update(table, .tags, &values));
         try std.testing.expectEqualSlices(u8, &before, &storage.buffer);
     }
 }
@@ -359,11 +367,11 @@ test "string content checks follow metadata validation and verifier budgets" {
     const string_work = runtime.sequence_length_size + payload.len + runtime.string_terminator_size;
     const max_work = table_work + string_work;
 
-    try std.testing.expectError(error.OutOfBounds, runtime.validation.stringPayload(&.{}));
-    try std.testing.expectEqualStrings("", try runtime.validation.stringPayload(&.{0}));
+    try std.testing.expectError(error.OutOfBounds, runtime.buffer_access.stringPayload(&.{}));
+    try std.testing.expectEqualStrings("", try runtime.buffer_access.stringPayload(&.{0}));
     try std.testing.expectEqualStrings(
         "a\x00b",
-        try runtime.validation.stringPayload("a\x00b\x00"),
+        try runtime.buffer_access.stringPayload("a\x00b\x00"),
     );
     try runtime.Verifier.verify(Message, bytes, .{ .max_work = max_work, .max_objects = 2 });
     for ([_]usize{ payload_start, payload_start + payload.len }) |corrupt_start| {
@@ -386,7 +394,7 @@ test "string content checks follow metadata validation and verifier budgets" {
         try std.testing.expectError(error.InvalidBuffer, table.readString(0));
     }
     // Malformed metadata must fail before charging or scanning the string.
-    try runtime.write(
+    try buffer_access.writeScalar(
         u32,
         bytes,
         payload_start - runtime.sequence_length_size,
@@ -404,6 +412,7 @@ test "shared empty strings preserve metadata during bulk updates" {
     }, .{}) = .{};
     @memset(&storage.buffer, 0);
     const bytes = try Reading.serialize(.{ .tags = &.{ "", "é", "" } }, &storage.buffer, .{});
+    const table = try runtime.MutableTable.from(bytes, .root);
     const view = (try Reading.read(bytes)).tags.?;
     const empty = try view.get(0);
     const target_start = @intFromPtr(empty.ptr) - @intFromPtr(bytes.ptr) -
@@ -414,7 +423,7 @@ test "shared empty strings preserve metadata during bulk updates" {
     const text_start = @intFromPtr(text.ptr) - @intFromPtr(&storage.buffer);
     var expected = storage.buffer;
     @memcpy(expected[text_start..][0..text.len], "à");
-    try std.testing.expect(try Reading.update(bytes, .tags, &.{ "", "à", "" }));
+    try std.testing.expect(try Reading.update(table, .tags, &.{ "", "à", "" }));
     try std.testing.expectEqualSlices(u8, &expected, &storage.buffer);
     try Reading.verify(bytes, .{});
 }
@@ -426,6 +435,7 @@ test "string vector mutation rejects replacement descriptors in the frame" {
     }, .{}) = .{};
     @memset(&storage.buffer, 0);
     const bytes = try Reading.serialize(.{ .tags = &.{ &padding, "" } }, &storage.buffer, .{});
+    const table = try runtime.MutableTable.from(bytes, .root);
     const view = (try Reading.read(bytes)).tags.?;
     const payload = try view.get(0);
     const descriptor_address = std.mem.alignForward(
@@ -439,6 +449,6 @@ test "string vector mutation rejects replacement descriptors in the frame" {
     ));
     descriptors.* = .{ "", "" };
     const before = storage.buffer;
-    try std.testing.expectError(error.AliasedInput, Reading.update(bytes, .tags, descriptors));
+    try std.testing.expectError(error.AliasedInput, Reading.update(table, .tags, descriptors));
     try std.testing.expectEqualSlices(u8, &before, &storage.buffer);
 }
