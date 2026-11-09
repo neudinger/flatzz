@@ -1,8 +1,8 @@
 //! Unified host tool: compile FBS/BFBS metadata to Zig, BFBS, or schema JSON.
-//! `flatzz-schema --zig input.fbs > output.zig`
-//! `flatzz-schema --bfbs input.fbs > output.bfbs`
-//! `flatzz-schema --json input.fbs > output.json`
-//! `flatzz-schema --json input.bfbs > output.json`
+//! `flatzz --zig input.fbs > output.zig`
+//! `flatzz --bfbs input.fbs > output.bfbs`
+//! `flatzz --json input.fbs > output.json`
+//! `flatzz --json input.bfbs > output.json`
 //! Native parsing and BFBS conversion share reflection metadata with the Zast backend.
 //! Options borrow the argument strings; metadata and temporary storage use the
 //! caller's arena. Encoded BFBS is owned by its supplied Zig allocator.
@@ -14,8 +14,8 @@ const codegen = @import("codegen");
 const Format = enum { bfbs, json, zig };
 
 const usage =
-    \\usage: flatzz-schema (--bfbs|--json|--zig) [-I directory]... [--depfile file] [--deptarget target] schema.fbs
-    \\       flatzz-schema (--json|--zig) schema.bfbs
+    \\usage: flatzz (--bfbs|--json|--zig) [-I directory]... [--depfile file] [--deptarget target] schema.fbs
+    \\       flatzz (--json|--zig) schema.bfbs
     \\Writes the selected schema format to stdout. Redirect it to save a file.
     \\
 ;

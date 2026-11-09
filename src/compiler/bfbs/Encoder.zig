@@ -1,4 +1,7 @@
 //! BFBS construction and ownership of its growable backward buffer.
+//! Internal one-shot encoder used by bfbs.encode. Input records remain borrowed;
+//! only the returned complete allocation survives. Temporary handle/cache storage
+//! and the growing output buffer are released if encoding fails.
 
 const std = @import("std");
 const reflection = @import("../reflection.zig");
@@ -15,13 +18,25 @@ const Scalar = record_layout.Scalar;
 const scalarDefault = record_layout.scalarDefault;
 const isReference = record_layout.isReference;
 
-const Key = struct { kind: u8, address: usize };
+// Distinguish equal addresses used by different reflection record types.
+const Key = struct {
+    /// Internal reflection declaration selector, never a serialized type code.
+    kind: u8,
+    /// Borrowed native record address, stable throughout this encode call.
+    address: usize,
+};
 
+/// Owns the growing aligned buffer; backward handle distances survive reallocation.
 builder: Builder,
+/// Borrowed canonical Object array; referenced Object pointers must identify its elements.
 objects: []const reflection.Object,
+/// Completed table handles by native record identity; keys never become wire type tags.
 tables: std.AutoHashMapUnmanaged(Key, Builder.Offset) = .empty,
 
 /// Encode a complete owned frame; release intermediate storage on failure.
+/// The result begins at its allocation base and is freed with the same allocator.
+/// Input metadata must survive all allocator calls. Invalid UTF-8/Object references
+/// return InvalidSchema; attribute sorting does not mutate the input graph.
 pub fn encode(
     allocator: std.mem.Allocator,
     schema: reflection.Schema,

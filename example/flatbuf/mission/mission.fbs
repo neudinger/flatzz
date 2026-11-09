@@ -1,0 +1,8 @@
+include "common.fbs";
+
+table Mission {
+    name:string;
+    position:Position;
+}
+
+root_type Mission;

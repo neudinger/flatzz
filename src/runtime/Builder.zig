@@ -4,6 +4,9 @@
 //! The caller owns the aligned storage; construction performs no allocation.
 //! Keep the builder at a stable address while a TableBuilder borrows it. Reset
 //! invalidates every handle and view, and later writes can overwrite old bytes.
+//! Import as flatzz.Builder. init borrows aligned storage, child operations return
+//! builder-local handles, and finish returns the completed frame as a storage suffix.
+//! Finished builders require reset before reuse; reset preserves force_defaults.
 //!
 //! Example inside a test with `std = @import("std")` and
 //! `flatzz = @import("flatzz")` imported:
@@ -20,6 +23,7 @@
 //! try std.testing.expectEqualStrings("sensor", name.?);
 //! ```
 //! Expected result: `name` is the borrowed string `"sensor"`; nothing is printed.
+//! See the `flatzz` module overview for complete imports and a Zig 0.17.0 test command.
 //! https://github.com/google/flatbuffers/blob/b8431fbcd7a5c71817f314e18b332c0648554efa/include/flatbuffers/flatbuffer_builder.h
 //! https://github.com/google/flatbuffers/blob/b8431fbcd7a5c71817f314e18b332c0648554efa/go/builder.go
 //! https://github.com/dvidelabs/flatcc/blob/e1272290b486fdd7fdc60f061036b7a18c468dc7/include/flatcc/flatcc_builder.h
@@ -29,7 +33,7 @@ const buffer_access = @import("buffer_access.zig");
 const errors = @import("errors.zig");
 
 const Self = @This();
-/// Construction failures; capacity and input checks precede writes.
+/// Construction failures; individual operations document preflight and partial-write behavior.
 pub const Error = errors.BuildError;
 const sequence_length_size = wire.sequence_length_size;
 const string_terminator_size = wire.string_terminator_size;
@@ -39,7 +43,10 @@ const field_offset_size = wire.field_offset_size;
 pub const max_buffer_size = std.math.maxInt(i32);
 /// Handles must originate from this builder since its last reset. Like Go
 /// UOffsetT/C++ Offset, the representation does not encode ownership or type.
-pub const Offset = enum(u32) { _ };
+pub const Offset = enum(u32) {
+    /// Builder-relative distance; the representation itself does not prove validity.
+    _,
+};
 /// Construction phase; begin another table or sequence only in `ready`.
 pub const State = enum {
     /// Completed children can be followed by more objects or root finalization.
@@ -167,7 +174,14 @@ pub fn createStructVector(
 fn createSequence(
     self: *Self,
     comptime Element: type,
-    comptime kind: enum { string, vector, structure },
+    comptime kind: enum {
+        /// UTF-8 bytes with a count prefix and zero terminator.
+        string,
+        /// Fixed-width scalar values with an element-count prefix.
+        vector,
+        /// Inline structs encoded member by member, including wire padding.
+        structure,
+    },
     values: []const switch (kind) {
         .structure => Element.Value,
         else => Element,
@@ -284,10 +298,17 @@ pub fn createStringVector(
     );
 }
 
-const ReferenceOption = enum { union_type, create };
+const ReferenceOption = enum {
+    /// Optional union metadata selecting paired tag/payload vectors.
+    union_type,
+    /// Optional native-packing callback, otherwise use completed handles.
+    create,
+};
 
 const ReferenceVectorLayout = struct {
+    /// Payload-offset vector bytes, including its count prefix and alignment padding.
     value_size: usize,
+    /// Tag-vector bytes including prefix/padding, or zero for ordinary reference vectors.
     tag_size: usize,
 };
 

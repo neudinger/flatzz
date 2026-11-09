@@ -1,6 +1,9 @@
 //! One source cursor and FBS grammar; includes share the enclosing compilation.
 //! Source slices and unresolved declarations retain the caller arena lifetime.
 //! Allocation and diagnostics go through the same compiler state during recursion.
+//! Compilation.load initializes this cursor and advances once before declarations.
+//! This internal grammar records unresolved types/defaults; Compilation.finish
+//! later resolves names, validates semantics, and computes wire layout.
 
 const std = @import("std");
 const flatzz = @import("flatzz");
@@ -39,13 +42,19 @@ const scalar_types = std.StaticStringMap(BaseType).initComptime(.{
     .{ "string", .String },
 });
 
-// One source cursor; include recursion shares the enclosing compiler state.
+/// Stable enclosing compilation; include parsers append into this same state.
 compiler: *Compiler,
+/// Source identity and complete text copied by Compilation.load.
 source: Source,
+/// Include depth, with zero identifying the main source load.
 depth: usize,
+/// Whether root/identifier/extension declarations select the compilation's output metadata.
 main: bool,
+/// Byte cursor immediately after the current raw token or skipped trivia.
 position: usize = 0,
+/// Current token borrowing source.text; declarations requires an initial advance.
 token: Token = .{ .kind = .eof, .text = "", .offset = 0 },
+/// Namespace active in this source; included parsers have their own namespace state.
 namespace: []const u8 = "",
 
 fn location(self: *const Parser) Location {
@@ -122,6 +131,10 @@ fn atom(self: *Parser, allocator: Allocator) Error!Atom {
     return .{ .kind = token.kind, .text = text, .location = token_location };
 }
 
+/// Consume this source to EOF, loading includes and appending unresolved declarations.
+/// Requires an initial advance and the same arena as the enclosing compilation.
+/// Includes must precede declarations. Errors leave partial compiler state and arena
+/// allocations; public parsing discards that state and retains the optional diagnostic.
 pub fn declarations(self: *Parser, allocator: Allocator) Error!void {
     const compiler = self.compiler;
     var includes: std.ArrayList([]const u8) = .empty;
@@ -580,6 +593,10 @@ fn attributes(self: *Parser, allocator: Allocator, field: bool) Error!Attributes
     return result.items;
 }
 
+/// Skip whitespace/comments and replace token with the next raw source slice.
+/// String decoding and numeric validation happen later. Unterminated comments/strings
+/// or unsupported characters return InvalidSchema; diagnostics can return OutOfMemory.
+/// EOF has empty text and an offset equal to source.text.len.
 pub fn advance(self: *Parser, allocator: Allocator) Error!void {
     const bytes = self.source.text;
     while (self.position < bytes.len) {

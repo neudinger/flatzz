@@ -1,6 +1,26 @@
 //! Checked local buffer access; opening one object does not verify its reachable graph.
 //! Positions are relative to the complete frame, including any size prefix.
 //! Helpers allocate nothing; returned payload slices borrow the supplied bytes.
+//! Access this namespace as `flatzz.buffer_access`. Scalar range checks do not
+//! enforce object alignment or schema presence; table/sequence helpers add their
+//! local wire constraints. Full known-schema verification is a separate traversal.
+//!
+//! Example test body with `std` and `runtime = @import("flatzz")` imported:
+//! ```zig
+//! var bytes = [_]u8{ 0, 0, 0, 0 };
+//! try runtime.buffer_access.writeScalar(u16, &bytes, 1, 513);
+//! try std.testing.expectEqualSlices(u8, &.{ 0, 1, 2, 0 }, &bytes);
+//! try std.testing.expectEqual(
+//!     @as(u16, 513),
+//!     try runtime.buffer_access.readScalar(u16, &bytes, 1),
+//! );
+//! try std.testing.expectError(
+//!     error.OutOfBounds,
+//!     runtime.buffer_access.readScalar(u16, &bytes, 3),
+//! );
+//! ```
+//! Expected result: an unaligned scalar round trip and a rejected truncated read; no output.
+//! See the `flatzz` module overview for complete imports and a Zig 0.17.0 test command.
 const std = @import("std");
 const wire = @import("wire.zig");
 const errors = @import("errors.zig");
@@ -15,6 +35,7 @@ pub const Range = struct {
     size: usize,
 };
 /// Validated local table and vtable positions; no reachable fields are cached.
+/// Obtain these through tableAt/referencedTable; structural edits invalidate cached positions.
 pub const TableLayout = struct {
     /// Signed vtable-displacement slot relative to the complete frame.
     table_start: usize,
@@ -78,6 +99,7 @@ pub const Context = struct {
 };
 
 /// Subtract before comparing so hostile sizes cannot overflow an end position.
+/// Returns OutOfBounds for a range outside the buffer; an empty range at its end is valid.
 pub fn checkRange(
     buffer_length: usize,
     range_start: usize,
@@ -196,6 +218,8 @@ pub const FieldLayout = struct {
 
 /// Struct size and alignment differ; scalars and offset slots use equal values.
 /// The complete inline value must remain within its enclosing table body.
+/// Returns null for an absent/trimmed slot. Supply checked, current table metadata;
+/// this lookup does not rerun all table/vtable validation performed by tableAt.
 pub fn fieldPosition(
     bytes: []const u8,
     table: TableLayout,

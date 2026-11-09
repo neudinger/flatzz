@@ -16,7 +16,7 @@ fn compileSchemas(builder: *std.Build) ![]const SchemaOutput {
         .optimize = .ReleaseSafe,
         .@"schema-tools" = true,
     });
-    const schema_tool = flatzz.artifact("flatzz-schema");
+    const schema_tool = flatzz.artifact("flatzz");
     const schema_directory = flatzz.path("example/flatbuf");
     builder.dependOnDirectoryContents(schema_directory);
 

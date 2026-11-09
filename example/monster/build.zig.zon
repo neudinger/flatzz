@@ -1,0 +1,8 @@
+.{
+    .name = .flatzz_monster_example,
+    .version = "0.0.0",
+    .fingerprint = 0xc7769efb878e864d, // Changing this has security and trust implications.
+    .minimum_zig_version = "0.17.0",
+    .dependencies = .{ .flatzz = .{ .path = "../.." } },
+    .paths = .{ "build.zig", "build.zig.zon", "main.zig" },
+}

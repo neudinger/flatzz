@@ -1,6 +1,9 @@
 //! Resolve arena-backed FBS declarations into sorted metadata with stable indices.
 //! Owns source copies, symbols and unresolved declarations in the caller arena.
 //! Loading a source creates a Parser; includes return directly to load.
+//! Internal lifecycle: initialize options, load the main source and its includes,
+//! then finish once. All allocating operations share the caller's arena, which
+//! owns partial state on failure and the referenced output storage on success.
 
 const std = @import("std");
 const flatzz = @import("flatzz");
@@ -27,19 +30,32 @@ const Root = model.Root;
 const attribute = model.attribute;
 const qualify = model.qualify;
 
-// Resolve arena-backed declarations into sorted metadata with stable indices.
+/// Borrowed loader/diagnostic settings shared with every source parser.
 options: Options,
+/// Arena-backed objects in parse order; finish sorts them and rebuilds symbols.
 objects: std.ArrayList(ObjectDef) = .empty,
+/// Arena-backed enum/union declarations; final order determines type indices.
 enums: std.ArrayList(EnumDef) = .empty,
+/// Deferred roots, including included declarations that must still name valid tables.
 roots: std.ArrayList(Root) = .empty,
+/// Source identities and direct include lists, sorted by filename at finish.
 files: std.ArrayList(reflection.SchemaFile) = .empty,
+/// Borrowed qualified names mapped to the current declaration-array indices.
 symbols: std.StringHashMapUnmanaged(Symbol) = .empty,
+/// Canonical source identities marked before parsing to suppress include cycles.
 loaded: std.StringHashMapUnmanaged(void) = .empty,
+/// Custom attribute names available to all sources in this compilation.
 custom_attributes: std.StringHashMapUnmanaged(void) = .empty,
+/// Main-source application identifier; copied source metadata outlives the parser cursor.
 file_ident: ?[]const u8 = null,
+/// Main-source application extension, or null when absent.
 file_ext: ?[]const u8 = null,
+/// Requirements accumulated while resolving optional scalars, arrays, and unions.
 features: reflection.AdvancedFeatures = .{},
 
+/// Return a failure and, when requested, store its source location and formatted message.
+/// Formatting uses the shared arena; its allocation failure replaces the original error
+/// with OutOfMemory. This does not roll back compiler state or earlier allocations.
 pub fn fail(
     self: *Compiler,
     allocator: Allocator,
@@ -61,6 +77,7 @@ pub fn fail(
     return failure;
 }
 
+/// Return InvalidSchema through the same optional diagnostic path as fail.
 pub fn invalid(
     self: *Compiler,
     allocator: Allocator,
@@ -70,6 +87,10 @@ pub fn invalid(
     return self.fail(allocator, location, error.InvalidSchema, message, .{});
 }
 
+/// Deduplicate a canonical source name, copy its name/text, and parse its declarations.
+/// New sources consume include depth and are marked before parsing to break cycles.
+/// Includes recurse into this same state. Errors retain partial arena-backed state;
+/// public callers discard the compilation and release their arena rather than retrying it.
 pub fn load(
     self: *Compiler,
     allocator: Allocator,
@@ -97,6 +118,8 @@ pub fn load(
     try parser.declarations(allocator);
 }
 
+/// Borrow a qualified name as a symbol key; duplicate declarations return InvalidSchema.
+/// Indices identify the current object/enum arrays and are rebuilt after final sorting.
 pub fn register(
     self: *Compiler,
     allocator: Allocator,
@@ -166,6 +189,10 @@ fn resolveType(
     field_type.element_size = field_type.element.byteSize();
 }
 
+/// Sort declarations, resolve names/defaults, lay out structs, and emit borrowed metadata.
+/// Call after all sources load. Output arrays and referenced records use the same arena;
+/// no ownership is transferred away from it. Errors can leave sorting and resolution
+/// partly applied, so retain diagnostics and discard the failed compilation.
 pub fn finish(self: *Compiler, allocator: Allocator) Error!reflection.Schema {
     // Resolve indices only after sorting the final type lists.
     inline for (.{
@@ -612,6 +639,9 @@ fn layoutObject(self: *Compiler, allocator: Allocator, index: usize, depth: usiz
     object.state = .done;
 }
 
+/// Parse a signed decimal or hexadecimal spelling into an i128 intermediate.
+/// Accepts a leading sign and case-insensitive 0x prefix; separators and invalid digits
+/// return InvalidSchema with a diagnostic. The magnitude must fit the signed intermediate.
 pub fn integer(
     self: *Compiler,
     allocator: Allocator,
@@ -642,6 +672,9 @@ pub fn integer(
     return if (negative) -magnitude else magnitude;
 }
 
+/// Range-check an integer against a scalar wire type and retain its bits in i64 metadata.
+/// Callers supply an integer/bool BaseType. Unsigned 64-bit values preserve their bit
+/// pattern through bit-casting; out-of-range values return InvalidSchema.
 pub fn integerBits(
     self: *Compiler,
     allocator: Allocator,

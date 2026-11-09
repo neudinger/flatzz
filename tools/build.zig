@@ -5,8 +5,10 @@ const std = @import("std");
 
 /// Dependencies returned to the package's command declaration list.
 pub const Steps = struct {
-    /// Host executable installed as flatzz-schema.
+    /// Host executable installed as flatzz.
     executable: *std.Build.Step.Compile,
+    /// Install only the host schema compiler.
+    install: *std.Build.Step,
     /// Tool compilation, CLI tests, fixture consistency, and generated-code checks.
     check: [4]*std.Build.Step,
     /// CLI tests, fixture consistency, and generated-code test execution.
@@ -67,7 +69,7 @@ pub fn add(builder: *std.Build) ?Steps {
 
     const schema_tool = schema_tool_blk: {
         const executable = builder.addExecutable(.{
-            .name = "flatzz-schema",
+            .name = "flatzz",
             .root_module = builder.createModule(.{
                 .root_source_file = builder.path("tools/schema.zig"),
                 .target = builder.graph.host,
@@ -78,9 +80,10 @@ pub fn add(builder: *std.Build) ?Steps {
                 },
             }),
         });
-        builder.installArtifact(executable);
         break :schema_tool_blk executable;
     };
+    const install = builder.addInstallArtifact(schema_tool, .{});
+    builder.getInstallStep().dependOn(&install.step);
 
     const command_tests = command_tests_blk: {
         const tests = builder.addTest(.{ .root_module = schema_tool.root_module });
@@ -140,6 +143,7 @@ pub fn add(builder: *std.Build) ?Steps {
 
     return .{
         .executable = schema_tool,
+        .install = &install.step,
         .check = .{
             &schema_tool.step, command_tests.compile, reading.check, generated_tests.compile,
         },

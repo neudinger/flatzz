@@ -1,6 +1,19 @@
 //! Scalar wire representations and physical FlatBuffers sizes, independent of Zig ABI.
 //! Fixed-width encode/decode operate on caller-selected ranges.
 //! Use `flatzz.buffer_access.readScalar` and `flatzz.buffer_access.writeScalar` for checked access.
+//! These low-level encoders copy scalar values, never native aggregate layouts.
+//! Fixed-size pointers select the accessed width; frame containment and alignment
+//! remain the caller's responsibility. No allocation or cleanup is required.
+//!
+//! Example test body with `std` and `runtime = @import("flatzz")` imported:
+//! ```zig
+//! var bytes: [4]u8 = undefined;
+//! runtime.wire.encode(u32, &bytes, 0x12345678);
+//! try std.testing.expectEqualSlices(u8, &.{ 0x78, 0x56, 0x34, 0x12 }, &bytes);
+//! try std.testing.expectEqual(@as(u32, 0x12345678), try runtime.wire.decode(u32, &bytes));
+//! ```
+//! Expected result: the four little-endian bytes round-trip without allocation or output.
+//! The `flatzz` module overview provides complete imports and a Zig 0.17.0 test command.
 const std = @import("std");
 const errors = @import("errors.zig");
 
@@ -103,6 +116,7 @@ pub fn Scalar(comptime ValueType: type) type {
 
 /// Range selection is the caller's responsibility. The fixed-width argument
 /// makes encoding infallible without repeating a dynamic bounds check.
+/// Writes little-endian bytes; bool encodings are normalized to zero or one.
 /// https://ziglang.org/documentation/0.17.0/std/#std.mem.writeInt
 pub fn encode(
     comptime ScalarType: type,
@@ -147,6 +161,7 @@ pub fn paddingFor(byte_count: usize, alignment: usize) usize {
 /// Caller validates capacity first. Directional element copies preserve memmove
 /// semantics while encoding native values rather than copying native layouts.
 /// Destination length must equal `values.len * @sizeOf(Bits(ElementType))`.
+/// No frame metadata or construction state is checked; overlapping scalar input is allowed.
 pub fn encodeSlice(
     comptime ElementType: type,
     destination_bytes: []u8,

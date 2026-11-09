@@ -1,4 +1,7 @@
 //! Checked BFBS traversal into caller-arena metadata with shared Object identity.
+//! Internal one-shot traversal used by bfbs.decodeWithOptions. Returned strings
+//! and records are copied into the caller's arena; only the temporary identity
+//! cache is individually released. Errors leave partial arena allocations.
 
 const std = @import("std");
 const reflection = @import("../reflection.zig");
@@ -17,20 +20,33 @@ const Scalar = record_layout.Scalar;
 const scalarDefault = record_layout.scalarDefault;
 const isReference = record_layout.isReference;
 
+/// Borrowed complete frame, retaining any size prefix as the alignment origin.
 bytes: []const u8,
+/// Framing and traversal budgets, fixed for this decode attempt.
 options: DecodeOptions,
+/// Active table depth, restored when a table visit returns.
 depth: usize = 0,
+/// Deepest table visited while measuring a cached Object subtree.
 deepest: usize = 0,
+/// Table/vector/string visits consumed so far, including shared-object references.
 object_count: usize = 0,
+/// Charged wire/allocation work, maintained at or below options.max_work.
 work: usize = 0,
-// Fixed Object-vector storage must be registered before root/RPC/legacy refs.
+/// Wire table positions mapped to arena-owned Object identities and subtree budgets.
+/// Register Object-vector storage before root/RPC/legacy references are decoded.
 objects: std.AutoHashMapUnmanaged(usize, struct {
+    /// Stable result address in the arena, also used by shared references.
     value: *reflection.Object,
+    /// Subtree work charged again when this Object is reached through a cached reference.
     work: usize = 0,
+    /// Maximum active table depth added by revisiting this cached subtree.
     height: usize = 0,
 }) = .empty,
 
 /// Decode with bounded work and translate malformed wire failures at this boundary.
+/// Borrow input bytes only for this call; copied metadata survives independently in
+/// the supplied arena. Release that arena after consumers finish, including on failure.
+/// Malformed framing/objects return InvalidBfbs; budget/allocation errors stay distinct.
 pub fn decode(
     allocator: std.mem.Allocator,
     bytes: []const u8,
@@ -127,8 +143,11 @@ fn measuredTable(
     comptime Record: type,
     view: Table,
 ) ReadError!struct {
+    /// Completed metadata record, with references into the caller's arena.
     value: Record,
+    /// Traversal work consumed while decoding this record and its descendants.
     work: usize,
+    /// Maximum additional active table depth required by this subtree.
     height: usize,
 } {
     const before = self.work;

@@ -2,6 +2,10 @@
 //! Strings use the same local layout validation and expose their UTF-8 bytes.
 //! Views allocate nothing and borrow their complete input frame; reset, growth,
 //! or structural mutation of that storage invalidates existing views.
+//! The facade exports VectorView and scalar/string/table/struct codecs. Mutable
+//! vectors expose mutable inline struct elements; scalar values are copied,
+//! strings stay read-only, and table codecs return read-only table views.
+//! Use a table/schema replacement operation to update scalar or string vectors.
 //!
 //! Example inside a test with `std = @import("std")` and
 //! `runtime = @import("flatzz")` imported:
@@ -16,6 +20,7 @@
 //! ```
 //! Expected result: `second == 7`; nothing is printed. This manually assembled
 //! scalar payload has no vector count prefix; use `fromReference` for wire vectors.
+//! See the `flatzz` module overview for complete imports and a Zig 0.17.0 test command.
 const wire = @import("wire.zig");
 const buffer_access = @import("buffer_access.zig");
 const errors = @import("errors.zig");
@@ -76,9 +81,9 @@ pub fn StructCodec(comptime StructLayout: type) type {
     };
 }
 
-/// Minimal codec contract: Value, slot_size, slot_alignment, and checked read.
-/// Like std.crypto.auth.hmac.Hmac(Hash), composition specializes the algorithm;
-/// it does not require codecs to own mutation, allocation, or graph traversal.
+/// Decode fixed-width scalar slots; expose Value, kind, slot_size, slot_alignment, and read.
+/// Unsupported scalar types fail at compile time. Unknown exhaustive-enum tags fail
+/// during access; codecs do not allocate storage or perform recursive schema verification.
 pub fn ScalarCodec(comptime ScalarType: type) type {
     return struct {
         /// Copied native scalar result.
@@ -155,6 +160,8 @@ pub fn TableCodec(comptime ChildSchema: type) type {
 /// Create a borrowed vector type; invalid codec size/alignment fails at compile time.
 /// Mutable vector storage permits borrowed mutable struct elements; other codecs
 /// retain their existing result types and reference-mutation contracts.
+/// ElementCodec supplies Value, kind, slot_size, slot_alignment, and checked read.
+/// Returned views retain the complete frame; no allocation or cleanup is required.
 pub fn SequenceView(
     comptime ElementCodec: type,
     comptime access: Access,

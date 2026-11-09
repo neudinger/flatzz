@@ -1,6 +1,10 @@
 //! Size-preserving replacement. Each fallible operation preflights before writes.
 //! These helpers allocate nothing and operate on already located, present values.
 //! The caller retains the complete mutable frame and checks schema presence/counts.
+//! Internal implementation of MutableTable and mutable struct/array views; use
+//! those checked public entry points rather than synthesizing payload pointers.
+//! Updates retain offsets, counts, terminators, and allocation ownership. They do
+//! not prove that every cross-typed alias in hostile data remains schema-valid.
 const std = @import("std");
 const wire = @import("wire.zig");
 const buffer_access = @import("buffer_access.zig");
@@ -82,7 +86,7 @@ pub fn string(
 }
 
 /// Pairwise checks preserve the existing allocation-free, atomic bulk contract.
-/// Sources cannot borrow bytes or descriptor storage. Equal shared targets must
+/// Replacement slice descriptors and payloads cannot borrow the frame. Equal shared targets must
 /// receive equal replacements. Each target is validated once; pairwise object
 /// overlap checks remain O(element_count squared), with constant scratch space.
 /// `vector` must use this frame and `replacement.len` must equal its checked count.

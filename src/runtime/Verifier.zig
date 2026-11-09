@@ -3,8 +3,30 @@
 //! Verification borrows immutable bytes and allocates nothing. Initialize fresh
 //! counters for a new traversal; failed traversals consume their work/object budget.
 //! Do not mutate bytes or counters while a traversal is active.
+//! Use flatzz.Verifier.verify for a fresh traversal, or a generated Schema.verify.
+//! Low-level callbacks reuse active counters and can leave budgets consumed on error.
+//! Only described fields are traversed; unknown appended fields are ignored.
 //! C++ Verifier and flatcc generated traversal supply the architectural model.
 //! https://github.com/google/flatbuffers/blob/b8431fbcd7a5c71817f314e18b332c0648554efa/include/flatbuffers/verifier.h
+//!
+//! Example test body with `std` and `runtime = @import("flatzz")` imported:
+//! ```zig
+//! const Message = struct {
+//!     count: u32 = 0,
+//!     pub const Schema = runtime.Schema(@This(), .{
+//!         .count = runtime.ScalarField(u32, 0, 0),
+//!     });
+//! };
+//! var output: runtime.Storage(Message.Schema, .{}, .{}) = .{};
+//! const bytes = try Message.Schema.serialize(.{ .count = 42 }, &output.buffer, .{});
+//! try runtime.Verifier.verify(Message, bytes, .{});
+//! try std.testing.expectError(error.DepthLimit, runtime.Verifier.verify(Message, bytes, .{
+//!     .max_depth = 0,
+//! }));
+//! ```
+//! Expected result: the default traversal passes; zero allowed depth rejects the root.
+//! No output/allocation occurs. Keep bytes unchanged while checking them; see the
+//! `flatzz` module overview for complete imports and a Zig 0.17.0 test command.
 const wire = @import("wire.zig");
 const buffer_access = @import("buffer_access.zig");
 const sequence = @import("sequence.zig");

@@ -1,5 +1,8 @@
 //! Bounded native graph preflight and packing for schema adapters.
 //! Preflight rejects output aliases before writes; packing may retain partial construction.
+//! Inputs remain borrowed for both passes. No allocator is used, repeated pointers
+//! produce independent copies, and traversal budgets bound cycles during preflight.
+//! The schema facade selects ordinary framing and owns allocating serialization.
 const std = @import("std");
 const schema = @import("../schema.zig");
 const buffer_access = @import("../buffer_access.zig");
@@ -9,6 +12,7 @@ const errors = @import("../errors.zig");
 const BuildError = errors.BuildError;
 
 /// Specialize construction without exposing traversal methods on generated schemas.
+/// Native must be the definition's nominal input type; a mismatch fails at compile time.
 pub fn Packer(comptime Native: type, comptime Definition: type) type {
     // The public constructor retains the schema's nominal native type; structurally
     // identical child types must not silently use one another's schema.
@@ -17,6 +21,10 @@ pub fn Packer(comptime Native: type, comptime Definition: type) type {
     const field_names = @typeInfo(Native).@"struct".field_names;
     const descriptors = Definition.fields;
     return struct {
+        /// Validate the complete graph before changing a ready builder, then pack its root.
+        /// Preflight checks required values, depth/work, and output aliases; UTF-8 and
+        /// capacity checks occur while packing. Packing can leave completed children.
+        /// After successful preflight, force_defaults remains set even if packing fails.
         pub fn create(
             builder: *Builder,
             values: *const Native,
@@ -90,6 +98,10 @@ pub fn Packer(comptime Native: type, comptime Definition: type) type {
             }
         }
 
+        /// Pack after presence/traversal preflight into output disjoint from native inputs.
+        /// create checks aliases; allocating serialization measures inputs and supplies
+        /// fresh output. This entry point repeats neither graph budgets nor alias checks.
+        /// Errors can retain partial children.
         pub fn pack(builder: *Builder, values: *const Native) BuildError!Builder.Offset {
             var built: Definition.Fields = undefined;
             inline for (field_names) |field_name| {
@@ -130,8 +142,11 @@ pub fn Packer(comptime Native: type, comptime Definition: type) type {
 // Each successful charge proves multiplication and addition fit usize. Budget
 // native descriptors before reading them, including zero-length sequences.
 const NativeTraversal = struct {
+    /// Native depth/work limits and default-retention policy for this preflight.
     options: schema.WriteOptions,
+    /// Active native table depth; restored after each recursive visit.
     depth: usize = 0,
+    /// Native visits/payload bytes charged so far, at or below options.max_work.
     work: usize = 0,
 
     fn charge(self: *NativeTraversal, count: usize, comptime width: usize) BuildError!void {

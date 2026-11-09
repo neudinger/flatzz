@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="570" viewBox="0 0 1280 570" role="img" aria-labelledby="title description">
+<title id="title">One backing buffer</title>
+<desc id="description">Conceptual caller-owned storage with unused capacity and a FlatBuffer frame containing root and vtable, table, string, and vector. view.fuel is decoded as 80; view.pilot borrows Ziguana bytes. Not an exact wire layout.</desc>
+<style>
+text { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
+.code { font-family: 'SFMono-Regular', Menlo, Consolas, monospace; font-size: 22px; }
+</style>
+<rect width="1280" height="570" rx="14" fill="#0d1117"/>
+<defs><pattern id="unused" width="12" height="12" patternUnits="userSpaceOnUse"><path d="M-3 3L3 -3 M0 12L12 0 M9 15L15 9" stroke="#35404b" stroke-width="1"/></pattern></defs>
+<text x="32" y="48" font-size="24" fill="#f3eee8" >ONE BACKING BUFFER</text>
+<text x="1248" y="47" font-size="17" fill="#bfc3c8" text-anchor="end">Conceptual layout · not to scale</text>
+<text x="640" y="104" font-size="21" fill="#f3eee8" text-anchor="middle">caller-owned storage</text>
+<path d="M60 126V114H1220V126 M440 164V152H1220V164" fill="none" stroke="#bfc3c8" stroke-width="1.5"/>
+<text x="830" y="143" font-size="20" fill="#f3eee8" text-anchor="middle">FlatBuffer frame</text>
+<rect x="60" y="180" width="1160" height="80" rx="8" fill="#141b23" stroke="#bfc3c8"/>
+<rect x="61" y="181" width="378" height="78" rx="7" fill="url(#unused)"/>
+<rect x="810" y="181" width="200" height="78" fill="#33291c"/>
+<path d="M440 180V260 M600 180V260 M810 180V260 M1010 180V260" fill="none" stroke="#bfc3c8"/>
+<text x="250" y="227" font-size="22" fill="#bfc3c8" text-anchor="middle" font-style="italic">unused capacity</text>
+<text x="520" y="215" font-size="22" fill="#f3eee8" text-anchor="middle">root /</text>
+<text x="520" y="241" font-size="22" fill="#f3eee8" text-anchor="middle">vtable</text>
+<text x="705" y="227" font-size="22" fill="#f3eee8" text-anchor="middle">table</text>
+<text x="910" y="227" font-size="22" fill="#f3eee8" text-anchor="middle">string</text>
+<text x="1115" y="227" font-size="22" fill="#f3eee8" text-anchor="middle">vector</text>
+<path d="M705 260V288H650V305" fill="none" stroke="#ffae92" stroke-width="2"/>
+<path d="M910 260V287H1035V305" fill="none" stroke="#f9c57d" stroke-width="2"/>
+<circle cx="705" cy="260" r="4" fill="#ffae92"/><circle cx="910" cy="260" r="4" fill="#f9c57d"/>
+<text x="650" y="327" font-size="22" fill="#ffae92" text-anchor="middle" class="code">view.fuel = 80</text>
+<text x="650" y="353" font-size="19" fill="#bfc3c8" text-anchor="middle">decoded scalar</text>
+<text x="1035" y="327" font-size="22" fill="#f9c57d" text-anchor="middle" class="code">view.pilot → &quot;Ziguana&quot;</text>
+<text x="1035" y="353" font-size="19" fill="#bfc3c8" text-anchor="middle">borrowed bytes</text>
+<rect x="32" y="379" width="1216" height="136" rx="8" fill="#141b23" stroke="#35404b"/>
+<text class="code" x="55" y="408" fill="#f3eee8" xml:space="preserve"><tspan fill="#ffae92">var</tspan> storage: [256]u8 align(flatzz.storage_alignment) = undefined;</text>
+<text class="code" x="55" y="437" fill="#f3eee8" xml:space="preserve"><tspan fill="#ffae92">const</tspan> bytes = <tspan fill="#ffae92">try</tspan> rocket.serialize(&amp;storage, .{});</text>
+<text class="code" x="55" y="466" fill="#f3eee8" xml:space="preserve"><tspan fill="#ffae92">try</tspan> Rocket.verify(bytes, .{});</text>
+<text class="code" x="55" y="495" fill="#f3eee8" xml:space="preserve"><tspan fill="#ffae92">const</tspan> view = <tspan fill="#ffae92">try</tspan> Rocket.read(bytes);</text>
+<text x="32" y="548" font-size="19" fill="#bfc3c8" >Fixed-buffer path: no heap allocation. Serialization writes data into storage.</text>
+</svg>

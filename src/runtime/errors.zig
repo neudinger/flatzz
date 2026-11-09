@@ -1,5 +1,10 @@
 //! Public error domains. Checked access never substitutes assertions for errors.
 //! Define runtime errors here and reference these sets at each failure site.
+//! The `flatzz` facade reexports AccessError, MutationError, BuildError, and VerifyError.
+//! Wire decoders use DecodeError directly. Missing optional fields normally return
+//! null/defaults (or false for replacement), not an error.
+//! Mutation errors preserve the operation's target bytes; construction errors can
+//! retain partial children as documented by the calling builder/schema operation.
 
 /// Fixed-width decoding can reject an unknown exhaustive enum tag.
 pub const DecodeError = error{

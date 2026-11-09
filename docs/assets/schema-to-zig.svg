@@ -1,0 +1,34 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="500" viewBox="0 0 1280 500" role="img" aria-labelledby="title description">
+<title id="title">From FBS to generated Zig</title>
+<desc id="description">Rocket schema on the left one third; generated Zig excerpt on the right two thirds. Field descriptors and schema metadata are omitted from the illustration; the linked guide includes the full generated source.</desc>
+<style>
+text { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
+.code { font-family: 'SFMono-Regular', Menlo, Consolas, monospace; font-size: 22px; }
+</style>
+<rect width="1280" height="500" rx="14" fill="#0d1117"/>
+<text x="32" y="48" font-size="24" fill="#f3eee8" >FROM SCHEMA TO NATIVE ZIG</text>
+<text x="1248" y="47" font-size="14" fill="#bfc3c8" text-anchor="end" letter-spacing="1.5">FLATZZ / BUILD TIME</text>
+<rect x="32" y="76" width="1216" height="370" rx="10" fill="#141b23" stroke="#35404b"/>
+<path d="M437.333 76V446 M32 137H1248" fill="none" stroke="#35404b"/>
+<text x="58" y="114" font-size="18" fill="#ffae92" >FBS / rocket.fbs</text>
+<text x="465" y="114" font-size="18" fill="#ffae92" >GENERATED ZIG / excerpt</text>
+<text class="code" x="58" y="177" fill="#f3eee8" xml:space="preserve">table Rocket {</text>
+<text class="code" x="58" y="205" fill="#f3eee8" xml:space="preserve">  id:uint;</text>
+<text class="code" x="58" y="233" fill="#f3eee8" xml:space="preserve">  fuel:float = 100;</text>
+<text class="code" x="58" y="261" fill="#f3eee8" xml:space="preserve">  pilot:string;</text>
+<text class="code" x="58" y="289" fill="#f3eee8" xml:space="preserve">  payload:[ubyte];</text>
+<text class="code" x="58" y="317" fill="#f3eee8" xml:space="preserve">}</text>
+<text class="code" x="58" y="345" fill="#f3eee8" xml:space="preserve">root_type Rocket;</text>
+<text class="code" x="465" y="177" fill="#f3eee8" xml:space="preserve"><tspan fill="#ffae92">pub</tspan> <tspan fill="#ffae92">const</tspan> Rocket = <tspan fill="#ffae92">struct</tspan> {</text>
+<text class="code" x="465" y="205" fill="#f3eee8" xml:space="preserve">    id: u32 = fields.id.default,</text>
+<text class="code" x="465" y="233" fill="#f3eee8" xml:space="preserve">    fuel: f32 = fields.fuel.default,</text>
+<text class="code" x="465" y="261" fill="#f3eee8" xml:space="preserve">    pilot: ?[]<tspan fill="#ffae92">const</tspan> u8 = null,</text>
+<text class="code" x="465" y="289" fill="#f3eee8" xml:space="preserve">    payload: ?[]<tspan fill="#ffae92">const</tspan> u8 = null,</text>
+<text class="code" x="465" y="317" fill="#f3eee8" xml:space="preserve"><tspan fill="#bfc3c8">    // Field descriptors omitted.</tspan></text>
+<text class="code" x="465" y="345" fill="#f3eee8" xml:space="preserve">    <tspan fill="#ffae92">pub</tspan> <tspan fill="#ffae92">const</tspan> serialize = Schema.serialize;</text>
+<text class="code" x="465" y="373" fill="#f3eee8" xml:space="preserve">    <tspan fill="#ffae92">pub</tspan> <tspan fill="#ffae92">const</tspan> serializeAlloc = Schema.serializeAlloc;</text>
+<text class="code" x="465" y="401" fill="#f3eee8" xml:space="preserve">    <tspan fill="#ffae92">pub</tspan> <tspan fill="#ffae92">const</tspan> read = Schema.read;</text>
+<text class="code" x="465" y="429" fill="#f3eee8" xml:space="preserve">};</text>
+<path d="M409 268H452 M443 260L452 268L443 276" fill="none" stroke="#ffae92" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+<text x="32" y="479" font-size="18" fill="#bfc3c8" >Excerpt only. The linked copyable example contains the complete generated module.</text>
+</svg>

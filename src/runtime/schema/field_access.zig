@@ -1,5 +1,7 @@
 //! Descriptor-selected results and reads from already checked tables.
 //! Views borrow the input frame; callers choose framing and input capabilities.
+//! Internal adapter shared by schema.read and schema.borrowMutable. It allocates
+//! nothing and never opens a root or performs recursive schema verification.
 
 const sequence = @import("../sequence.zig");
 const table_view = @import("../table_view.zig");
@@ -10,7 +12,9 @@ const errors = @import("../errors.zig");
 const AccessError = errors.AccessError;
 const StructView = struct_view.StructView;
 
-// Select result types from wire kinds without resolving native child schemas.
+/// Select a field result without resolving native child schemas.
+/// Scalars are copied; optional references and structured views borrow the frame.
+/// The access capability reaches table/struct payloads; strings stay read-only.
 pub fn View(comptime field_kind: anytype, comptime access: table_view.Access) type {
     return switch (field_kind) {
         .scalar => |ValueType| ValueType,
@@ -23,7 +27,9 @@ pub fn View(comptime field_kind: anytype, comptime access: table_view.Access) ty
     };
 }
 
-// Reuse checked table metadata; framing and input capabilities are selected by callers.
+/// Read one descriptor using the caller's already checked table and selected frame.
+/// Absence uses scalar defaults, null references, or the union's none alternative.
+/// Required presence is a verifier/builder rule; vector elements are checked lazily.
 pub fn read(
     comptime FieldType: type,
     comptime access: table_view.Access,

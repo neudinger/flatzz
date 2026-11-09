@@ -1,5 +1,25 @@
 //! Conservative fixed storage derived from schema wire descriptors.
 //! Explicit budgets or native values supply compile-time bounds without allocation.
+//! Import as `flatzz.storage`, or use the facade's Storage/Serialized aliases.
+//! Capacity calculations include framing and padding; they do not predict an
+//! exact output length or replace packing's UTF-8/encoding checks.
+//!
+//! Example test body with `std` and `runtime = @import("flatzz")` imported:
+//! ```zig
+//! const Value = struct { label: ?[]const u8 = null };
+//! const Definition = runtime.Schema(Value, .{
+//!     .label = runtime.ReferenceField(0, .string, .{}),
+//! });
+//! var output: runtime.Storage(Definition, .{ .label = 6 }, .{}) = .{};
+//! const value: Value = .{ .label = "sensor" };
+//! const bytes = try Definition.serialize(value, &output.buffer, .{});
+//! const view = try Definition.read(bytes);
+//! try std.testing.expectEqualStrings("sensor", view.label.?);
+//! try std.testing.expect(bytes.len <= output.buffer.len);
+//! ```
+//! Expected result: a borrowed frame within the six-byte string budget; no allocation/output.
+//! Retain output.buffer for every borrowed result. See the `flatzz` module overview
+//! for complete imports and a Zig 0.17.0 test command, including allocating serialization.
 const std = @import("std");
 const wire = @import("wire.zig");
 const schema = @import("schema.zig");
@@ -8,8 +28,18 @@ const errors = @import("errors.zig");
 
 const BuildError = errors.BuildError;
 
-const BudgetPart = enum { count, bytes };
-const Purpose = enum { capacity, serialize };
+const BudgetPart = enum {
+    /// Element count; checked to fit the wire's u32 prefix.
+    count,
+    /// Aggregate payload/descendant byte budget supplied by the caller.
+    bytes,
+};
+const Purpose = enum {
+    /// Compile-time capacity calculation; required-field presence is not validated.
+    capacity,
+    /// Runtime sizing for serialization; required-field presence is validated.
+    serialize,
+};
 const default_write_options: schema.WriteOptions = .{};
 
 /// One allocator-owned buffer and its serialized frame, without a final output copy.
@@ -21,6 +51,7 @@ pub const Serialized = struct {
     bytes: []u8,
 
     /// Release the complete allocation with the allocator supplied to serializeAlloc.
+    /// Copies share ownership; call once in total. The bytes suffix and all views expire here.
     pub fn deinit(self: Serialized, allocator: std.mem.Allocator) void {
         allocator.free(self.storage);
     }
@@ -259,8 +290,11 @@ fn framingSize(finish: Builder.FinishOptions) usize {
 fn NativeSizer(comptime purpose: Purpose) type {
     return struct {
         const Self = @This();
+        /// Framing and native traversal budgets shared by this sizing pass.
         options: ValueOptions,
+        /// Active table depth; restored after visiting a native child.
         depth: usize = 0,
+        /// Native visits/payload bytes charged so far, at or below options.max_work.
         work: usize = 0,
 
         fn table(self: *Self, comptime SchemaType: type, value: anytype) BuildError!usize {

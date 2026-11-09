@@ -11,6 +11,9 @@
 //! and preserves shared Object references. Keep the arena alive for all consumers.
 //! Wire validation does not replace FBS semantic validation. Unknown appended
 //! fields are ignored; unknown BaseType values and feature bits are retained.
+//! Retained feature bits describe metadata, not a promise that runtime serialization
+//! or code generation implements those features. Encoding preserves record/vector
+//! order and indices; producers remain responsible for their FBS semantic consistency.
 //!
 //! ## Complete example
 //!
@@ -26,8 +29,10 @@
 //! test "schema binary round trip" {
 //!     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
 //!     defer arena.deinit();
-//!     const schema = try compiler.parser.parse(arena.allocator(),
-//!         "table Reading { value:uint = 42; } root_type Reading;");
+//!     const schema = try compiler.parser.parse(
+//!         arena.allocator(),
+//!         "table Reading { value:uint = 42; } root_type Reading;",
+//!     );
 //!     const bytes = try compiler.bfbs.encode(std.testing.allocator, schema);
 //!     defer std.testing.allocator.free(bytes);
 //!     const decoded = try compiler.bfbs.decode(arena.allocator(), bytes);
@@ -64,6 +69,7 @@ pub const Error = std.mem.Allocator.Error || Builder.Error || error{
 };
 
 /// Decoder work bounds apply before payload allocation or string scanning.
+/// Limits exclude cache/allocator overhead and do not bound total process memory.
 pub const DecodeOptions = struct {
     /// Ordinary BFBS by default; prefixed input retains its original alignment origin.
     format: framing.Format = .ordinary,

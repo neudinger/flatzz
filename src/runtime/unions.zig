@@ -1,6 +1,9 @@
 //! Union metadata and checked borrowed alternatives, not native wire layouts.
 //! Each logical field owns a tag and a payload slot. Union vectors pair two
 //! arrays; only NONE elements may contain a zero offset.
+//! Import the public factories as flatzz.Union and flatzz.UnionVectorView.
+//! Value carries native inputs, Handle contains completed builder offsets,
+//! and View borrows wire payloads. None of these transfers storage ownership.
 //! https://github.com/dvidelabs/flatcc/blob/e1272290b486fdd7fdc60f061036b7a18c468dc7/doc/binary-format.md#unions
 //!
 //! Example inside a test with `std = @import("std")` and
@@ -22,6 +25,9 @@
 //! Expected result: `selected == .text` and `handle.? == text`; nothing is printed.
 //! `value` is a construction handle, not serialized bytes or a decoded view.
 //! The builder and its storage must remain valid until the enclosing table is finished.
+//! Generated schemas select metadata through Schema.borrowMutable(bytes, .field);
+//! raw Table.readUnion callers supply the union type and physical IDs themselves.
+//! See the `flatzz` module overview for complete imports and a Zig 0.17.0 test command.
 const std = @import("std");
 const wire = @import("wire.zig");
 const buffer_access = @import("buffer_access.zig");
@@ -156,7 +162,8 @@ pub fn Union(
         }
 
         /// Tag/offset pairing is checked before interpreting any payload.
-        /// Field NONE requires absence; vector NONE requires a zero slot.
+        /// A missing payload slot requires NONE; an existing slot is zero exactly for NONE.
+        /// field checks single-field presence; vector NONE elements retain zero offset slots.
         pub fn check(
             bytes: []const u8,
             location: Location,

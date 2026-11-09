@@ -1,6 +1,30 @@
 //! Borrowed inline values; nested views retain the complete frame and access.
+//! Import the public factories as flatzz.StructView and flatzz.ArrayView. Opening
+//! checks the inline range/alignment; get decodes selected scalar leaves.
+//! StructView.read copies a complete native value; StructView.verify checks all
+//! leaves without that copy.
+//! Mutating requires .mutable at compile time and never changes the layout.
 //! Go Struct{Bytes, Pos} and C++ GetStruct are the reference access patterns.
 //! https://github.com/google/flatbuffers/blob/b8431fbcd7a5c71817f314e18b332c0648554efa/go/struct.go
+//!
+//! Example test body with `std` and `runtime = @import("flatzz")` imported:
+//! ```zig
+//! const Point = struct { height: i16 };
+//! const Layout = runtime.StructLayout(Point, .{ .size = 2, .alignment = 2 }, .{
+//!     .height = runtime.ScalarMember(i16, 0),
+//! });
+//! var bytes: [Layout.wire_size]u8 = undefined;
+//! Layout.encode(&bytes, .{ .height = 1 });
+//! const view = try runtime.StructView(Layout, .mutable).from(&bytes, 0);
+//! const before = try view.read();
+//! try view.update(.height, 2);
+//! try std.testing.expectEqual(@as(i16, 1), before.height);
+//! try std.testing.expectEqual(@as(i16, 2), try view.get(.height));
+//! ```
+//! Expected result: the copied point stays at height 1; the view sees 2. No output/allocation.
+//! This uses standalone inline bytes. Table access normally supplies the containing
+//! complete frame; retain that storage for all nested views. The `flatzz` overview
+//! provides complete imports and a Zig 0.17.0 test command.
 const buffer_access = @import("buffer_access.zig");
 const mutation = @import("mutation.zig");
 const errors = @import("errors.zig");
@@ -81,6 +105,7 @@ pub fn StructView(comptime Layout: type, comptime access: Access) type {
         }
 
         /// Struct members always exist. Failure never partially updates bytes.
+        /// Requires mutable access; nested aggregate input must not borrow this frame.
         pub fn update(
             self: Self,
             comptime field: Layout.Field,
@@ -107,6 +132,7 @@ pub fn StructView(comptime Layout: type, comptime access: Access) type {
         }
 
         /// Replaces a present fixed-size value, including its zeroed padding.
+        /// Requires mutable access and disjoint native input; errors leave bytes unchanged.
         pub fn replace(
             self: Self,
             value: Layout.Value,

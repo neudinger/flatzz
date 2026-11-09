@@ -1,0 +1,7 @@
+table Rocket {
+  id:uint;
+  fuel:float = 100;
+  pilot:string;
+  payload:[ubyte];
+}
+root_type Rocket;

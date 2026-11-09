@@ -1,6 +1,28 @@
 //! One implementation for borrowed read-only and mutable table capabilities.
+//! Public entry points are flatzz.Table, MutableTable, and TableView. A view caches
+//! local table/vtable layout and borrows the complete selected frame without allocation.
+//! Structural edits invalidate cached metadata; scalar copies remain independent,
+//! while borrowed strings and child views can observe size-preserving edits.
 //! C++ Table / Go Table{Bytes, Pos}, with checked local metadata cached once.
 //! https://github.com/google/flatbuffers/blob/b8431fbcd7a5c71817f314e18b332c0648554efa/include/flatbuffers/table.h
+//!
+//! Example test body with `std` and `runtime = @import("flatzz")` imported:
+//! ```zig
+//! var buffer: [128]u8 align(runtime.storage_alignment) = undefined;
+//! var builder = runtime.Builder.init(&buffer);
+//! var table = try runtime.TableBuilder(1).init(&builder);
+//! try table.addScalar(u16, 0, 41, 0);
+//! const bytes = try builder.finish(try table.endTable(), .ordinary);
+//! const view = try runtime.Table.from(bytes, .root);
+//! const before = try view.readField(u16, 0, 0);
+//! const mutable = try runtime.MutableTable.from(bytes, .root);
+//! try std.testing.expect(try mutable.mutateField(u16, 0, 42));
+//! try std.testing.expectEqual(@as(u16, 41), before);
+//! try std.testing.expectEqual(@as(u16, 42), try view.readField(u16, 0, 0));
+//! ```
+//! Expected result: the copied value stays 41; a new read sees 42. No output or allocation.
+//! This example checks local access only. See the `flatzz` overview for the complete
+//! test runner and schema-level verification of a reachable graph.
 const wire = @import("wire.zig");
 const buffer_access = @import("buffer_access.zig");
 const sequence = @import("sequence.zig");
@@ -227,8 +249,9 @@ pub fn TableView(comptime access: Access) type {
             };
         }
 
-        /// All mutations preserve storage size and return false for absence.
-        /// They provide local checks and failure atomicity, not proof that every
+        /// Replace one present scalar; return false for absence and reject clearing with null.
+        /// Requires mutable access. All mutations preserve storage size and provide
+        /// local checks and failure atomicity, not proof that every
         /// cross-typed alias in a malicious graph remains schema-valid.
         pub fn mutateField(
             self: Self,

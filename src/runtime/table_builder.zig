@@ -2,6 +2,10 @@
 //! Open one context after constructing referenced children, add each physical
 //! field at most once, then finalize through its generated schema or `endTable`.
 //! The context borrows a stable builder address and requires no allocation/deinit.
+//! Import the public factory as flatzz.TableBuilder. endTable completes an object
+//! handle; Builder.finish subsequently emits the root frame. Raw finalization does
+//! not enforce required schema fields; generated schemas use Schema.endTable.
+//! Builder's module example shows the complete child/table/frame lifecycle.
 const std = @import("std");
 const wire = @import("wire.zig");
 const Builder = @import("Builder.zig");

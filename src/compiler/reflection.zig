@@ -9,6 +9,9 @@
 //! codec derives wire field IDs from that order. `null` optional metadata differs
 //! from a present empty string or slice. Constructing these records does not
 //! validate schema semantics or generate native Zig types.
+//! Copying a record preserves its borrowed pointers/slices. There is no record-level
+//! deinit; the producer owns backing storage. In particular, keep Schema.objects
+//! at stable addresses while root, RPC, or legacy Object pointers refer to its elements.
 //!
 //! Example inside a test with `std = @import("std")` and `reflection` imported:
 //! ```zig
@@ -27,6 +30,7 @@
 //! Expected result: `schema.root_table.?.name` is `"Reading"` and its first field
 //! describes a `uint` at table wire ID zero. No allocation or output occurs.
 //! Keep the local records alive while using `schema`, including during BFBS encoding.
+//! The `flatzz_compiler` overview supplies complete imports and a Zig 0.17.0 test command.
 
 /// Four-byte identifier stored in a reflection binary schema frame.
 pub const file_identifier = "BFBS";
@@ -75,6 +79,7 @@ pub const BaseType = enum(i8) {
     Vector64 = 18,
     /// Upstream sentinel after the known type codes; not a field value type.
     MaxBaseType = 19,
+    /// Retain unrecognized wire codes without claiming consumer support for them.
     _,
 
     /// Whether this code represents a scalar, including union discriminators and booleans.

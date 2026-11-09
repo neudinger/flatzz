@@ -1,5 +1,8 @@
 //! Reflection-to-Zig declaration lowering with borrowed scratch storage.
 //! Dynamic descriptions and escaped names share scratch storage until AST finalization.
+//! The schema remains borrowed and unchanged. Call prepareNames before lowering
+//! declarations; the caller bulk-releases scratch storage after finalization or failure.
+//! Public source ownership and error handling are provided by codegen.generate.
 
 const std = @import("std");
 const flatzz = @import("flatzz");
@@ -14,7 +17,16 @@ const Member = zast.StructDeclaration.Member;
 const Allocator = std.mem.Allocator;
 const Generator = @This();
 
-const KindField = enum { scalar, structure, table, vector };
+const KindField = enum {
+    /// Descriptor payload naming a scalar type.
+    scalar,
+    /// Descriptor payload naming an inline struct layout.
+    structure,
+    /// Descriptor payload naming a referenced child table type.
+    table,
+    /// Descriptor payload naming a vector element codec.
+    vector,
+};
 
 const reserved_module_names = [_][]const u8{
     "runtime", "types", "file_identifier", "file_extension",
@@ -29,9 +41,13 @@ const schema_aliases = [_][]const u8{
     "read",  "update", "borrowMutable", "verify",
 };
 
+/// Expression construction using the caller's scratch arena.
 syntax: Syntax,
+/// Borrowed metadata; every referenced record and string must survive lowering.
 schema: reflection.Schema,
+/// Escaped names indexed exactly like schema.objects; populated by prepareNames.
 object_names: []const []const u8 = &.{},
+/// Escaped names indexed exactly like schema.enums; populated by prepareNames.
 enum_names: []const []const u8 = &.{},
 
 fn identifier(self: *Generator, name: []const u8) ![]const u8 {
@@ -69,6 +85,9 @@ fn appendBinding(
     });
 }
 
+/// Compute names after stripping the common namespace, rejecting reserved names/collisions.
+/// Retain the schema and scratch arena for all subsequent lowering. Errors leave scratch
+/// allocations in that arena; discard the generation attempt rather than publishing a part.
 pub fn prepareNames(self: *Generator) !void {
     var common: ?[]const u8 = null;
     for (self.schema.objects) |object_value| common = commonNamespace(
@@ -177,6 +196,9 @@ fn defaultValue(self: *Generator, field: reflection.Field) !Expression {
     };
 }
 
+/// Lower an enum or union to a borrowed Zast expression using prepared declaration names.
+/// Numeric tags retain their wire values; names become snake_case. Invalid metadata,
+/// unsupported tag forms, name collisions, and allocation failures propagate.
 pub fn enumeration(self: *Generator, value: reflection.Enum) !Expression {
     const syntax = self.syntax;
     const backing = if (value.is_union) "u8" else scalarName(
@@ -433,6 +455,10 @@ fn appendField(
     return .{ .name = name, .value = try self.descriptor(field.*, structure) };
 }
 
+/// Lower a table or struct to native fields and runtime descriptors in physical ID order.
+/// Requires prepareNames; descriptions borrow both the schema and scratch arena.
+/// Input field order is unchanged. Deprecated fields and synthetic union tags do not
+/// become native fields; malformed pairs, unsupported layouts, and collisions fail.
 pub fn object(self: *Generator, value: reflection.Object) !zast.StructDeclaration {
     const syntax = self.syntax;
     // Order borrowed records without copying or mutating the caller's field metadata.

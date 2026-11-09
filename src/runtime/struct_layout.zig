@@ -1,5 +1,8 @@
 //! Compile-time FlatBuffers struct layouts, independent of the native Zig ABI.
 //! Members follow schema order, with natural alignment and explicit padding.
+//! Public factories are reexported by flatzz. Encoding copies members and zeros
+//! wire padding; decoding copies native values and ignores padding. Neither operation
+//! allocates. Checked frame containment belongs to StructView and table accessors.
 //! https://flatbuffers.dev/internals/#structs
 //!
 //! Example inside a test with `std = @import("std")` and
@@ -20,6 +23,7 @@
 //! Expected result: `bytes == .{ 1, 0, 254, 255 }`, `point.horizontal == 1`,
 //! and `point.vertical == -2`.
 //! No output is printed; all storage belongs to the caller.
+//! See the `flatzz` module overview for complete imports and a Zig 0.17.0 test command.
 const std = @import("std");
 const wire = @import("wire.zig");
 const errors = @import("errors.zig");
@@ -186,7 +190,7 @@ pub fn ArrayLayout(comptime element: Kind, comptime count: usize) type {
 
 /// Generated metadata gives the wire layout; native declaration order is free.
 /// Reject layouts inconsistent with normal FlatBuffers packing at compile time.
-/// Explicit force_align needs its own policy in a later feature.
+/// Forced alignment differing from the computed natural alignment is unsupported.
 pub fn StructLayout(
     comptime Native: type,
     comptime options: Options,

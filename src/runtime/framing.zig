@@ -1,4 +1,22 @@
 //! Frame positions retain the prefix: alignment is relative to slice index zero.
+//! Use `flatzz.framing` to select ordinary or size-prefixed input and optional
+//! identifier checks before opening tables. Parsing returns positions, borrows no
+//! storage beyond the call, and does not validate a root offset or table graph.
+//!
+//! Example test body with `std` and `runtime = @import("flatzz")` imported:
+//! ```zig
+//! const input = [_]u8{ 4, 0, 0, 0, 0, 0, 0, 0, 9, 9 };
+//! const layout = try runtime.framing.parse(&input, .{
+//!     .format = .size_prefixed,
+//!     .boundary = .first,
+//! });
+//! try std.testing.expectEqual(@as(usize, 8), layout.frame_size);
+//! try std.testing.expectEqual(@as(usize, 4), layout.root_offset_start);
+//! try std.testing.expectEqualSlices(u8, &.{ 9, 9 }, input[layout.frame_size..]);
+//! ```
+//! Expected result: an eight-byte frame and two trailing bytes; no output/allocation.
+//! The zero root offset deliberately shows that framing alone does not validate objects.
+//! See the `flatzz` module overview for complete imports and a Zig 0.17.0 test command.
 const wire = @import("wire.zig");
 const buffer_access = @import("buffer_access.zig");
 const errors = @import("errors.zig");
@@ -45,6 +63,7 @@ pub const Layout = struct {
 /// Truncation returns OutOfBounds; an unexpected identifier returns
 /// IdentifierMismatch, and an exact-boundary mismatch returns InvalidBuffer.
 /// No allocation or copying occurs; the returned record contains only positions.
+/// Ordinary input always consumes the complete slice; boundary applies only to size prefixes.
 pub fn parse(bytes: []const u8, options: Options) AccessError!Layout {
     var layout: Layout = .{ .frame_size = bytes.len };
     if (options.format == .size_prefixed) {

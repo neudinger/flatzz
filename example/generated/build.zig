@@ -5,7 +5,7 @@ const std = @import("std");
 /// Register host-side Reading generation; the output path belongs to the build.
 fn compileReading(builder: *std.Build, flatzz: *std.Build.Dependency) std.Build.LazyPath {
     return zig_schema_blk: {
-        const generate = builder.addRunArtifact(flatzz.artifact("flatzz-schema"));
+        const generate = builder.addRunArtifact(flatzz.artifact("flatzz"));
         generate.addArgs(&.{ "--zig", "--depfile" });
         _ = generate.addDepFileOutputArg2("reading.d", .{});
         generate.addFileArg(flatzz.path("example/flatbuf/reading.fbs"));

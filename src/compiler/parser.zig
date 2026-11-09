@@ -1,7 +1,7 @@
 //! Native FBS frontend for Flatzz reflection metadata (Zig 0.17.0).
 //!
-//! Use a caller-owned arena: ALL returned data AND parsing temporaries use the
-//! supplied allocator. Destroy the arena after code generation, including on
+//! Use a caller-owned arena for referenced metadata, diagnostic strings, and parsing
+//! temporaries. Retain it for all schema consumers and destroy it on success or
 //! failure. The parser copies input text, so the original source may be released.
 //! Parser/compiler state stores no allocator: allocating operations receive it
 //! explicitly. Use the same allocator throughout a parse, including callbacks.
@@ -17,6 +17,9 @@
 //!
 //! Reflection arrays are sorted as flatc sorts them; IDs/layout retain declaration
 //! semantics. See https://flatbuffers.dev/schema/ and reflection/reflection.fbs.
+//! Includes do not trigger automatic filesystem access: the caller's loader supplies
+//! canonical names and text. Parsing validates the supported FBS subset; it does not
+//! generate Zig source or serialize application message values.
 //!
 //! From Flatzz, run `zig build test`.
 //! Import `const compiler = @import("flatzz_compiler");`, then `const parser = compiler.parser;`.
@@ -24,11 +27,14 @@
 //! ```zig
 //! var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
 //! defer arena.deinit();
-//! const schema = try parser.parse(arena.allocator(),
-//!     "table Reading { value:uint = 42; } root_type Reading;");
+//! const schema = try parser.parse(
+//!     arena.allocator(),
+//!     "table Reading { value:uint = 42; } root_type Reading;",
+//! );
 //! std.debug.print("{s}\n", .{schema.root_table.?.name});
 //! ```
 //! Expected output: `Reading` followed by a newline. The arena owns the schema.
+//! The `flatzz_compiler` module overview provides a complete Zig 0.17.0 test runner.
 
 const std = @import("std");
 const reflection = @import("reflection.zig");
@@ -112,21 +118,19 @@ pub fn parse(allocator: Allocator, source: []const u8) Error!reflection.Schema {
 /// there is no rollback of arena allocations. Loader `OutOfMemory` propagates,
 /// while other loader errors become `IncludeNotFound`.
 ///
-/// Inside a function with `std`, `compiler = @import("flatzz_compiler")`,
+/// Inside a test with `std`, `compiler = @import("flatzz_compiler")`,
 /// and `parser = compiler.parser` declared:
 /// ```zig
 /// var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
 /// defer arena.deinit();
 /// var diagnostic: parser.Diagnostic = .{};
-/// const result = parser.parseWithOptions(arena.allocator(), "table T { value:Missing; }", .{
-///     .filename = "bad.fbs",
-///     .diagnostic = &diagnostic,
-/// });
-/// if (result) |_| unreachable else |failure| {
-///     std.debug.assert(failure == error.InvalidSchema);
-///     std.debug.assert(std.mem.eql(u8, diagnostic.filename, "bad.fbs"));
-///     std.debug.assert(diagnostic.line == 1);
-/// }
+/// try std.testing.expectError(error.InvalidSchema, parser.parseWithOptions(
+///     arena.allocator(),
+///     "table Reading { value:Missing; }",
+///     .{ .filename = "bad.fbs", .diagnostic = &diagnostic },
+/// ));
+/// try std.testing.expectEqualStrings("bad.fbs", diagnostic.filename);
+/// try std.testing.expectEqual(@as(usize, 1), diagnostic.line);
 /// ```
 /// Expected result: `InvalidSchema` with a line-one diagnostic for `bad.fbs`;
 /// no text is printed. The diagnostic strings remain valid until arena cleanup.

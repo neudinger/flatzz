@@ -1,6 +1,9 @@
 //! Compile-time schema facts shared by generated access/build/verify adapters.
 //! Field names select metadata; explicit wire IDs determine physical slots.
 //! References are named types, so recursive schemas are resolved lazily.
+//! Import factories through flatzz.Schema and its field descriptors, or flatzz.schema.
+//! Native packing, local reads/updates, and full verification remain separate contracts;
+//! descriptor construction performs no runtime work or allocation.
 //!
 //! Example inside a test with `std = @import("std")` and
 //! `runtime = @import("flatzz")` imported:
@@ -23,6 +26,7 @@
 //! Expected result: `before.count == 42`, `changed == true`, `after.count == 7`.
 //! No output is printed. `bytes` borrows `storage.buffer`; reusing that storage
 //! invalidates views. Writing may leave partial builder data on failure.
+//! See the `flatzz` module overview for complete imports and a Zig 0.17.0 test command.
 const std = @import("std");
 const wire = @import("wire.zig");
 const sequence = @import("sequence.zig");
@@ -403,6 +407,7 @@ pub fn Schema(comptime Native: type, comptime descriptors: anytype) type {
             options: Verifier.Options,
         ) VerifyError!void {
             return Verifier.verify(struct {
+                /// Bind this adapter without requiring a Schema declaration on Native.
                 pub const Schema = Self;
             }, source, options);
         }
@@ -579,6 +584,8 @@ pub fn Schema(comptime Native: type, comptime descriptors: anytype) type {
 
         /// Generated traversal specializes field facts; resource accounting stays
         /// in Verifier. Unknown newer fields are deliberately not traversed.
+        /// Internal verifier callback: reuse its current frame/counters, which may
+        /// remain partly consumed on error. Use verify above for a fresh traversal.
         pub fn verifyFields(
             verifier: *Verifier,
             table: Table,

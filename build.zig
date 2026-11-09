@@ -11,14 +11,42 @@ const format_paths = [_][]const u8{
     "build.zig", "build.zig.zon", "src", "tests", "tools", "example",
 };
 
-/// Register host-side Reading generation; the output path belongs to the build.
-fn compileReading(builder: *std.Build, schema_tool: *Step.Compile) std.Build.LazyPath {
+const schema_examples = [_]struct {
+    name: []const u8,
+    schema_path: []const u8,
+    description: []const u8,
+}{
+    .{
+        .name = "readme",
+        .schema_path = "example/readme/rocket.fbs",
+        .description = "Generate Rocket and run the README round trip and mutation example",
+    },
+    .{
+        .name = "mission",
+        .schema_path = "example/flatbuf/mission/mission.fbs",
+        .description = "Generate Mission from two FBS files, then serialize and read it",
+    },
+    .{
+        .name = "monster",
+        .schema_path = "example/flatbuf/monster.fbs",
+        .description = "Generate Monster, then serialize and read it",
+    },
+};
+
+/// Generate a schema on the host; the output path belongs to the build.
+fn compileSchema(
+    builder: *std.Build,
+    schema_tool: *Step.Compile,
+    source_path: []const u8,
+) std.Build.LazyPath {
     return zig_schema_blk: {
         const generate = builder.addRunArtifact(schema_tool);
         generate.addArgs(&.{ "--zig", "--depfile" });
-        _ = generate.addDepFileOutputArg2("reading.d", .{});
-        generate.addFileArg(builder.path("example/flatbuf/reading.fbs"));
-        break :zig_schema_blk generate.captureStdOut(.{ .basename = "reading.zig" });
+        _ = generate.addDepFileOutputArg2("schema.d", .{});
+        generate.addFileArg(builder.path(source_path));
+        break :zig_schema_blk generate.captureStdOut(.{
+            .basename = builder.fmt("{s}.zig", .{std.fs.path.stem(source_path)}),
+        });
     };
 }
 
@@ -93,7 +121,7 @@ pub fn build(builder: *std.Build) void {
         null;
 
     const generated_reading = if (schema_tools) |tools| reading_module_blk: {
-        const source = compileReading(builder, tools.executable);
+        const source = compileSchema(builder, tools.executable, "example/flatbuf/reading.fbs");
         builder.getInstallStep().dependOn(
             &builder.addInstallFile(source, "schema/reading.zig").step,
         );
@@ -108,7 +136,7 @@ pub fn build(builder: *std.Build) void {
     const generated = if (generated_reading) |reading| app_blk: {
         // The generator runs on the host; the app imports only its output and runtime.
         const executable = builder.addExecutable(.{
-            .name = "flatzz",
+            .name = "flatzz-example",
             .root_module = builder.createModule(.{
                 .root_source_file = builder.path("example/generated/main.zig"),
                 .target = target,
@@ -123,6 +151,45 @@ pub fn build(builder: *std.Build) void {
         const run = builder.addRunArtifact(executable);
         run.addPassthruArgs();
         break :app_blk .{ .compile = &executable.step, .run = &run.step };
+    } else null;
+
+    const examples = if (schema_tools) |tools| examples_blk: {
+        var checks: [schema_examples.len * 2]*Step = undefined;
+        var tests: [schema_examples.len]*Step = undefined;
+        for (schema_examples, 0..) |example, index| {
+            const schema_name = std.fs.path.stem(example.schema_path);
+            const schema = builder.createModule(.{
+                .root_source_file = compileSchema(builder, tools.executable, example.schema_path),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{.{ .name = "flatzz", .module = runtime_module }},
+            });
+            const module = builder.createModule(.{
+                .root_source_file = builder.path(
+                    builder.fmt("example/{s}/main.zig", .{example.name}),
+                ),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{
+                    .{ .name = schema_name, .module = schema },
+                    .{ .name = "flatzz", .module = runtime_module },
+                },
+            });
+            const executable = builder.addExecutable(.{
+                .name = builder.fmt("flatzz-{s}-example", .{example.name}),
+                .root_module = module,
+            });
+            const example_tests = builder.addTest(.{ .root_module = module });
+            checks[index * 2] = &executable.step;
+            checks[index * 2 + 1] = &example_tests.step;
+            tests[index] = &builder.addRunArtifact(example_tests).step;
+            const run = builder.step(
+                builder.fmt("run-{s}", .{example.name}),
+                example.description,
+            );
+            run.dependOn(&builder.addRunArtifact(executable).step);
+        }
+        break :examples_blk .{ .check = checks, .tests = tests };
     } else null;
 
     const suites = suites_blk: {
@@ -188,14 +255,24 @@ pub fn build(builder: *std.Build) void {
         &suites.check,
         &contracts,
         if (schema_tools) |*tools| &tools.check else &.{},
+        if (examples) |*apps| &apps.check else &.{},
     }) catch @panic("OOM");
     const test_steps = std.mem.concat(builder.allocator, *Step, &.{
         &suites.tests,
         &contracts,
         if (schema_tools) |*tools| &tools.tests else &.{},
+        if (examples) |*apps| &apps.tests else &.{},
     }) catch @panic("OOM");
 
     inline for (.{
+        .{
+            .tag = .compiler,
+            .description = "Build and install only flatzz",
+            .prerequisites = if (schema_tools) |tools|
+                @as([]const *Step, &.{tools.install})
+            else
+                &.{},
+        },
         .{
             .tag = .docs,
             .description = "Build the public API reference",
