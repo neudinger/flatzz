@@ -18,6 +18,7 @@ from existing bytes.
   <a href="docs/examples.md">Copyable examples</a> ·
   <a href="src/runtime.zig">Runtime API</a> ·
   <a href="src/compiler.zig">Compiler API</a> ·
+  <a href="docs/wasm.md">WebAssembly compiler</a> ·
   <a href="example/README.md">More examples</a>
 </p>
 
@@ -39,7 +40,7 @@ const rocket: Rocket = .{
     .pilot = "Ziguana",
     .payload = &.{ 1, 2, 3 },
 };
-const result = try rocket.serializeAlloc(allocator, .{});
+const result = try rocket.serialize(allocator, .{});
 defer result.deinit(allocator);
 
 try Rocket.verify(result.bytes, .{});
@@ -56,6 +57,10 @@ try std.testing.expectEqualStrings("Ziguana", view.pilot.?);
 `result` owns the allocation. Release it once with the same allocator and keep
 it alive while using borrowed views. `view.fuel` is the decoded scalar `80`;
 `view.pilot` borrows the string `"Ziguana"` from `result.bytes`.
+
+The same `serialize(target, options)` operation accepts an allocator or an aligned
+mutable buffer. Its argument type determines whether the result owns an allocation
+or borrows supplied storage; the values and storage remain runtime inputs.
 
 ## 2. Use caller-owned storage
 
@@ -117,6 +122,7 @@ The default `check` and `test` steps generate the README example.
 | --- | --- |
 | `zig build` | Install the compiler, both examples, and generated Reading |
 | `zig build compiler` | Build and install only `zig-out/bin/flatzz` |
+| `zig build wasm` | Install the reusable freestanding Wasm compiler |
 | `zig build run-readme` | Generate Rocket; allocate, serialize, receive, read, and edit |
 | `zig build run-mission` | Generate Mission from two FBS files; serialize with comptime-sized storage and read it |
 | `zig build run-monster` | Generate Monster; serialize with comptime-sized storage and read its fields and union |
@@ -125,7 +131,8 @@ The default `check` and `test` steps generate the README example.
 | `zig build check` | Compile examples, tests, and contracts |
 | `zig build test` | Test native runtime, FBS parsing, generated Zig, and contracts |
 | `zig build fmt` | Check Zig formatting |
-| `zig build docs` | Generate runtime API docs in `zig-out/docs` |
+| `zig build docs` | Generate runtime/compiler API references into `zig-out/docs` |
+| `zig build examples` | Compile the native Zig examples and their tests |
 | `zig build check test -Dschema-tools=false` | Check and test runtime/compiler APIs without Zast |
 | `zig build generate-reading` | Regenerate `tests/fixtures/reading/reading.zig` |
 | `zig build --help` | List targets and options |
@@ -133,6 +140,11 @@ The default `check` and `test` steps generate the README example.
 The generated example executable is `zig-out/bin/flatzz-example`.
 
 All example commands and independent example builds: [example/README.md](example/README.md).
+The sibling `flatzz-site` project prepares the website, API theme, and example catalogue.
+
+The [WebAssembly compiler](docs/wasm.md) provides FBS to Zig/schema JSON/BFBS and
+BFBS to Zig/schema JSON. Other projects can request the `flatzz-compiler-wasm`
+artifact with `.@"wasm-compiler" = true`; no site-specific compiler setup is needed.
 
 </details>
 
@@ -142,7 +154,7 @@ All example commands and independent example builds: [example/README.md](example
 The public entry points are [runtime.zig](src/runtime.zig) (`flatzz`) and
 [compiler.zig](src/compiler.zig) (`flatzz_compiler`). Applications can use the
 runtime, FBS parser, reflection model, and BFBS codec without Zast. Zig source
-generation uses a separate host backend; generated modules import only `flatzz`.
+generation uses a separate Zast-based backend; generated modules import only `flatzz`.
 
 | Responsibility | Implementation |
 | --- | --- |
@@ -159,8 +171,10 @@ generation uses a separate host backend; generated modules import only `flatzz`.
 | Source cursor and declaration grammar | [Parser.zig](src/compiler/fbs/Parser.zig) |
 | Shared unresolved declarations and spelling helpers | [model.zig](src/compiler/fbs/model.zig) |
 | Reflection records and primitive facts | [reflection.zig](src/compiler/reflection.zig) |
+| Portable schema JSON writing | [json.zig](src/compiler/json.zig) |
 | Public BFBS API, encoding, decoding, and shared record layout | [bfbs.zig](src/compiler/bfbs.zig), [Encoder.zig](src/compiler/bfbs/Encoder.zig), [Decoder.zig](src/compiler/bfbs/Decoder.zig), [record_layout.zig](src/compiler/bfbs/record_layout.zig) |
 | Source generation lifetime, lowering, and scratch expression construction | [codegen.zig](src/compiler/codegen.zig), [Generator.zig](src/compiler/codegen/Generator.zig), [Syntax.zig](src/compiler/codegen/Syntax.zig) |
+| Freestanding compiler ABI and virtual source map | [compiler.zig](src/wasm/compiler.zig), [Sources.zig](src/wasm/Sources.zig) |
 
 [Detailed ownership and implementation notes](docs/examples.md#ownership-and-implementation-notes).
 

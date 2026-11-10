@@ -50,7 +50,7 @@ pub const Serialized = struct {
     /// Serialized suffix borrowing storage; use this slice for reading and writing.
     bytes: []u8,
 
-    /// Release the complete allocation with the allocator supplied to serializeAlloc.
+    /// Release the complete allocation with the allocator supplied to serialize.
     /// Copies share ownership; call once in total. The bytes suffix and all views expire here.
     pub fn deinit(self: Serialized, allocator: std.mem.Allocator) void {
         allocator.free(self.storage);

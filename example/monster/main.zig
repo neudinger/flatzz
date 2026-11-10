@@ -8,7 +8,7 @@ const generated = @import("monster");
 
 const Monster = generated.Monster;
 
-/// Serialize without an allocator, verify, and print fields borrowed from local storage.
+/// Serialize into comptime-sized storage, verify, and print borrowed fields.
 pub fn main(init: std.process.Init) !void {
     const weapon: generated.Weapon = .{};
     const value: Monster = .{
@@ -31,9 +31,9 @@ pub fn main(init: std.process.Init) !void {
     const position = try (view.pos orelse return error.MissingPosition).read();
     const inventory = view.inventory orelse return error.MissingInventory;
 
-    var output_buffer: [256]u8 = undefined;
-    var output = std.Io.File.Writer.init(.stdout(), init.io, &output_buffer);
-    try output.interface.print(
+    var output: std.Io.Writer.Allocating = .init(init.gpa);
+    defer output.deinit();
+    try output.writer.print(
         "Monster: name={s}, hp={d}, mana={d}, color={s}, " ++
             "pos=({d}, {d}, {d}), inventory[2]={d}, test={s}\n",
         .{
@@ -42,7 +42,7 @@ pub fn main(init: std.process.Init) !void {
             position.z,           try inventory.get(2), @tagName(view.@"test"),
         },
     );
-    try output.interface.flush();
+    try std.Io.File.stdout().writeStreamingAll(init.io, output.written());
 }
 
 test "Monster comptime-sized storage preserves fields and a Weapon union payload" {

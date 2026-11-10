@@ -57,8 +57,8 @@ zig test --dep flatzz --dep rocket -Mroot=/tmp/flatzz-example.zig -Mflatzz=src/r
 [README](../README.md#1-serialize-and-read-back) ·
 [Runnable source and tests](../example/readme/main.zig)
 
-`serializeAlloc` returns an owner. `std.testing.allocator` detects leaked storage
-when this test runs; `deinit` releases it after all borrowed views are finished.
+`serialize(allocator, .{})` returns an owner. `std.testing.allocator` detects leaked
+storage when this test runs; `deinit` releases it after all borrowed views are finished.
 
 ```zig
 test "1. serialize and read back" {
@@ -69,7 +69,7 @@ test "1. serialize and read back" {
         .pilot = "Ziguana",
         .payload = &.{ 1, 2, 3 },
     };
-    const result = try rocket.serializeAlloc(allocator, .{});
+    const result = try rocket.serialize(allocator, .{});
     defer result.deinit(allocator);
 
     try Rocket.verify(result.bytes, .{});
@@ -87,7 +87,8 @@ test "1. serialize and read back" {
 [Runnable source and tests](../example/readme/main.zig)
 
 No allocator is passed to this path. The returned frame borrows a suffix of the
-usable storage; it is not the entire 256-byte capacity. The pointer checks show
+usable storage. `capacityFor` derives a conservative bound from the complete
+native value at comptime; it is not the frame length. The pointer checks show
 that the string is borrowed from the frame. Scalars are decoded by value, and
 vector elements are read lazily with `get`.
 
@@ -99,7 +100,8 @@ test "2. use caller-owned storage" {
         .pilot = "Ziguana",
         .payload = &.{ 1, 2, 3 },
     };
-    var storage: [256]u8 align(flatzz.storage_alignment) = undefined;
+    const capacity = comptime flatzz.storage.capacityFor(Rocket.Schema, rocket, .{});
+    var storage: [capacity]u8 align(flatzz.storage_alignment) = undefined;
     const bytes = try rocket.serialize(&storage, .{});
 
     try Rocket.verify(bytes, .{});
@@ -158,7 +160,6 @@ pub const Rocket = struct {
     pub const Field = Schema.Field;
     pub const View = Schema.View;
     pub const serialize = Schema.serialize;
-    pub const serializeAlloc = Schema.serializeAlloc;
     pub const read = Schema.read;
     pub const update = Schema.update;
     pub const borrowMutable = Schema.borrowMutable;
@@ -192,7 +193,8 @@ test "4. read and edit existing bytes" {
         .pilot = "Ziguana",
         .payload = &.{ 1, 2, 3 },
     };
-    var storage: [256]u8 align(flatzz.storage_alignment) = undefined;
+    const capacity = comptime flatzz.storage.capacityFor(Rocket.Schema, rocket, .{});
+    var storage: [capacity]u8 align(flatzz.storage_alignment) = undefined;
     const bytes = try rocket.serialize(&storage, .{});
     try Rocket.verify(bytes, .{});
     const before = try Rocket.read(bytes);
@@ -252,58 +254,23 @@ pub fn main(init: std.process.Init) !void {
         .pilot = "Ziguana",
         .payload = &.{ 1, 2, 3 },
     };
-    var output_buffer: [512]u8 = undefined;
-    var output = std.Io.File.Writer.init(.stdout(), init.io, &output_buffer);
+    var output: std.Io.Writer.Allocating = .init(init.gpa);
+    defer output.deinit();
 
-    const result = try rocket.serializeAlloc(init.gpa, .{});
+    const result = try rocket.serialize(init.gpa, .{});
     defer result.deinit(init.gpa);
     try Rocket.verify(result.bytes, .{});
-    try printRocket(&output.interface, "allocated", try Rocket.read(result.bytes));
+    try printRocket(&output.writer, "allocated", try Rocket.read(result.bytes));
 
-    var storage: [256]u8 align(flatzz.storage_alignment) = undefined;
+    const capacity = comptime flatzz.storage.capacityFor(Rocket.Schema, rocket, .{});
+    var storage: [capacity]u8 align(flatzz.storage_alignment) = undefined;
     const bytes = try rocket.serialize(&storage, .{});
     try Rocket.verify(bytes, .{});
-    try printRocket(&output.interface, "received", try Rocket.read(bytes));
+    try printRocket(&output.writer, "received", try Rocket.read(bytes));
     if (!try Rocket.update(bytes, .fuel, 79)) return error.MissingFuel;
     if (!try Rocket.update(bytes, .pilot, "Pilot01")) return error.MissingPilot;
     try Rocket.verify(bytes, .{});
-    try printRocket(&output.interface, "edited", try Rocket.read(bytes));
-    try output.interface.flush();
+    try printRocket(&output.writer, "edited", try Rocket.read(bytes));
+    try std.Io.File.stdout().writeStreamingAll(init.io, output.written());
 }
 ```
-
-The generated module needs no allocator to read or edit existing bytes. The
-application is responsible for input framing, mapping, synchronization, and
-keeping borrowed storage valid.
-
-## Ownership and implementation notes
-
-Descriptor factories remain in `schema.zig`, preserving their type names and lazy
-recursive references. `native_graph` owns preflight and packing, recursing through
-the existing descriptor and table-construction contract without adding public schema
-methods. It shares presence and work-accounting policy with `schema.zig` through
-lazy imports. Field access accepts already checked tables; its callers select framing
-and read-only or mutable access.
-Storage sizing, native alias preflight, packing, and wire verification retain their
-separate validation contracts.
-
-FBS parsing uses the caller's arena for copied sources, unresolved declarations,
-metadata, and diagnostics. Keep that arena alive until all consumers finish.
-Includes follow `Compilation.load -> Parser -> Compilation.load` directly.
-Public types stay in the parser facade; internal modules use the same identities.
-BFBS encoding owns its growing buffer and completed handles; decoding copies
-metadata into the caller's arena and retains its own traversal limits and object
-identity cache. The documented BFBS facade retains the public errors and options.
-Code generation borrows its input schema and owns one temporary scratch arena
-through AST finalization. `Generator` and `Syntax` borrow that allocator; `Syntax`
-copies temporary child lists into the arena. The returned formatted source is separately owned by
-the caller and freed with its allocator.
-
-Builders use caller-owned buffers. `serializeAlloc` returns a `Serialized` owner
-that must be released once with the same allocator. Borrowed views expire when
-their backing storage is reused or released; structural edits invalidate checked
-table metadata. Use explicit Builder handles when table sharing is required.
-
-Further Scanner, name-handling, Builder, and storage splits remain deferred.
-The current boundaries follow ownership and validation responsibilities rather
-than a maximum file size.

@@ -37,8 +37,13 @@ const reserved_member_names = [_][]const u8{
 };
 
 const schema_aliases = [_][]const u8{
-    "Field", "View",   "serialize",     "serializeAlloc",
-    "read",  "update", "borrowMutable", "verify",
+    "Field",
+    "View",
+    "serialize",
+    "read",
+    "update",
+    "borrowMutable",
+    "verify",
 };
 
 /// Expression construction using the caller's scratch arena.

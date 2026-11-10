@@ -60,7 +60,7 @@ pub fn main(init: std.process.Init) !void {
     const message_bytes = try message.serialize(&message_storage, .{});
 
     // Uncomment to compare allocating serialization with the fixed buffer.
-    // const allocated = try message.serializeAlloc(init.gpa, .{});
+    // const allocated = try message.serialize(init.gpa, .{});
     // defer allocated.deinit(init.gpa);
     // if (!std.mem.eql(u8, message_bytes, allocated.bytes)) return error.UnexpectedValue;
 
@@ -69,9 +69,9 @@ pub fn main(init: std.process.Init) !void {
     if ((try Temperature.read(message_view.current.temperature)).value != temperature.value)
         return error.UnexpectedValue;
 
-    var output_buffer: [512]u8 = undefined;
-    var output = std.Io.File.Writer.init(.stdout(), init.io, &output_buffer);
-    try output.interface.print(
+    var output: std.Io.Writer.Allocating = .init(init.gpa);
+    defer output.deinit();
+    try output.writer.print(
         "before: sequence={d}, temperature={?d}\n" ++
             "after: sequence={d}, temperature={?d}, altitude={d}\n" ++
             "reading: label={s}, status={s}, samples[2]={d}\n",
@@ -82,5 +82,5 @@ pub fn main(init: std.process.Init) !void {
             @tagName(after.status),    try samples.get(2),
         },
     );
-    try output.interface.flush();
+    try std.Io.File.stdout().writeStreamingAll(init.io, output.written());
 }

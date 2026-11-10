@@ -168,48 +168,9 @@ fn printJson(file_io: std.Io, schema: compiler.reflection.Schema) !void {
         .writer = &output.interface,
         .options = .{ .whitespace = .indent_2 },
     };
-    try writeJson(schema, &json);
+    try compiler.json.write(schema, &json);
     try output.interface.writeByte('\n');
     try output.interface.flush();
-}
-
-/// Walk the reflection model without constructing a second tree. JSON uses
-/// numeric feature bits, omits null fields, and quotes nonfinite real defaults.
-fn writeJson(value: anytype, json: *std.json.Stringify) std.json.Stringify.Error!void {
-    const Value = @TypeOf(value);
-    if (Value == compiler.reflection.AdvancedFeatures) return json.write(@as(u64, @bitCast(value)));
-    switch (@typeInfo(Value)) {
-        .@"struct" => |structure| {
-            try json.beginObject();
-            inline for (structure.field_names) |name| {
-                const member = @field(value, name);
-                const omit = if (@typeInfo(@TypeOf(member)) == .optional) member == null else false;
-                if (!omit) {
-                    try json.objectField(name);
-                    try writeJson(member, json);
-                }
-            }
-            try json.endObject();
-        },
-        .optional => if (value) |member| try writeJson(member, json) else try json.write(null),
-        .pointer => |pointer| switch (pointer.size) {
-            .one => try writeJson(value.*, json),
-            .slice => if (pointer.child == u8) {
-                try json.write(value);
-            } else {
-                try json.beginArray();
-                for (value) |member| try writeJson(member, json);
-                try json.endArray();
-            },
-            else => @compileError("reflection JSON requires single pointers or slices"),
-        },
-        .float => if (std.math.isFinite(value)) {
-            try json.write(value);
-        } else {
-            try json.write(if (std.math.isNan(value)) "nan" else if (value < 0) "-inf" else "inf");
-        },
-        else => try json.write(value),
-    }
 }
 
 /// Replace a Make-style depfile only after every path was written successfully.
@@ -314,59 +275,6 @@ test "CLI options share include and dependency settings across formats" {
     try std.testing.expectEqualStrings("result.json", options.deptarget.?);
     for (invalid_cli_arguments) |arguments|
         try std.testing.expect((try Options.parse(arena.allocator(), arguments)) == null);
-}
-
-test "native reflection JSON preserves numbers flags and nonfinite defaults" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-    const schema = try compiler.parser.parse(allocator,
-        \\struct Bytes { data:[ubyte:2]; }
-        \\table Root {
-        \\  bytes:Bytes;
-        \\  optional:int = null;
-        \\  precise:long = 9007199254740993;
-        \\  maximum:ulong = 18446744073709551615;
-        \\  positive:double = inf;
-        \\  negative:double = -inf;
-        \\  missing:double = nan;
-        \\}
-        \\root_type Root;
-    );
-    var output: std.Io.Writer.Allocating = .init(allocator);
-    var json: std.json.Stringify = .{ .writer = &output.writer };
-    try writeJson(schema, &json);
-    const document = try std.json.parseFromSliceLeaky(
-        std.json.Value,
-        allocator,
-        output.written(),
-        .{},
-    );
-    try std.testing.expectEqual(@as(i64, 5), document.object.get("advanced_features").?.integer);
-    try std.testing.expect(!document.object.contains("services"));
-    const fields = document.object.get("root_table").?.object.get("fields").?.array.items;
-    try std.testing.expectEqual(@as(usize, 7), fields.len);
-    for (fields) |field| {
-        const name = field.object.get("name").?.string;
-        if (std.mem.eql(u8, name, "precise")) {
-            try std.testing.expectEqual(
-                @as(i64, 9007199254740993),
-                field.object.get("default_integer").?.integer,
-            );
-        } else if (std.mem.eql(u8, name, "maximum")) {
-            try std.testing.expectEqual(
-                @as(i64, -1),
-                field.object.get("default_integer").?.integer,
-            );
-        } else if (std.mem.eql(u8, name, "positive")) {
-            try std.testing.expectEqualStrings("inf", field.object.get("default_real").?.string);
-        } else if (std.mem.eql(u8, name, "negative")) {
-            try std.testing.expectEqualStrings("-inf", field.object.get("default_real").?.string);
-        } else if (std.mem.eql(u8, name, "missing")) {
-            try std.testing.expectEqualStrings("nan", field.object.get("default_real").?.string);
-        }
-        try std.testing.expect(!field.object.contains("documentation"));
-    }
 }
 
 test "native include search respects explicit paths and normalized identities" {

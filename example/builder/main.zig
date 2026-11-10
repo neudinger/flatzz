@@ -33,15 +33,6 @@ pub fn main(init: std.process.Init) !void {
         initial_location,
         .{ .coordinates = .{ .latitude = 50, .longitude = 4 }, .altitude = 100 },
     };
-    var storage: runtime.Storage(Reading.Schema, .{
-        .label = initial_label.len,
-        .samples = initial_samples.len,
-        .tags = .{
-            .count = initial_tags.len,
-            .bytes = initial_tags[0].len + initial_tags[1].len,
-        },
-        .history = initial_history.len,
-    }, .{}) = .{};
     // Keep default-valued scalar slots available for later mutation.
     // Optional temperature must be present: force_defaults never stores null.
     const value: Reading = .{
@@ -53,7 +44,9 @@ pub fn main(init: std.process.Init) !void {
         .history = &initial_history,
         .calibration = .{ .gains = .{ 1, 2, 3 }, .locations = initial_history },
     };
-    const bytes = try value.serialize(&storage.buffer, .{ .force_defaults = true });
+    const capacity = comptime runtime.storage.capacityFor(Reading.Schema, value, .{});
+    var storage: [capacity]u8 align(runtime.storage_alignment) = undefined;
+    const bytes = try value.serialize(&storage, .{ .force_defaults = true });
     try Reading.verify(bytes, .{});
     const before = try Reading.read(bytes);
     // read() copies the native value; the borrowed view would observe updates.
@@ -95,10 +88,9 @@ pub fn main(init: std.process.Init) !void {
     try Reading.verify(bytes, .{});
     const after = try Reading.read(bytes);
 
-    const output_capacity = 256;
-    var output_buffer: [output_capacity]u8 = undefined;
-    var stdout = std.Io.File.Writer.init(.stdout(), init.io, &output_buffer);
-    const writer = &stdout.interface;
+    var stdout: std.Io.Writer.Allocating = .init(init.gpa);
+    defer stdout.deinit();
+    const writer = &stdout.writer;
     // `before.label` borrows the mutated bytes, so use the original literal here.
     try writer.print(
         "before: sequence={d}, value={d}, label={s}, active={}, status={}, temperature={?d}\n",
@@ -145,23 +137,37 @@ pub fn main(init: std.process.Init) !void {
     for (bytes) |byte| try writer.print(" {x:0>2}", .{byte});
     try writer.writeByte('\n');
     try showUnions(writer);
-    try writer.flush();
+    try std.Io.File.stdout().writeStreamingAll(init.io, stdout.written());
 }
 
 fn showUnions(writer: *std.Io.Writer) !void {
-    const storage_capacity = 512;
-    var storage: [storage_capacity]u8 align(runtime.storage_alignment) = undefined;
+    const temperature_value: Temperature = .{ .value = 25.5 };
+    const location_value: Location = .{
+        .coordinates = .{ .latitude = 48.5, .longitude = 2.25 },
+        .altitude = 35,
+    };
+    const text_value = "sensor online";
+    // The equivalent native graph bounds construction even without sharing children.
+    const value: ReadingMessage = .{
+        .current = .{ .temperature = &temperature_value },
+        .history = &.{
+            .{ .temperature = &temperature_value },
+            .{ .location = location_value },
+            .{ .text = text_value },
+            .none,
+            .{ .previous = location_value },
+        },
+    };
+    const capacity = comptime runtime.storage.capacityFor(ReadingMessage.Schema, value, .{});
+    var storage: [capacity]u8 align(runtime.storage_alignment) = undefined;
     // Explicit handles preserve shared payloads across fields and vector entries.
     // Build every payload and the parent with this builder, then finish the root.
     var builder = Builder.init(&storage);
-    const temperature = try Temperature.Schema.create(&builder, .{ .value = 25.5 }, .{});
+    const temperature = try Temperature.Schema.create(&builder, temperature_value, .{});
     // Union structs are separate referenced objects. Ordinary Location fields
     // and struct-vector elements continue to be encoded inline.
-    const location = try builder.createStruct(Location.Layout, .{
-        .coordinates = .{ .latitude = 48.5, .longitude = 2.25 },
-        .altitude = 35,
-    });
-    const text = try builder.createString("sensor online");
+    const location = try builder.createStruct(Location.Layout, location_value);
+    const text = try builder.createString(text_value);
     const history_handles = try builder.createReferenceVector(&[_]ReadingPayload.Handle{
         .{ .temperature = temperature },
         .{ .location = location },

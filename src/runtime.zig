@@ -5,6 +5,9 @@
 //! Wire IDs and defaults come from descriptors, independently of native Zig layout.
 //! Schema parsing, reflection, and BFBS conversion belong to `flatzz_compiler`;
 //! applications using this runtime do not load BFBS metadata.
+//! `serialize(target, options)` selects storage at compile time from the target's
+//! type: an aligned mutable byte buffer returns a borrowed slice; a std.mem.Allocator
+//! returns an owned Serialized. The target and native values remain runtime inputs.
 //!
 //! ## Allocating serialization
 //!
@@ -22,7 +25,6 @@
 //!         .value = flatzz.ScalarField(u32, 0, 0),
 //!         .label = flatzz.ReferenceField(1, .string, .{}),
 //!     });
-//!     pub const serializeAlloc = Schema.serializeAlloc;
 //!     pub const serialize = Schema.serialize;
 //!     pub const verify = Schema.verify;
 //!     pub const read = Schema.read;
@@ -32,7 +34,7 @@
 //! test "allocated serialization" {
 //!     const allocator = std.testing.allocator;
 //!     const value: Reading = .{ .value = 41, .label = "sensor" };
-//!     const result = try value.serializeAlloc(allocator, .{});
+//!     const result = try value.serialize(allocator, .{});
 //!     defer result.deinit(allocator);
 //!
 //!     try Reading.verify(result.bytes, .{});
@@ -144,9 +146,10 @@
 //! calls, and must not overlap fixed output storage. Depth and work limits bound
 //! traversal, including cycles. Packing errors may leave partial fixed-buffer
 //! contents; reset an existing builder to discard partial construction.
-//! `serializeAlloc` returns `error.OutOfMemory` or a `BuildError` and frees any
-//! allocation on failure. Local access uses `AccessError`, in-place replacement
-//! uses `MutationError`, and recursive verification uses `VerifyError`.
+//! Buffer-target `serialize` returns `BuildError`; an allocator target also permits
+//! `error.OutOfMemory` and frees any allocation on failure. Local access uses
+//! `AccessError`, in-place replacement uses `MutationError`, and recursive
+//! verification uses `VerifyError`.
 
 const table_view = @import("runtime/table_view.zig");
 const sequence = @import("runtime/sequence.zig");

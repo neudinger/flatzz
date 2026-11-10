@@ -1,6 +1,14 @@
 # Flatzz examples
 
 Use Zig 0.17.0. Zig fetches the pinned Zast package for examples that use schema tooling.
+Serialization storage is either allocator-owned or sized with
+`comptime flatzz.storage.capacityFor(Schema, value, .{})`. Text output uses
+allocator-owned writers. No example chooses an arbitrary byte-buffer capacity.
+
+`zig build examples` compiles the native Zig examples and their tests.
+The sibling `flatzz-site` project discovers these sources automatically and prepares
+its own website catalogue, generated schemas, and copyable source pages.
+
 Run these commands from the Flatzz root:
 
 | Command | Action |

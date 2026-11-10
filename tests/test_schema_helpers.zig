@@ -87,6 +87,43 @@ test "root helpers preserve defaults optional presence and verification limits" 
     try testing.expectError(error.OutOfBounds, Definition.borrowMutable(&empty, .items));
 }
 
+test "serialize preserves exact error unions and aligned buffer coercions" {
+    const value: Values = .{ .label = "sensor", .optional = 0 };
+    const options: runtime.WriteOptions = .{ .force_defaults = true };
+    var expected_storage: [512]u8 align(runtime.storage_alignment) = undefined;
+    var builder = runtime.Builder.init(&expected_storage);
+    builder.force_defaults = true;
+    const label = try builder.createString("sensor");
+    var context = try Definition.Context.init(&builder);
+    try Definition.addFields(&context, .{ .label = label, .optional = 0 });
+    const expected = try builder.finish(try Definition.endTable(&context), .ordinary);
+
+    var buffer: [512]u8 align(runtime.storage_alignment) = undefined;
+    const slice: []align(runtime.storage_alignment) u8 = &buffer;
+    var extra_aligned: [512]u8 align(16) = undefined;
+    var terminated: [512:0]u8 align(runtime.storage_alignment) = undefined;
+    terminated[512] = 0;
+    const terminated_slice: [:0]align(runtime.storage_alignment) u8 = &terminated;
+    inline for (.{ &buffer, slice, &extra_aligned, &terminated, terminated_slice }) |target| {
+        const result = Definition.serialize(value, target, options);
+        try testing.expect(@TypeOf(result) == runtime.BuildError![]u8);
+        const bytes = try result;
+        try testing.expectEqualSlices(u8, expected, bytes);
+        const supplied: []align(runtime.storage_alignment) u8 = target;
+        try testing.expect(bytes.ptr == supplied[supplied.len - bytes.len ..].ptr);
+        try Definition.verify(bytes, .{});
+    }
+
+    const result = Definition.serialize(value, testing.allocator, options);
+    try testing.expect(
+        @TypeOf(result) == (std.mem.Allocator.Error || runtime.BuildError)!runtime.Serialized,
+    );
+    const owned = try result;
+    defer owned.deinit(testing.allocator);
+    try testing.expectEqualSlices(u8, expected, owned.bytes);
+    try Definition.verify(owned.bytes, .{});
+}
+
 test "custom descriptor kinds retain checked reads and mutable borrowing" {
     const Descriptor = struct {
         pub const Value = ?structs.Sample;
@@ -696,7 +733,7 @@ test "allocating serialization owns one aligned buffer and preserves runtime vec
             const allocator = counted.allocator();
             {
                 const options: runtime.WriteOptions = .{ .force_defaults = force_defaults };
-                const result: runtime.Serialized = try Definition.serializeAlloc(
+                const result: runtime.Serialized = try Definition.serialize(
                     value,
                     allocator,
                     options,
@@ -727,7 +764,7 @@ test "allocating serialization owns one aligned buffer and preserves runtime vec
         }
     }
     const inline_value: structs.Packet = .{ .envelope = structs.envelope, .extra = structs.sample };
-    const inline_result = try structs.Packet.Schema.serializeAlloc(
+    const inline_result = try structs.Packet.Schema.serialize(
         inline_value,
         testing.allocator,
         .{},
@@ -748,7 +785,7 @@ fn serializeAllocatedGraph(allocator: std.mem.Allocator, label: []const u8) !voi
         .payload = .{ .child = &leaf },
         .history = &.{ .{ .envelope = structs.envelope }, .{ .text = label }, .none },
     };
-    const result = try NativeNode.Schema.serializeAlloc(root, allocator, .{});
+    const result = try NativeNode.Schema.serialize(root, allocator, .{});
     defer result.deinit(allocator);
     var storage: [4096]u8 align(runtime.storage_alignment) = undefined;
     const expected = try NativeNode.Schema.serialize(root, &storage, .{});
@@ -782,27 +819,27 @@ test "allocating serialization bounds preflight and frees storage on packing err
     const Empty = runtime.Schema(struct {}, .{});
     var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
     const allocator = failing.allocator();
-    try testing.expectError(error.DepthLimit, Empty.serializeAlloc(.{}, allocator, .{
+    try testing.expectError(error.DepthLimit, Empty.serialize(.{}, allocator, .{
         .max_depth = 0,
     }));
-    try testing.expectError(error.WorkLimit, Empty.serializeAlloc(.{}, allocator, .{
+    try testing.expectError(error.WorkLimit, Empty.serialize(.{}, allocator, .{
         .max_work = 0,
     }));
     try testing.expectError(
         error.MissingRequiredField,
-        graph.Node.Schema.serializeAlloc(.{}, allocator, .{}),
+        graph.Node.Schema.serialize(.{}, allocator, .{}),
     );
     var cyclic: NativeNode = .{};
     cyclic.payload = .{ .child = &cyclic };
     try testing.expectError(
         error.DepthLimit,
-        NativeNode.Schema.serializeAlloc(cyclic, allocator, .{}),
+        NativeNode.Schema.serialize(cyclic, allocator, .{}),
     );
-    try testing.expectError(error.WorkLimit, NativeNode.Schema.serializeAlloc(cyclic, allocator, .{
+    try testing.expectError(error.WorkLimit, NativeNode.Schema.serialize(cyclic, allocator, .{
         .max_work = 5,
     }));
     try testing.expect(!failing.has_induced_failure);
-    try testing.expectError(error.OutOfMemory, Empty.serializeAlloc(.{}, allocator, .{}));
+    try testing.expectError(error.OutOfMemory, Empty.serialize(.{}, allocator, .{}));
     try testing.expect(failing.has_induced_failure);
     var counted = testing.FailingAllocator.init(testing.allocator, .{});
     const invalid: NativeNode = .{
@@ -810,7 +847,7 @@ test "allocating serialization bounds preflight and frees storage on packing err
     };
     try testing.expectError(
         error.InvalidUtf8,
-        NativeNode.Schema.serializeAlloc(invalid, counted.allocator(), .{}),
+        NativeNode.Schema.serialize(invalid, counted.allocator(), .{}),
     );
     try testing.expectEqual(@as(usize, 1), counted.allocations);
     try testing.expectEqual(@as(usize, 1), counted.deallocations);

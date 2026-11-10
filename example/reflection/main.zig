@@ -24,16 +24,16 @@ pub fn main(init: std.process.Init) !void {
     );
     const root_table = schema.root_table orelse return error.MissingRootTable;
 
-    var output_buffer: [4096]u8 = undefined;
-    var output = std.Io.File.Writer.init(.stdout(), init.io, &output_buffer);
-    try output.interface.print("Root: {s}\nObjects: {d}\nEnums: {d}\nFields: {d}\n", .{
+    var output: std.Io.Writer.Allocating = .init(init.gpa);
+    defer output.deinit();
+    try output.writer.print("Root: {s}\nObjects: {d}\nEnums: {d}\nFields: {d}\n", .{
         root_table.name, schema.objects.len, schema.enums.len, root_table.fields.len,
     });
     // Reflection sorts fields by name; IDs retain their declaration order.
     for (root_table.fields) |field| {
-        try output.interface.print("  {s}: {s} (id={d})\n", .{
+        try output.writer.print("  {s}: {s} (id={d})\n", .{
             field.name, @tagName(field.type.base_type), field.id,
         });
     }
-    try output.interface.flush();
+    try std.Io.File.stdout().writeStreamingAll(init.io, output.written());
 }

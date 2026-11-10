@@ -2,8 +2,8 @@
 //!
 //! Import this module with `const compiler = @import("flatzz_compiler");`.
 //! `parser` produces `reflection.Schema` from FBS text; `bfbs` encodes and decodes
-//! the same metadata model. These APIs run in applications or build tools without
-//! Zast. Zig source generation uses a separate host backend with that dependency.
+//! the same metadata model. `json` writes that model as schema metadata. These APIs
+//! run without Zast. Zig source generation uses a separate backend with that dependency.
 //!
 //! ## Parse an FBS schema
 //!
@@ -137,3 +137,8 @@ pub const reflection = @import("compiler/reflection.zig");
 /// until consumers finish and release it on success or failure. `bfbs.decodeWithOptions` selects
 /// framing and resource limits; checked wire data is not necessarily a valid FBS schema.
 pub const bfbs = @import("compiler/bfbs.zig");
+
+/// Stream schema metadata as JSON through a caller-configured writer.
+/// This is schema introspection, not conversion of application message bytes.
+/// No second metadata tree is allocated; the schema is borrowed for the call.
+pub const json = @import("compiler/json.zig");

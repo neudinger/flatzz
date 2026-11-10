@@ -1,8 +1,9 @@
 //! Build the runtime package, generated examples, host schema tool, and test contracts.
-//! `zig build docs` installs the public API reference under `zig-out/docs`.
+//! Website preparation and browser tests belong to the consuming site project.
 
 const std = @import("std");
 const schema_build = @import("tools/build.zig");
+const wasm_build = @import("tools/wasm/build.zig");
 const compile_fail = @import("tests/compile_fail.zig");
 
 const Step = std.Build.Step;
@@ -50,7 +51,7 @@ fn compileSchema(
     };
 }
 
-/// Configure target-aware runtime artifacts and host-only schema tooling.
+/// Configure target-aware runtime artifacts, native schema tooling, and optional Wasm tooling.
 pub fn build(builder: *std.Build) void {
     const target = builder.standardTargetOptions(.{});
     const optimize = builder.standardOptimizeOption(.{});
@@ -68,19 +69,27 @@ pub fn build(builder: *std.Build) void {
         .imports = &.{.{ .name = "flatzz", .module = runtime_module }},
     });
 
-    const docs = docs_blk: {
-        // Zig's doc renderer recognizes the module root by its matching filename.
-        const documentation = builder.addObject(.{
-            .name = "runtime",
-            .root_module = runtime_module,
+    // Emit the standard Zig viewers; website preparation belongs to flatzz-site.
+    const docs = builder.step("docs", "Generate runtime and compiler API documentation");
+    for ([_]struct {
+        name: []const u8,
+        module: *std.Build.Module,
+        destination: []const u8,
+    }{
+        .{ .name = "runtime", .module = runtime_module, .destination = "docs" },
+        .{ .name = "compiler", .module = compiler_module, .destination = "docs/compiler" },
+    }) |reference| {
+        const object = builder.addObject(.{
+            .name = reference.name,
+            .root_module = reference.module,
         });
-        const install_docs = builder.addInstallDirectory(.{
-            .source_dir = documentation.getEmittedDocs(),
+        const install = builder.addInstallDirectory(.{
+            .source_dir = object.getEmittedDocs(),
             .install_dir = .prefix,
-            .install_subdir = "docs",
+            .install_subdir = reference.destination,
         });
-        break :docs_blk &install_docs.step;
-    };
+        docs.dependOn(&install.step);
+    }
 
     const reading_module = builder.createModule(.{
         .root_source_file = builder.path("tests/fixtures/reading/reading.zig"),
@@ -111,14 +120,24 @@ pub fn build(builder: *std.Build) void {
         break :builder_example_blk .{ .compile = &executable.step, .run = &run.step };
     };
 
-    const schema_tools = if (builder.option(
+    const schema_tools_enabled = builder.option(
         bool,
         "schema-tools",
         "Build host schema tooling (defaults on for root builds)",
-    ) orelse builder.isRoot())
+    ) orelse builder.isRoot();
+    const schema_tools = if (schema_tools_enabled)
         schema_build.add(builder)
     else
         null;
+
+    const wasm_compiler_enabled = builder.option(
+        bool,
+        "wasm-compiler",
+        "Expose the Wasm compiler (defaults on with root schema tooling)",
+    ) orelse (builder.isRoot() and schema_tools_enabled);
+    if (wasm_compiler_enabled) {
+        wasm_build.add(builder);
+    }
 
     const generated_reading = if (schema_tools) |tools| reading_module_blk: {
         const source = compileSchema(builder, tools.executable, "example/flatbuf/reading.fbs");
@@ -274,11 +293,6 @@ pub fn build(builder: *std.Build) void {
                 &.{},
         },
         .{
-            .tag = .docs,
-            .description = "Build the public API reference",
-            .prerequisites = @as([]const *Step, &.{docs}),
-        },
-        .{
             .tag = .run,
             .description = "Generate Reading, then build, verify, read, and mutate it",
             .prerequisites = if (generated) |app| @as([]const *Step, &.{app.run}) else &.{},
@@ -287,6 +301,18 @@ pub fn build(builder: *std.Build) void {
             .tag = .@"run-builder",
             .description = "Run the Builder example",
             .prerequisites = @as([]const *Step, &.{builder_example.run}),
+        },
+        .{
+            .tag = .examples,
+            .description = "Compile the native Zig examples and their tests",
+            .prerequisites = examples_blk: {
+                const steps = std.mem.concat(builder.allocator, *Step, &.{
+                    &.{builder_example.compile},
+                    if (generated) |app| &.{app.compile} else &.{},
+                    if (examples) |*apps| &apps.check else &.{},
+                }) catch @panic("OOM");
+                break :examples_blk steps;
+            },
         },
         // Compile-only coverage also supports targets that cannot run on this host.
         .{

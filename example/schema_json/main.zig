@@ -9,13 +9,13 @@ pub fn main(init: std.process.Init) !void {
     const arguments = try init.minimal.args.toSlice(init.arena.allocator());
     if ((arguments.len - 1) % 2 != 0) return error.ExpectedJsonAndBfbsPaths;
 
-    var output_buffer: [4096]u8 = undefined;
-    var output = std.Io.File.Writer.init(.stdout(), init.io, &output_buffer);
+    var output: std.Io.Writer.Allocating = .init(init.gpa);
+    defer output.deinit();
     var argument_index: usize = 1;
     while (argument_index < arguments.len) : (argument_index += 2) {
         const json_path = arguments[argument_index];
         const binary_path = arguments[argument_index + 1];
-        try output.interface.print("JSON: {s}\nBFBS: {s}\n", .{ json_path, binary_path });
+        try output.writer.print("JSON: {s}\nBFBS: {s}\n", .{ json_path, binary_path });
     }
-    try output.interface.flush();
+    try std.Io.File.stdout().writeStreamingAll(init.io, output.written());
 }

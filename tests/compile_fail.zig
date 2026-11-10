@@ -14,6 +14,59 @@ pub const Case = struct {
 /// Negative API contracts consumed by the root build.
 pub const cases = [_]Case{
     .{
+        .name = "serialize_immutable_buffer",
+        .source =
+        \\const runtime = @import("runtime");
+        \\test "serialization requires writable output" {
+        \\    const Definition = runtime.Schema(struct {}, .{});
+        \\    const storage: [64]u8 align(runtime.storage_alignment) = @splat(0);
+        \\    const buffer: []align(runtime.storage_alignment) const u8 = &storage;
+        \\    _ = try Definition.serialize(.{}, buffer, .{});
+        \\}
+        \\
+        ,
+        .expected_error = "expected type '[]align(8) u8', found '[]align(8) const u8'",
+    },
+    .{
+        .name = "serialize_unaligned_buffer",
+        .source =
+        \\const runtime = @import("runtime");
+        \\test "serialization retains output alignment requirements" {
+        \\    const Definition = runtime.Schema(struct {}, .{});
+        \\    var storage: [64]u8 align(runtime.storage_alignment) = undefined;
+        \\    const buffer: []align(1) u8 = &storage;
+        \\    _ = try Definition.serialize(.{}, buffer, .{});
+        \\}
+        \\
+        ,
+        .expected_error = "expected type '[]align(8) u8', found '[]align(1) u8'",
+    },
+    .{
+        .name = "serialize_non_byte_buffer",
+        .source =
+        \\const runtime = @import("runtime");
+        \\test "serialization rejects non-byte output" {
+        \\    const Definition = runtime.Schema(struct {}, .{});
+        \\    var buffer: [64]u16 align(runtime.storage_alignment) = undefined;
+        \\    _ = try Definition.serialize(.{}, &buffer, .{});
+        \\}
+        \\
+        ,
+        .expected_error = "expected type '[]align(8) u8', found '*align(8) [64]u16'",
+    },
+    .{
+        .name = "serialize_unsupported_target",
+        .source =
+        \\const runtime = @import("runtime");
+        \\test "serialization rejects unsupported target types" {
+        \\    const Definition = runtime.Schema(struct {}, .{});
+        \\    _ = try Definition.serialize(.{}, false, .{});
+        \\}
+        \\
+        ,
+        .expected_error = "expected type '[]align(8) u8', found 'bool'",
+    },
+    .{
         .name = "reference_callback_type",
         .source =
         \\const runtime = @import("runtime");

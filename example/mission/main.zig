@@ -8,7 +8,7 @@ const generated = @import("mission");
 
 const Mission = generated.Mission;
 
-/// Serialize without an allocator and read while local storage remains alive.
+/// Serialize into comptime-sized storage and read while it remains alive.
 pub fn main(init: std.process.Init) !void {
     // Both types come from one generated module, including common.fbs.
     const position: generated.Position = .{ .east = 12.5, .north = -3.25, .altitude = 400 };
@@ -24,12 +24,12 @@ pub fn main(init: std.process.Init) !void {
     const name = view.name orelse return error.MissingName;
     const received = try (view.position orelse return error.MissingPosition).read();
 
-    var output_buffer: [256]u8 = undefined;
-    var output = std.Io.File.Writer.init(.stdout(), init.io, &output_buffer);
-    try output.interface.print("Mission: name={s}, position=({d}, {d}, {d})\n", .{
+    var output: std.Io.Writer.Allocating = .init(init.gpa);
+    defer output.deinit();
+    try output.writer.print("Mission: name={s}, position=({d}, {d}, {d})\n", .{
         name, received.east, received.north, received.altitude,
     });
-    try output.interface.flush();
+    try std.Io.File.stdout().writeStreamingAll(init.io, output.written());
 }
 
 test "Mission comptime-sized storage preserves the included Position" {

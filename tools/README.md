@@ -6,6 +6,7 @@ Run from the Flatzz root with Zig 0.17.0.
 | --- | --- |
 | `zig build` | Build and install apps and `zig-out/bin/flatzz` |
 | `zig build compiler` | Build and install only `zig-out/bin/flatzz` |
+| `zig build wasm` | Install `zig-out/wasm/flatzz-compiler.wasm` |
 | `zig build check test` | Check and test schema tooling and generated code |
 | `zig build generate-reading` | Regenerate the checked-in Reading fixture |
 | `zig-out/bin/flatzz --zig tests/fixtures/reading/reading.fbs > reading.zig` | Generate Zig from FBS |

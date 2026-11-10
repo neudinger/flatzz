@@ -2,6 +2,7 @@
 //! The runtime does not link the executable or require external dependencies.
 
 const std = @import("std");
+const CompilerModules = @import("CompilerModules.zig");
 
 /// Dependencies returned to the package's command declaration list.
 pub const Steps = struct {
@@ -41,31 +42,14 @@ fn generatedModule(
 /// Export the host tool and return its compile, test, and source-update steps.
 /// Only the explicit generation command depends on the source update.
 pub fn add(builder: *std.Build) ?Steps {
-    const zast = builder.lazyDependency("zast", .{
-        .target = builder.graph.host,
-        .optimize = .ReleaseSafe,
-    }) orelse return null;
-    const host_runtime = builder.createModule(.{
-        .root_source_file = builder.path("src/runtime.zig"),
-        .target = builder.graph.host,
-        .optimize = .ReleaseSafe,
-    });
-    const host_compiler = builder.createModule(.{
-        .root_source_file = builder.path("src/compiler.zig"),
-        .target = builder.graph.host,
-        .optimize = .ReleaseSafe,
-        .imports = &.{.{ .name = "flatzz", .module = host_runtime }},
-    });
-    const codegen = builder.createModule(.{
-        .root_source_file = builder.path("src/compiler/codegen.zig"),
-        .target = builder.graph.host,
-        .optimize = .ReleaseSafe,
-        .imports = &.{
-            .{ .name = "flatzz", .module = host_runtime },
-            .{ .name = "flatzz_compiler", .module = host_compiler },
-            .{ .name = "zast", .module = zast.module("zast") },
-        },
-    });
+    const modules = CompilerModules.init(
+        builder,
+        builder.graph.host,
+        .ReleaseSafe,
+    ) orelse return null;
+    const host_runtime = modules.runtime;
+    const host_compiler = modules.compiler;
+    const codegen = modules.codegen;
 
     const schema_tool = schema_tool_blk: {
         const executable = builder.addExecutable(.{

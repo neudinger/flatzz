@@ -5,6 +5,7 @@ table Schema {
     Storage:int = 11;
     x:[int];
     mutableX:int = 13;
+    serializeAlloc:int = 17;
 }
 namespace Two;
 table Schema { other:One.Schema; }

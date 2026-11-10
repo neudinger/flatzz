@@ -84,6 +84,14 @@ pub const WriteOptions = struct {
     max_work: usize = 64 * 1024 * 1024,
 };
 
+// Select the complete error union without requiring runtime targets to be comptime-known.
+fn SerializeResult(comptime Target: type) type {
+    return if (Target == std.mem.Allocator)
+        (std.mem.Allocator.Error || BuildError)!storage.Serialized
+    else
+        BuildError![]u8;
+}
+
 /// Describe one union using adjacent physical tag/value IDs.
 /// `UnionType.Value` carries native payloads; `.none` represents absence.
 /// Invalid IDs fail at compile time. Use `UnionVectorField` for paired vectors.
@@ -346,55 +354,35 @@ pub fn Schema(comptime Native: type, comptime descriptors: anytype) type {
             return @field(descriptors, @tagName(field));
         }
 
-        /// Serialize a native graph as an ordinary root without heap allocation.
-        /// Every supported field kind is packed, including child tables and unions.
-        /// Preflight bounds traversal, checks required values, and rejects any input
-        /// overlapping usable output storage before writes. UTF-8 is checked while packing.
-        /// Table/union vectors reuse output capacity for temporary u32 offsets;
-        /// no separate vector scratch budget is needed.
-        /// Repeated table pointers produce independent copies; use explicit Builder
-        /// handles with addFields to preserve sharing. Traversal limits bound cycles.
-        /// The mutable result borrows a suffix of the alignment-trimmed storage.
-        /// Storage reuse invalidates it and its views. Packing errors can leave
-        /// partial bytes; preflight errors leave storage unchanged.
         pub fn serialize(
             values: Native,
-            output_storage: []align(wire.storage_alignment) u8,
+            target: anytype,
             options: WriteOptions,
-        ) BuildError![]u8 {
-            var builder = Builder.init(output_storage);
-            return builder.finish(try create(&builder, values, options), .ordinary);
-        }
-
-        /// Serialize a runtime native graph into one allocator-owned aligned buffer.
-        /// Measure required presence and depth/work limits before allocating, then
-        /// pack once without a final output copy. UTF-8 and encoding errors free the
-        /// allocation. The result retains spare capacity; call result.deinit(allocator)
-        /// once with the same allocator, invalidating bytes and all borrowed views.
-        /// Inputs must remain valid throughout allocation and packing, including
-        /// across allocator calls. Fixed-buffer serialize performs no allocation.
-        pub fn serializeAlloc(
-            values: Native,
-            allocator: std.mem.Allocator,
-            options: WriteOptions,
-        ) (std.mem.Allocator.Error || BuildError)!storage.Serialized {
-            const size = try storage.measure(Self, values, .{
-                .max_depth = options.max_depth,
-                .max_work = options.max_work,
-            });
-            const buffer = try allocator.alignedAlloc(
-                u8,
-                .fromByteUnits(wire.storage_alignment),
-                size,
-            );
-            errdefer allocator.free(buffer);
-            var builder = Builder.init(buffer);
-            builder.force_defaults = options.force_defaults;
-            const bytes = try builder.finish(
-                try native_graph.Packer(Native, Self).pack(&builder, &values),
-                .ordinary,
-            );
-            return .{ .storage = buffer, .bytes = bytes };
+        ) SerializeResult(@TypeOf(target)) {
+            if (@TypeOf(target) == std.mem.Allocator) {
+                const allocator = target;
+                const size = try storage.measure(Self, values, .{
+                    .max_depth = options.max_depth,
+                    .max_work = options.max_work,
+                });
+                const buffer = try allocator.alignedAlloc(
+                    u8,
+                    .fromByteUnits(wire.storage_alignment),
+                    size,
+                );
+                errdefer allocator.free(buffer);
+                var builder = Builder.init(buffer);
+                builder.force_defaults = options.force_defaults;
+                const bytes = try builder.finish(
+                    try native_graph.Packer(Native, Self).pack(&builder, &values),
+                    .ordinary,
+                );
+                return .{ .storage = buffer, .bytes = bytes };
+            } else {
+                const output_storage: []align(wire.storage_alignment) u8 = target;
+                var builder = Builder.init(output_storage);
+                return builder.finish(try create(&builder, values, options), .ordinary);
+            }
         }
 
         /// Verify known fields reachable from bytes or a checked Table with fresh limits.

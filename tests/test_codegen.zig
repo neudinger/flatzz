@@ -19,14 +19,12 @@ const collision_schemas = [_][]const u8{
     "table Reading { Field:int; }",
     "table Reading { View:int; }",
     "table Reading { serialize:int; }",
-    "table Reading { serializeAlloc:int; }",
     "table Reading { read:int; }",
     "table Reading { update:int; }",
     "table Reading { verify:int; }",
     "struct Location { Field:int; }",
     "struct Location { View:int; }",
     "struct Location { serialize:int; }",
-    "struct Location { serializeAlloc:int; }",
     "struct Location { read:int; }",
     "struct Location { update:int; }",
     "struct Location { verify:int; }",
@@ -118,7 +116,8 @@ test "serialization is generated for every native table schema" {
         cases.UnionNode,
     }) |Native| {
         try std.testing.expect(@hasDecl(Native, "serialize"));
-        try std.testing.expect(@hasDecl(Native, "serializeAlloc"));
+        try std.testing.expect(!@hasDecl(Native, "serializeAlloc"));
+        try std.testing.expect(!@hasDecl(Native.Schema, "serializeAlloc"));
         try std.testing.expect(@hasDecl(Native, "read"));
         try std.testing.expect(@hasDecl(Native, "update"));
         try std.testing.expect(@hasDecl(Native, "borrowMutable"));
@@ -132,13 +131,13 @@ test "serialization is generated for every native table schema" {
     var storage: [128]u8 align(flatzz.storage_alignment) = undefined;
     const value: cases.NativePacket = .{ .value = 42 };
     const bytes = try value.serialize(&storage, .{});
-    const owned = try value.serializeAlloc(std.testing.allocator, .{});
+    const owned = try value.serialize(std.testing.allocator, .{});
     defer owned.deinit(std.testing.allocator);
     try std.testing.expectEqualSlices(u8, bytes, owned.bytes);
     try cases.NativePacket.verify(bytes, .{});
     try std.testing.expectEqual(@as(i32, 42), (try cases.NativePacket.read(bytes)).value);
     const empty: cases.Empty = .{};
-    const empty_owned = try empty.serializeAlloc(std.testing.allocator, .{});
+    const empty_owned = try empty.serialize(std.testing.allocator, .{});
     defer empty_owned.deinit(std.testing.allocator);
     try cases.Empty.verify(empty_owned.bytes, .{});
     try cases.Empty.verify(try empty.serialize(&storage, .{}), .{});
@@ -159,7 +158,7 @@ test "generated native child tables and table vectors serialize recursively" {
     };
     var storage: [4096]u8 align(flatzz.storage_alignment) = undefined;
     const bytes = try value.serialize(&storage, .{});
-    const owned = try value.serializeAlloc(std.testing.allocator, .{});
+    const owned = try value.serialize(std.testing.allocator, .{});
     defer owned.deinit(std.testing.allocator);
     try std.testing.expectEqualSlices(u8, bytes, owned.bytes);
     try cases.Packet.verify(bytes, .{});
@@ -196,7 +195,7 @@ test "generated native union payloads and recursive union graphs serialize" {
     };
     var storage: [2048]u8 align(flatzz.storage_alignment) = undefined;
     const bytes = try value.serialize(&storage, .{});
-    const owned = try value.serializeAlloc(std.testing.allocator, .{});
+    const owned = try value.serialize(std.testing.allocator, .{});
     defer owned.deinit(std.testing.allocator);
     try std.testing.expectEqualSlices(u8, bytes, owned.bytes);
     try generated.ReadingMessage.verify(bytes, .{});
@@ -214,7 +213,7 @@ test "generated native union payloads and recursive union graphs serialize" {
     const branch: cases.UnionNode = .{ .next = .{ .union_node = &leaf } };
     const root: cases.UnionNode = .{ .next = .{ .union_node = &branch } };
     const recursive = try root.serialize(&storage, .{});
-    const recursive_owned = try root.serializeAlloc(std.testing.allocator, .{});
+    const recursive_owned = try root.serialize(std.testing.allocator, .{});
     defer recursive_owned.deinit(std.testing.allocator);
     try std.testing.expectEqualSlices(u8, recursive, recursive_owned.bytes);
     try cases.UnionNode.verify(recursive, .{});
@@ -462,11 +461,16 @@ test "qualified types and keyword fields compile without helper-name shadowing" 
     const child = try FirstTable.Schema.read(view.other.?);
     try std.testing.expectEqual(@as(i32, 11), child.Storage);
     try std.testing.expectEqual(@as(i32, 13), child.mutableX);
+    try std.testing.expectEqual(@as(i32, 17), child.serializeAlloc);
     try std.testing.expect(child.x == null);
     const first: FirstTable = .{ .write = 42 };
     const serialized = try first.serialize(&storage, .{});
     try FirstTable.verify(serialized, .{});
     try std.testing.expectEqual(@as(i32, 42), (try FirstTable.read(serialized)).write);
+    const owned = try first.serialize(std.testing.allocator, .{});
+    defer owned.deinit(std.testing.allocator);
+    try std.testing.expectEqualSlices(u8, serialized, owned.bytes);
+    try std.testing.expectEqual(@as(i32, 17), (try FirstTable.read(owned.bytes)).serializeAlloc);
 }
 
 test "generation orders wire IDs without changing caller-owned field metadata" {

@@ -26,7 +26,7 @@ text { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
 <text class="code" x="465" y="289" fill="#f3eee8" xml:space="preserve">    payload: ?[]<tspan fill="#ffae92">const</tspan> u8 = null,</text>
 <text class="code" x="465" y="317" fill="#f3eee8" xml:space="preserve"><tspan fill="#bfc3c8">    // Field descriptors omitted.</tspan></text>
 <text class="code" x="465" y="345" fill="#f3eee8" xml:space="preserve">    <tspan fill="#ffae92">pub</tspan> <tspan fill="#ffae92">const</tspan> serialize = Schema.serialize;</text>
-<text class="code" x="465" y="373" fill="#f3eee8" xml:space="preserve">    <tspan fill="#ffae92">pub</tspan> <tspan fill="#ffae92">const</tspan> serializeAlloc = Schema.serializeAlloc;</text>
+<text class="code" x="465" y="373" fill="#f3eee8" xml:space="preserve">    <tspan fill="#ffae92">pub</tspan> <tspan fill="#ffae92">const</tspan> verify = Schema.verify;</text>
 <text class="code" x="465" y="401" fill="#f3eee8" xml:space="preserve">    <tspan fill="#ffae92">pub</tspan> <tspan fill="#ffae92">const</tspan> read = Schema.read;</text>
 <text class="code" x="465" y="429" fill="#f3eee8" xml:space="preserve">};</text>
 <path d="M409 268H452 M443 260L452 268L443 276" fill="none" stroke="#ffae92" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>

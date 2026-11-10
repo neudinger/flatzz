@@ -1,13 +1,13 @@
-//! Reflection-to-Zig backend. Zast is a host-tool dependency only.
+//! Reflection-to-Zig backend for native and freestanding Wasm tools. Zast is a compiler dependency.
 //! `generate` borrows the schema for the call and returns allocator-owned source.
 //! The generated module imports `flatzz`; retain buffer storage for borrowed views.
 //! This backend is separate from the flatzz_compiler facade and is wired as the
-//! host build's codegen module. It needs the sibling Zast checkout; generated
-//! application modules depend only on flatzz.
+//! build's codegen module. Zig fetches Zast for the backend. Generated application
+//! modules depend only on flatzz.
 //!
 //! ## Complete host example
 //!
-//! Save as `codegen_example_test.zig` beside Flatzz's build file, with `../zast` present:
+//! Save as `codegen_example_test.zig` beside Flatzz's build file:
 //!
 //! ```zig
 //! const std = @import("std");
@@ -28,7 +28,7 @@
 //! }
 //! ```
 //!
-//! Run from the Flatzz root with Zig 0.17.0:
+//! For this direct invocation, put the pinned Zast checkout at `../zast`.
 //!
 //! ```sh
 //! zig test --dep codegen --dep flatzz_compiler -Mroot=codegen_example_test.zig \

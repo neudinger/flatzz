@@ -24,23 +24,24 @@ pub fn main(init: std.process.Init) !void {
         .pilot = "Ziguana",
         .payload = &.{ 1, 2, 3 },
     };
-    var output_buffer: [512]u8 = undefined;
-    var output = std.Io.File.Writer.init(.stdout(), init.io, &output_buffer);
+    var output: std.Io.Writer.Allocating = .init(init.gpa);
+    defer output.deinit();
 
-    const result = try rocket.serializeAlloc(init.gpa, .{});
+    const result = try rocket.serialize(init.gpa, .{});
     defer result.deinit(init.gpa);
     try Rocket.verify(result.bytes, .{});
-    try printRocket(&output.interface, "allocated", try Rocket.read(result.bytes));
+    try printRocket(&output.writer, "allocated", try Rocket.read(result.bytes));
 
-    var storage: [256]u8 align(flatzz.storage_alignment) = undefined;
+    const capacity = comptime flatzz.storage.capacityFor(Rocket.Schema, rocket, .{});
+    var storage: [capacity]u8 align(flatzz.storage_alignment) = undefined;
     const bytes = try rocket.serialize(&storage, .{});
     try Rocket.verify(bytes, .{});
-    try printRocket(&output.interface, "received", try Rocket.read(bytes));
+    try printRocket(&output.writer, "received", try Rocket.read(bytes));
     if (!try Rocket.update(bytes, .fuel, 79)) return error.MissingFuel;
     if (!try Rocket.update(bytes, .pilot, "Pilot01")) return error.MissingPilot;
     try Rocket.verify(bytes, .{});
-    try printRocket(&output.interface, "edited", try Rocket.read(bytes));
-    try output.interface.flush();
+    try printRocket(&output.writer, "edited", try Rocket.read(bytes));
+    try std.Io.File.stdout().writeStreamingAll(init.io, output.written());
 }
 
 test "1. serialize and read back" {
@@ -51,7 +52,7 @@ test "1. serialize and read back" {
         .pilot = "Ziguana",
         .payload = &.{ 1, 2, 3 },
     };
-    const result = try rocket.serializeAlloc(allocator, .{});
+    const result = try rocket.serialize(allocator, .{});
     defer result.deinit(allocator);
 
     try Rocket.verify(result.bytes, .{});
@@ -69,7 +70,8 @@ test "2. use caller-owned storage" {
         .pilot = "Ziguana",
         .payload = &.{ 1, 2, 3 },
     };
-    var storage: [256]u8 align(flatzz.storage_alignment) = undefined;
+    const capacity = comptime flatzz.storage.capacityFor(Rocket.Schema, rocket, .{});
+    var storage: [capacity]u8 align(flatzz.storage_alignment) = undefined;
     const bytes = try rocket.serialize(&storage, .{});
 
     try Rocket.verify(bytes, .{});
@@ -91,7 +93,8 @@ test "4. read and edit existing bytes" {
         .pilot = "Ziguana",
         .payload = &.{ 1, 2, 3 },
     };
-    var storage: [256]u8 align(flatzz.storage_alignment) = undefined;
+    const capacity = comptime flatzz.storage.capacityFor(Rocket.Schema, rocket, .{});
+    var storage: [capacity]u8 align(flatzz.storage_alignment) = undefined;
     const bytes = try rocket.serialize(&storage, .{});
     try Rocket.verify(bytes, .{});
     const before = try Rocket.read(bytes);
