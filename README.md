@@ -1,10 +1,11 @@
 # Flatzz
 
 <p align="center">
-  <img src="docs/assets/banner.png" alt="flatzz — FlatBuffers for Zig. Generate Zig. Own the bytes. A schema becomes Zig declarations and a rocket whose stages represent schema fields." width="100%">
+  <img src="docs/assets/banner.png" alt="Flatzz — Zig for FlatBuffers. A Rocket FBS schema becomes Zig declarations beside a single rocket piloted by Ziguana." width="100%">
 </p>
 
 <p align="center">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-EUPL--1.2-ffae92?style=flat-square&amp;labelColor=141b23" alt="License: EUPL-1.2"></a>
   <a href="build.zig"><img src="https://img.shields.io/badge/Zig-0.17.0-f3a642?style=flat-square&amp;logo=zig&amp;logoColor=white" alt="Zig 0.17.0"></a>
   <a href="src/runtime.zig"><img src="https://img.shields.io/badge/API-documented-ffae92?style=flat-square&amp;labelColor=141b23" alt="Documented API"></a>
   <a href="example/readme/main.zig"><img src="https://img.shields.io/badge/examples-runnable-f9c57d?style=flat-square&amp;labelColor=141b23" alt="Runnable examples"></a>
@@ -24,12 +25,6 @@ from existing bytes.
 
 ## 1. Serialize and read back
 
-Run from this checkout with **Zig 0.17.0**:
-
-```sh
-zig build run-readme
-```
-
 The build generates a `rocket` module from [rocket.fbs](example/readme/rocket.fbs).
 Inside a function with `std` imported, an `allocator`, and the generated `Rocket` type:
 
@@ -40,6 +35,7 @@ const rocket: Rocket = .{
     .pilot = "Ziguana",
     .payload = &.{ 1, 2, 3 },
 };
+
 const result = try rocket.serialize(allocator, .{});
 defer result.deinit(allocator);
 
@@ -50,9 +46,38 @@ try std.testing.expectEqual(@as(f32, 80), view.fuel);
 try std.testing.expectEqualStrings("Ziguana", view.pilot.?);
 ```
 
+Or for comptime buffer
+
+```zig
+const rocket: Rocket = .{
+    .id = 7,
+    .fuel = 80,
+    .pilot = "Ziguana",
+    .payload = &.{ 1, 2, 3 },
+};
+const capacity = comptime flatzz.storage.capacityFor(Rocket.Schema, rocket, .{});
+var storage: [capacity]u8 align(flatzz.storage_alignment) = undefined;
+const bytes = try rocket.serialize(&storage, .{});
+try Rocket.verify(bytes, .{});
+const before = try Rocket.read(bytes);
+
+try std.testing.expect(try Rocket.update(bytes, .fuel, 79));
+try std.testing.expect(try Rocket.update(bytes, .pilot, "Pilot01"));
+try Rocket.verify(bytes, .{});
+const after = try Rocket.read(bytes);
+
+try std.testing.expectEqual(@as(f32, 80), before.fuel);
+try std.testing.expectEqual(@as(f32, 79), after.fuel);
+try std.testing.expectEqualStrings("Pilot01", after.pilot.?);
+try std.testing.expectEqualStrings("Pilot01", before.pilot.?);
+try std.testing.expectError(error.LengthMismatch, Rocket.update(bytes, .pilot, "short"));
+try std.testing.expectEqualStrings("Pilot01", (try Rocket.read(bytes)).pilot.?);
+```
+
 [Copy complete test](docs/examples.md#1-serialize-and-read-back) ·
 [Complete runner](docs/examples.md#complete-runner) ·
 [Runnable source and tests](example/readme/main.zig)
+
 
 `result` owns the allocation. Release it once with the same allocator and keep
 it alive while using borrowed views. `view.fuel` is the decoded scalar `80`;
@@ -84,8 +109,7 @@ the frame. The illustration is conceptual, not an exact byte layout.
 Generation happens on the host at build time. The application imports the
 generated module and the Flatzz runtime. The illustration omits field metadata;
 the [copyable example](docs/examples.md#3-from-fbs-to-generated-zig) includes the
-complete generated output. Rocket stages in the banner represent schema fields,
-not physical offsets in the frame.
+complete generated output.
 
 ## 4. Read and edit existing bytes
 
@@ -114,9 +138,10 @@ see the [Builder example](example/builder/main.zig).
 <details>
 <summary>Build commands and compatibility</summary>
 
-Run from this directory. Zig fetches the pinned Zast package for schema tooling.
-The runtime, parser, reflection model, and BFBS APIs can be checked without Zast.
-The default `check` and `test` steps generate the README example.
+Run from this directory. Zig fetches the pinned Zast package when schema tools
+or the Wasm compiler are enabled. Runtime, parsing, reflection, and BFBS APIs
+can be checked without Zast. The default `check` and `test` steps include README
+example generation through the schema tools.
 
 | Command | Action |
 | --- | --- |
@@ -179,3 +204,7 @@ generation uses a separate Zast-based backend; generated modules import only `fl
 [Detailed ownership and implementation notes](docs/examples.md#ownership-and-implementation-notes).
 
 </details>
+
+## License
+
+Licensed under the [European Union Public Licence v1.2](LICENSE).

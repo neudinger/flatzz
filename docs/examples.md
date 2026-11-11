@@ -3,55 +3,6 @@
 Complete code for the [Flatzz README](../README.md). The examples use Zig 0.17.0
 and the actual `Rocket` module generated from the schema below.
 
-## Run and test
-
-From the Flatzz checkout:
-
-```sh
-zig build run-readme
-zig build check test
-```
-
-`run-readme` generates the schema on the host, then builds and runs
-[main.zig](../example/readme/main.zig). The default `check` and `test` steps
-compile and run the three tests copied below against freshly generated code.
-They are unavailable with `-Dschema-tools=false`.
-
-Expected program output:
-
-```text
-allocated: id=7, fuel=80, pilot=Ziguana, payload[0]=1
-received: id=7, fuel=80, pilot=Ziguana, payload[0]=1
-edited: id=7, fuel=79, pilot=Pilot01, payload[0]=1
-```
-
-## Shared imports
-
-Each test below is independent. Put these imports before any copied test.
-The `rocket` module imports `flatzz`; the application does not import a compiler.
-
-```zig
-const std = @import("std");
-const flatzz = @import("flatzz");
-const generated = @import("rocket");
-
-const Rocket = generated.Rocket;
-```
-
-To test a copied file, first generate its schema from the Flatzz root:
-
-```sh
-zig build compiler
-zig-out/bin/flatzz --zig example/readme/rocket.fbs > /tmp/flatzz-rocket.zig
-```
-
-Save the imports and one or more complete tests as `/tmp/flatzz-example.zig`,
-then run from the Flatzz root:
-
-```sh
-zig test --dep flatzz --dep rocket -Mroot=/tmp/flatzz-example.zig -Mflatzz=src/runtime.zig --dep flatzz -Mrocket=/tmp/flatzz-rocket.zig
-```
-
 ## 1. Serialize and read back
 
 [README](../README.md#1-serialize-and-read-back) ·

@@ -5,8 +5,9 @@ const std = @import("std");
 const schema_build = @import("tools/build.zig");
 const wasm_build = @import("tools/wasm/build.zig");
 const compile_fail = @import("tests/compile_fail.zig");
-
-const Step = std.Build.Step;
+const Build = std.Build;
+const Module = Build.Module;
+const Step = Build.Step;
 
 const format_paths = [_][]const u8{
     "build.zig", "build.zig.zon", "src", "tests", "tools", "example",
@@ -34,315 +35,166 @@ const schema_examples = [_]struct {
     },
 };
 
+/// Reuse target and optimization options for source paths and generated files.
+fn module(builder: *Build, source: anytype, options: Module.CreateOptions) *Module {
+    const path = if (@TypeOf(source) == Build.LazyPath) source else builder.path(source);
+    var configuration = options;
+    configuration.root_source_file = path;
+    return builder.createModule(configuration);
+}
+
 /// Generate a schema on the host; the output path belongs to the build.
-fn compileSchema(
-    builder: *std.Build,
-    schema_tool: *Step.Compile,
-    source_path: []const u8,
-) std.Build.LazyPath {
-    return zig_schema_blk: {
-        const generate = builder.addRunArtifact(schema_tool);
-        generate.addArgs(&.{ "--zig", "--depfile" });
-        _ = generate.addDepFileOutputArg2("schema.d", .{});
-        generate.addFileArg(builder.path(source_path));
-        break :zig_schema_blk generate.captureStdOut(.{
-            .basename = builder.fmt("{s}.zig", .{std.fs.path.stem(source_path)}),
-        });
-    };
+fn compileSchema(builder: *Build, schema_tool: *Step.Compile, source: []const u8) Build.LazyPath {
+    const generate = builder.addRunArtifact(schema_tool);
+    generate.addArgs(&.{ "--zig", "--depfile" });
+    _ = generate.addDepFileOutputArg2("schema.d", .{});
+    generate.addFileArg(builder.path(source));
+    return generate.captureStdOut(.{
+        .basename = builder.fmt("{s}.zig", .{std.fs.path.stem(source)}),
+    });
 }
 
 /// Configure target-aware runtime artifacts, native schema tooling, and optional Wasm tooling.
-pub fn build(builder: *std.Build) void {
-    const target = builder.standardTargetOptions(.{});
-    const optimize = builder.standardOptimizeOption(.{});
-
-    const runtime_module = builder.addModule("flatzz", .{
+pub fn build(builder: *Build) void {
+    const options: Module.CreateOptions = .{
         .root_source_file = builder.path("src/runtime.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
-    const compiler_module = builder.addModule("flatzz_compiler", .{
-        .root_source_file = builder.path("src/compiler.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{.{ .name = "flatzz", .module = runtime_module }},
-    });
+        .target = builder.standardTargetOptions(.{}),
+        .optimize = builder.standardOptimizeOption(.{}),
+    };
+    // Compile-only commands also support targets that cannot run on this host.
+    const check = builder.step("check", "Compile all tools and test contracts");
+    const tests = builder.step(
+        "test",
+        "Test runtime, native schema conversion, and compile-time contracts",
+    );
+    const examples = builder.step("examples", "Compile the native Zig examples and their tests");
+    const runtime_module = builder.addModule("flatzz", options);
+    var runtime_options = options;
+    runtime_options.imports = &.{.{ .name = "flatzz", .module = runtime_module }};
+    var compiler_options = runtime_options;
+    compiler_options.root_source_file = builder.path("src/compiler.zig");
+    const compiler_module = builder.addModule("flatzz_compiler", compiler_options);
 
     // Emit the standard Zig viewers; website preparation belongs to flatzz-site.
     const docs = builder.step("docs", "Generate runtime and compiler API documentation");
-    for ([_]struct {
-        name: []const u8,
-        module: *std.Build.Module,
-        destination: []const u8,
-    }{
-        .{ .name = "runtime", .module = runtime_module, .destination = "docs" },
-        .{ .name = "compiler", .module = compiler_module, .destination = "docs/compiler" },
+    inline for (.{
+        .{ "runtime", runtime_module, "docs" },
+        .{ "compiler", compiler_module, "docs/compiler" },
     }) |reference| {
-        const object = builder.addObject(.{
-            .name = reference.name,
-            .root_module = reference.module,
-        });
+        const object = builder.addObject(.{ .name = reference[0], .root_module = reference[1] });
         const install = builder.addInstallDirectory(.{
             .source_dir = object.getEmittedDocs(),
             .install_dir = .prefix,
-            .install_subdir = reference.destination,
+            .install_subdir = reference[2],
         });
         docs.dependOn(&install.step);
     }
 
-    const reading_module = builder.createModule(.{
-        .root_source_file = builder.path("tests/fixtures/reading/reading.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{.{ .name = "flatzz", .module = runtime_module }},
-    });
-    const test_imports: []const std.Build.Module.Import = &.{
+    const reading_module = module(builder, "tests/fixtures/reading/reading.zig", runtime_options);
+    var test_options = options;
+    test_options.imports = &.{
         .{ .name = "runtime", .module = runtime_module },
         .{ .name = "reading", .module = reading_module },
     };
-
-    const builder_example = builder_example_blk: {
-        const module = builder.createModule(.{
-            .root_source_file = builder.path("example/builder/main.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = test_imports,
-        });
-
-        const executable = builder.addExecutable(.{
-            .name = "flatzz-builder-example",
-            .root_module = module,
-        });
-        builder.installArtifact(executable);
-        const run = builder.addRunArtifact(executable);
-        run.addPassthruArgs();
-        break :builder_example_blk .{ .compile = &executable.step, .run = &run.step };
-    };
+    const builder_example = builder.addExecutable(.{
+        .name = "flatzz-builder-example",
+        .root_module = module(builder, "example/builder/main.zig", test_options),
+    });
+    builder.installArtifact(builder_example);
+    check.dependOn(&builder_example.step);
+    examples.dependOn(&builder_example.step);
+    const run_builder = builder.addRunArtifact(builder_example);
+    run_builder.addPassthruArgs();
 
     const schema_tools_enabled = builder.option(
         bool,
         "schema-tools",
         "Build host schema tooling (defaults on for root builds)",
     ) orelse builder.isRoot();
-    const schema_tools = if (schema_tools_enabled)
-        schema_build.add(builder)
-    else
-        null;
-
+    const schema_tools = if (schema_tools_enabled) schema_build.add(builder) else null;
     const wasm_compiler_enabled = builder.option(
         bool,
         "wasm-compiler",
         "Expose the Wasm compiler (defaults on with root schema tooling)",
     ) orelse (builder.isRoot() and schema_tools_enabled);
-    if (wasm_compiler_enabled) {
-        wasm_build.add(builder);
-    }
+    if (wasm_compiler_enabled) wasm_build.add(builder);
 
-    const generated_reading = if (schema_tools) |tools| reading_module_blk: {
+    if (schema_tools) |tools| {
         const source = compileSchema(builder, tools.executable, "example/flatbuf/reading.fbs");
-        builder.getInstallStep().dependOn(
-            &builder.addInstallFile(source, "schema/reading.zig").step,
-        );
-        break :reading_module_blk builder.createModule(.{
-            .root_source_file = source,
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{.{ .name = "flatzz", .module = runtime_module }},
-        });
-    } else null;
-
-    const generated = if (generated_reading) |reading| app_blk: {
+        const install = builder.addInstallFile(source, "schema/reading.zig");
+        builder.getInstallStep().dependOn(&install.step);
+        const reading = module(builder, source, runtime_options);
         // The generator runs on the host; the app imports only its output and runtime.
-        const executable = builder.addExecutable(.{
+        const app_module = module(builder, "example/generated/main.zig", runtime_options);
+        app_module.addImport("reading", reading);
+        const generated_example = builder.addExecutable(.{
             .name = "flatzz-example",
-            .root_module = builder.createModule(.{
-                .root_source_file = builder.path("example/generated/main.zig"),
-                .target = target,
-                .optimize = optimize,
-                .imports = &.{
-                    .{ .name = "reading", .module = reading },
-                    .{ .name = "flatzz", .module = runtime_module },
-                },
-            }),
+            .root_module = app_module,
         });
-        builder.installArtifact(executable);
-        const run = builder.addRunArtifact(executable);
+        builder.installArtifact(generated_example);
+        check.dependOn(&generated_example.step);
+        examples.dependOn(&generated_example.step);
+        const run = builder.addRunArtifact(generated_example);
         run.addPassthruArgs();
-        break :app_blk .{ .compile = &executable.step, .run = &run.step };
-    } else null;
+        const update = tools.generate_reading;
+        inline for (.{
+            .{ .run, "Generate Reading, then build, verify, read, and mutate it", &run.step },
+            .{ .compiler, "Build and install only flatzz", tools.install },
+            .{ .@"generate-reading", "Regenerate the checked-in Reading fixture", update },
+        }) |command| builder.step(@tagName(command[0]), command[1]).dependOn(command[2]);
+        for (tools.check) |prerequisite| check.dependOn(prerequisite);
+        for (tools.tests) |prerequisite| tests.dependOn(prerequisite);
 
-    const examples = if (schema_tools) |tools| examples_blk: {
-        var checks: [schema_examples.len * 2]*Step = undefined;
-        var tests: [schema_examples.len]*Step = undefined;
-        for (schema_examples, 0..) |example, index| {
-            const schema_name = std.fs.path.stem(example.schema_path);
-            const schema = builder.createModule(.{
-                .root_source_file = compileSchema(builder, tools.executable, example.schema_path),
-                .target = target,
-                .optimize = optimize,
-                .imports = &.{.{ .name = "flatzz", .module = runtime_module }},
-            });
-            const module = builder.createModule(.{
-                .root_source_file = builder.path(
-                    builder.fmt("example/{s}/main.zig", .{example.name}),
-                ),
-                .target = target,
-                .optimize = optimize,
-                .imports = &.{
-                    .{ .name = schema_name, .module = schema },
-                    .{ .name = "flatzz", .module = runtime_module },
-                },
-            });
+        for (schema_examples) |example| {
+            const schema = module(
+                builder,
+                compileSchema(builder, tools.executable, example.schema_path),
+                runtime_options,
+            );
+            const app_source = builder.fmt("example/{s}/main.zig", .{example.name});
+            const example_module = module(builder, app_source, runtime_options);
+            example_module.addImport(std.fs.path.stem(example.schema_path), schema);
             const executable = builder.addExecutable(.{
                 .name = builder.fmt("flatzz-{s}-example", .{example.name}),
-                .root_module = module,
+                .root_module = example_module,
             });
-            const example_tests = builder.addTest(.{ .root_module = module });
-            checks[index * 2] = &executable.step;
-            checks[index * 2 + 1] = &example_tests.step;
-            tests[index] = &builder.addRunArtifact(example_tests).step;
-            const run = builder.step(
-                builder.fmt("run-{s}", .{example.name}),
-                example.description,
-            );
-            run.dependOn(&builder.addRunArtifact(executable).step);
-        }
-        break :examples_blk .{ .check = checks, .tests = tests };
-    } else null;
-
-    const suites = suites_blk: {
-        const tests = builder.addTest(.{ .root_module = builder.createModule(.{
-            .root_source_file = builder.path("tests/test_all.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = test_imports,
-        }) });
-        const compiler_tests = builder.addTest(.{ .root_module = builder.createModule(.{
-            .root_source_file = builder.path("tests/test_compiler.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{.{ .name = "flatzz_compiler", .module = compiler_module }},
-        }) });
-        const parser_tests = builder.addTest(.{ .root_module = builder.createModule(.{
-            .root_source_file = builder.path("tests/test_parser.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{.{ .name = "flatzz_compiler", .module = compiler_module }},
-        }) });
-        break :suites_blk .{
-            .check = [_]*Step{ &tests.step, &compiler_tests.step, &parser_tests.step },
-            .tests = [_]*Step{
-                &builder.addRunArtifact(tests).step,
-                &builder.addRunArtifact(compiler_tests).step,
-                &builder.addRunArtifact(parser_tests).step,
-            },
-        };
-    };
-
-    const contracts = contracts_blk: {
-        const failures = compile_fail.cases;
-        const sources = builder.addWriteFiles();
-        var steps: [failures.len]*Step = undefined;
-        for (failures, 0..) |failure, failure_index| {
-            const rejected = builder.addTest(.{ .root_module = builder.createModule(.{
-                .root_source_file = sources.add(
-                    builder.fmt("test_{s}.zig", .{failure.name}),
-                    failure.source,
-                ),
-                .target = target,
-                .optimize = optimize,
-                .imports = &.{.{ .name = "runtime", .module = runtime_module }},
-            }) });
-            rejected.expect_errors = .{ .contains = failure.expected_error };
-            steps[failure_index] = &rejected.step;
-        }
-        break :contracts_blk steps;
-    };
-
-    const format = format_blk: {
-        const check_format = builder.addFmt(.{
-            .paths = builder.pathList(&format_paths),
-            .check = true,
-        });
-        break :format_blk &check_format.step;
-    };
-
-    const checks = std.mem.concat(builder.allocator, *Step, &.{
-        &.{builder_example.compile},
-        if (generated) |app| &.{app.compile} else &.{},
-        &suites.check,
-        &contracts,
-        if (schema_tools) |*tools| &tools.check else &.{},
-        if (examples) |*apps| &apps.check else &.{},
-    }) catch @panic("OOM");
-    const test_steps = std.mem.concat(builder.allocator, *Step, &.{
-        &suites.tests,
-        &contracts,
-        if (schema_tools) |*tools| &tools.tests else &.{},
-        if (examples) |*apps| &apps.tests else &.{},
-    }) catch @panic("OOM");
-
-    inline for (.{
-        .{
-            .tag = .compiler,
-            .description = "Build and install only flatzz",
-            .prerequisites = if (schema_tools) |tools|
-                @as([]const *Step, &.{tools.install})
-            else
-                &.{},
-        },
-        .{
-            .tag = .run,
-            .description = "Generate Reading, then build, verify, read, and mutate it",
-            .prerequisites = if (generated) |app| @as([]const *Step, &.{app.run}) else &.{},
-        },
-        .{
-            .tag = .@"run-builder",
-            .description = "Run the Builder example",
-            .prerequisites = @as([]const *Step, &.{builder_example.run}),
-        },
-        .{
-            .tag = .examples,
-            .description = "Compile the native Zig examples and their tests",
-            .prerequisites = examples_blk: {
-                const steps = std.mem.concat(builder.allocator, *Step, &.{
-                    &.{builder_example.compile},
-                    if (generated) |app| &.{app.compile} else &.{},
-                    if (examples) |*apps| &apps.check else &.{},
-                }) catch @panic("OOM");
-                break :examples_blk steps;
-            },
-        },
-        // Compile-only coverage also supports targets that cannot run on this host.
-        .{
-            .tag = .check,
-            .description = "Compile all tools and test contracts",
-            .prerequisites = checks,
-        },
-        .{
-            .tag = .@"test",
-            .description = "Test runtime, native schema conversion, and compile-time contracts",
-            .prerequisites = test_steps,
-        },
-        .{
-            .tag = .@"generate-reading",
-            .description = "Regenerate the checked-in Reading fixture",
-            .prerequisites = if (schema_tools) |tools|
-                @as([]const *Step, &.{tools.generate_reading})
-            else
-                &.{},
-        },
-        .{
-            .tag = .fmt,
-            .description = "Check Zig source formatting",
-            .prerequisites = @as([]const *Step, &.{format}),
-        },
-    }) |command| {
-        // Optional schema targets are absent when their tools are disabled.
-        if (command.prerequisites.len != 0) {
-            const command_step = builder.step(@tagName(command.tag), command.description);
-            for (command.prerequisites) |prerequisite| command_step.dependOn(prerequisite);
+            const example_tests = builder.addTest(.{ .root_module = example_module });
+            for ([_]*Step{ check, examples }) |command| {
+                command.dependOn(&executable.step);
+                command.dependOn(&example_tests.step);
+            }
+            tests.dependOn(&builder.addRunArtifact(example_tests).step);
+            builder.step(builder.fmt("run-{s}", .{example.name}), example.description)
+                .dependOn(&builder.addRunArtifact(executable).step);
         }
     }
+
+    var compiler_test_options = options;
+    compiler_test_options.imports = &.{.{ .name = "flatzz_compiler", .module = compiler_module }};
+    inline for (.{
+        .{ "tests/test_all.zig", test_options },
+        .{ "tests/test_compiler.zig", compiler_test_options },
+        .{ "tests/test_parser.zig", compiler_test_options },
+    }) |suite| {
+        const executable = builder.addTest(.{ .root_module = module(builder, suite[0], suite[1]) });
+        check.dependOn(&executable.step);
+        tests.dependOn(&builder.addRunArtifact(executable).step);
+    }
+
+    var case_options = options;
+    case_options.imports = &.{.{ .name = "runtime", .module = runtime_module }};
+    const sources = builder.addWriteFiles();
+    for (compile_fail.cases) |failure| {
+        const source = sources.add(builder.fmt("test_{s}.zig", .{failure.name}), failure.source);
+        const rejected = builder.addTest(.{ .root_module = module(builder, source, case_options) });
+        rejected.expect_errors = .{ .contains = failure.expected_error };
+        check.dependOn(&rejected.step);
+        tests.dependOn(&rejected.step);
+    }
+
+    const format = builder.addFmt(.{ .paths = builder.pathList(&format_paths), .check = true });
+    inline for (.{
+        .{ .@"run-builder", "Run the Builder example", &run_builder.step },
+        .{ .fmt, "Check Zig source formatting", &format.step },
+    }) |command| builder.step(@tagName(command[0]), command[1]).dependOn(command[2]);
 }

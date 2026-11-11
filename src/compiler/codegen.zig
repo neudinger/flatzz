@@ -7,8 +7,6 @@
 //!
 //! ## Complete host example
 //!
-//! Save as `codegen_example_test.zig` beside Flatzz's build file:
-//!
 //! ```zig
 //! const std = @import("std");
 //! const compiler = @import("flatzz_compiler");
@@ -27,14 +25,6 @@
 //!     try std.testing.expect(std.mem.indexOf(u8, source, "pub const Reading") != null);
 //! }
 //! ```
-//!
-//! For this direct invocation, put the pinned Zast checkout at `../zast`.
-//!
-//! ```sh
-//! zig test --dep codegen --dep flatzz_compiler -Mroot=codegen_example_test.zig \
-//!     --dep flatzz --dep flatzz_compiler --dep zast -Mcodegen=src/compiler/codegen.zig \
-//!     --dep flatzz -Mflatzz_compiler=src/compiler.zig -Mflatzz=src/runtime.zig \
-//!     -Mzast=../zast/src/root.zig
 //! ```
 //!
 //! Expected result: a passing test with no application output. The owned source
