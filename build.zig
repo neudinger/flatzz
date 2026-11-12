@@ -2,6 +2,7 @@
 //! Website preparation and browser tests belong to the consuming site project.
 
 const std = @import("std");
+const manifest = @import("build.zig.zon");
 const schema_build = @import("tools/build.zig");
 const wasm_build = @import("tools/wasm/build.zig");
 const compile_fail = @import("tests/compile_fail.zig");
@@ -192,9 +193,28 @@ pub fn build(builder: *Build) void {
         tests.dependOn(&rejected.step);
     }
 
+    const update_zast = update_zast_blk: {
+        if (!@hasField(@TypeOf(manifest.dependencies.zast), "hash")) {
+            const failure = builder.addFail("Enable the Zast GitHub pin in build.zig.zon first.");
+            break :update_zast_blk &failure.step;
+        }
+        const updater = builder.addExecutable(.{
+            .name = "flatzz-update-zast",
+            .root_module = module(builder, "tools/update_zast.zig", .{
+                .target = builder.graph.host,
+                .optimize = .ReleaseSafe,
+            }),
+        });
+        const command = builder.addRunArtifact(updater);
+        command.addArg(builder.graph.zig_exe);
+        command.setCwd(builder.path("."));
+        command.has_side_effects = true;
+        break :update_zast_blk &command.step;
+    };
     const format = builder.addFmt(.{ .paths = builder.pathList(&format_paths), .check = true });
     inline for (.{
         .{ .@"run-builder", "Run the Builder example", &run_builder.step },
         .{ .fmt, "Check Zig source formatting", &format.step },
+        .{ .@"update-zast", "Pin Zast to the latest GitHub main commit", update_zast },
     }) |command| builder.step(@tagName(command[0]), command[1]).dependOn(command[2]);
 }

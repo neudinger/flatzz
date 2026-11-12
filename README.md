@@ -160,6 +160,7 @@ example generation through the schema tools.
 | `zig build examples` | Compile the native Zig examples and their tests |
 | `zig build check test -Dschema-tools=false` | Check and test runtime/compiler APIs without Zast |
 | `zig build generate-reading` | Regenerate `tests/fixtures/reading/reading.zig` |
+| `zig build update-zast` | Update the Zast commit and package hash from GitHub `main` |
 | `zig build --help` | List targets and options |
 
 The generated example executable is `zig-out/bin/flatzz-example`.
