@@ -23,6 +23,24 @@ from existing bytes.
   <a href="example/README.md">More examples</a>
 </p>
 
+<p align="center">
+  <a href="https://neudinger.github.io/flatzz-site/">
+    <img src="https://img.shields.io/badge/website-flatzz-ffae92?style=flat-square&amp;labelColor=141b23" alt="Flatzz website">
+  </a>
+  <a href="https://neudinger.github.io/flatzz-site/docs/">
+    <img src="https://img.shields.io/badge/docs-read-ffae92?style=flat-square&amp;labelColor=141b23" alt="Flatzz documentation">
+  </a>
+  <a href="https://neudinger.github.io/flatzz-site/docs/api/runtime/">
+    <img src="https://img.shields.io/badge/API-runtime-f9c57d?style=flat-square&amp;labelColor=141b23" alt="Runtime API reference">
+  </a>
+  <a href="https://neudinger.github.io/flatzz-site/docs/api/compiler/">
+    <img src="https://img.shields.io/badge/API-compiler-f9c57d?style=flat-square&amp;labelColor=141b23" alt="Compiler API reference">
+  </a>
+  <a href="https://neudinger.github.io/flatzz-site/#playground">
+    <img src="https://img.shields.io/badge/playground-try_online-f9c57d?style=flat-square&amp;labelColor=141b23" alt="Open the compiler playground">
+  </a>
+</p>
+
 ## 1. Serialize and read back
 
 The build generates a `rocket` module from [rocket.fbs](example/readme/rocket.fbs).
@@ -122,7 +140,8 @@ complete generated output.
 
 [Copy read/edit test](docs/examples.md#4-read-and-edit-existing-bytes) ·
 [Mutable nested struct example](example/generated/main.zig) ·
-[More examples](example/README.md)
+[More examples](example/README.md) ·
+[Browse online examples](https://neudinger.github.io/flatzz-site/examples/)
 
 `update` returns `false` when a field is absent. Strings and vectors must keep
 their lengths; replacing tables or whole unions requires rebuilding. Read scalars
